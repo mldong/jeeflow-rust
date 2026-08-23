@@ -451,18 +451,17 @@ impl JeeflowEngineImpl {
         }
     }
 
-    /// Persist new tasks.
-    fn persist_tasks(&self, instance: &ProcessInstance, new_tasks: &[ProcessTask]) -> JeeflowResult<()> {
-        for task in new_tasks {
-            let mut t = task.clone();
-            if t.task_id == 0 {
-                t.task_id = self.next_id();
+    /// Persist new tasks (assigns IDs in-place for tasks with id=0).
+    fn persist_tasks(&self, instance: &ProcessInstance, new_tasks: &mut [ProcessTask]) -> JeeflowResult<()> {
+        for task in new_tasks.iter_mut() {
+            if task.task_id == 0 {
+                task.task_id = self.next_id();
             }
-            t.process_instance_id = instance.instance_id;
-            self.repo().save_task(&mut t)?;
+            task.process_instance_id = instance.instance_id;
+            self.repo().save_task(task)?;
             // Save actors
-            if !t.actor_ids.is_empty() {
-                self.repo().add_task_actor(t.task_id, &t.actor_ids)?;
+            if !task.actor_ids.is_empty() {
+                self.repo().add_task_actor(task.task_id, &task.actor_ids)?;
             }
         }
         Ok(())
@@ -556,9 +555,8 @@ impl JeeflowEngineImpl {
             self.execute_node(&mut exec, &start)?;
         }
 
-        // 10. Persist new tasks (sync)
-        let new_tasks = exec.new_tasks.clone();
-        self.persist_tasks(&exec.process_instance, &new_tasks)?;
+        // 10. Persist new tasks (sync) — assigns IDs in-place
+        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
 
         // 11. Update instance (sync)
         self.repo().update_instance(&exec.process_instance)?;
@@ -640,12 +638,11 @@ impl JeeflowEngineImpl {
             }
         }
 
-        // 12. Persist new tasks + update instance (sync)
-        let new_tasks = exec.new_tasks.clone();
-        self.persist_tasks(&exec.process_instance, &new_tasks)?;
+        // 12. Persist new tasks + update instance (sync) — assigns IDs in-place
+        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
         self.repo().update_instance(&exec.process_instance)?;
 
-        Ok(new_tasks)
+        Ok(exec.new_tasks)
     }
 
     /// Async execute and jump to specific task node.
@@ -694,11 +691,10 @@ impl JeeflowEngineImpl {
             self.execute_node(&mut exec, &node)?;
         }
 
-        let new_tasks = exec.new_tasks.clone();
-        self.persist_tasks(&exec.process_instance, &new_tasks)?;
+        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
         self.repo().update_instance(&exec.process_instance)?;
 
-        Ok(new_tasks)
+        Ok(exec.new_tasks)
     }
 
     /// Async execute and jump to end (reject).
@@ -952,6 +948,29 @@ mod tests {
     }
 
     // ── v1.0 core scenarios (1-10) ──
+
+    /// #91 regression: execute_task_async must return new_tasks with non-zero IDs.
+    #[tokio::test]
+    async fn test_c01_execute_returns_nonzero_task_ids() {
+        let (engine, repo) = make_compliance_engine();
+        let flow = load_flow("01-simple");
+        let did = save_define(&repo, "simple-nonzero", &flow);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let tasks = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
+        let apply_task = tasks.iter().find(|t| t.actor_ids.contains(&"applicant".to_string())).unwrap();
+        // Execute apply → should create task for "leader" with non-zero id
+        let new_tasks = engine.execute_task_async(apply_task.task_id, "applicant", &FlowData::new()).await.unwrap();
+        assert!(!new_tasks.is_empty(), "#91: execute should return new tasks");
+        for t in &new_tasks {
+            assert!(t.task_id > 0, "#91: new task id should be non-zero, got {}", t.task_id);
+        }
+        // Cross-check: the returned id should match what's in the repo
+        let repo_tasks = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
+        for nt in &new_tasks {
+            assert!(repo_tasks.iter().any(|rt| rt.task_id == nt.task_id),
+                "#91: returned task_id {} should exist in repo", nt.task_id);
+        }
+    }
 
     #[tokio::test]
     async fn test_c01_simple_linear() {

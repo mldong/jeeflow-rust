@@ -64,13 +64,18 @@ fn to_camel_json(val: &Json) -> Json {
 }
 
 /// Stringify all "id" fields in a JSON value (C1/C14).
+/// Handles singular keys (id, *Id, *_id) and plural array keys (ids, *Ids, *_ids).
 fn stringify_ids(val: &Json) -> Json {
     match val {
         Json::Object(map) => {
             let mut new_map = serde_json::Map::new();
             for (k, v) in map {
-                if k == "id" || k.ends_with("Id") || k.ends_with("_id") || k == "id" {
+                if k == "id" || k.ends_with("Id") || k.ends_with("_id") {
+                    // Singular id key → stringify the value
                     new_map.insert(k.clone(), stringify_id_value(v));
+                } else if k == "ids" || k.ends_with("Ids") || k.ends_with("_ids") {
+                    // Plural ids array key → stringify each element
+                    new_map.insert(k.clone(), stringify_id_array(v));
                 } else {
                     new_map.insert(k.clone(), stringify_ids(v));
                 }
@@ -87,6 +92,14 @@ fn stringify_id_value(v: &Json) -> Json {
         Json::Number(n) => Json::String(n.to_string()),
         Json::Null => Json::Null,
         other => other.clone(),
+    }
+}
+
+/// Stringify each element of an id array (for plural keys like taskIds, roleIds).
+fn stringify_id_array(v: &Json) -> Json {
+    match v {
+        Json::Array(arr) => Json::Array(arr.iter().map(stringify_id_value).collect()),
+        other => stringify_id_value(other),
     }
 }
 
@@ -1144,6 +1157,28 @@ mod tests {
         JeeflowFacade::new(ctx)
     }
 
+    struct TestUserProvider;
+    impl UserProvider for TestUserProvider {
+        fn get_user(&self, user_id: &str) -> JeeflowResult<Option<UserInfo>> {
+            Ok(Some(UserInfo {
+                user_id: user_id.to_string(),
+                real_name: user_id.to_string(),
+                dept_id: "dept1".into(), dept_name: "TestDept".into(),
+                post_id: "post1".into(), post_name: "TestPost".into(),
+            }))
+        }
+    }
+
+    fn make_facade_with_user_provider() -> JeeflowFacade {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_user_provider(Arc::new(TestUserProvider))
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        JeeflowFacade::new(ctx)
+    }
+
     fn make_facade_with_define() -> (JeeflowFacade, i64) {
         let facade = make_facade();
         let mut define = ProcessDefine {
@@ -1638,6 +1673,150 @@ mod tests {
         assert_eq!(output["process_instance_id"], "1");
         assert_eq!(output["taskId"], "2");
         assert_eq!(output["user_id"], "3");
+    }
+
+    // ─── #92 plural Ids array tests ───
+
+    #[test]
+    fn test_stringify_ids_plural_keys_task_ids() {
+        // taskIds with >2^53 number → must be stringified
+        let input = json!({"taskIds": [999999999999999999i64]});
+        let output = stringify_ids(&input);
+        assert_eq!(output["taskIds"][0], "999999999999999999");
+    }
+
+    #[test]
+    fn test_stringify_ids_plural_keys_various() {
+        // ids, roleIds, actorIds — all plural patterns
+        let input = json!({
+            "ids": [1, 2, 3],
+            "roleIds": [888888888888888888i64],
+            "actorIds": [100001, 100002],
+            "candidate_ids": [777777777777777777i64]
+        });
+        let output = stringify_ids(&input);
+        assert_eq!(output["ids"][0], "1");
+        assert_eq!(output["ids"][2], "3");
+        assert_eq!(output["roleIds"][0], "888888888888888888");
+        assert_eq!(output["actorIds"][0], "100001");
+        assert_eq!(output["candidate_ids"][0], "777777777777777777");
+    }
+
+    #[test]
+    fn test_stringify_ids_object_array_not_affected() {
+        // rows/items object arrays should NOT be treated as id arrays;
+        // each object's internal id keys should still be stringified.
+        let input = json!({
+            "rows": [
+                {"id": 123, "name": "test", "taskIds": [456]},
+                {"id": 789, "name": "test2"}
+            ],
+            "items": [{"user_id": 111}]
+        });
+        let output = stringify_ids(&input);
+        // Object id fields stringified
+        assert_eq!(output["rows"][0]["id"], "123");
+        assert_eq!(output["rows"][1]["id"], "789");
+        // Non-id fields untouched
+        assert_eq!(output["rows"][0]["name"], "test");
+        // Plural ids inside objects also stringified
+        assert_eq!(output["rows"][0]["taskIds"][0], "456");
+        // items objects' id keys stringified
+        assert_eq!(output["items"][0]["user_id"], "111");
+    }
+
+    #[test]
+    fn test_transform_output_plural_ids_stringified() {
+        // Full pipeline: camelCase + stringify_ids + format_time
+        let input = json!({"task_ids": [999999999999999999i64], "role_ids": [1, 2]});
+        let output = transform_output(input);
+        // After camelCase: taskIds, roleIds; after stringify_ids: string arrays
+        assert_eq!(output["taskIds"][0], "999999999999999999");
+        assert_eq!(output["roleIds"][0], "1");
+        assert_eq!(output["roleIds"][1], "2");
+    }
+
+    // ─── #91+#92 cross-call test: execute → taskIds match todoList ───
+
+    #[tokio::test]
+    async fn test_execute_response_task_ids_nonzero_and_match_todo_list() {
+        let facade = make_facade_with_user_provider();
+
+        // 1. processDesign/save
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), json!("two-step-flow"));
+        args.insert("displayName".to_string(), json!("Two Step Flow"));
+        let resp = facade.flow("processDesign/save", &args).await;
+        assert_eq!(resp["code"], 0, "save failed: {:?}", resp);
+        let design_id = resp["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        // 2. processDesign/updateDefine (4-node: start→apply→approve→end)
+        let flow_json = r#"{
+            "name":"two-step-flow","displayName":"Two Step Flow","type":"approval",
+            "nodes":[
+                {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                {"id":"apply","type":"snaker:task","text":{"value":"Apply"},
+                 "properties":{"assignee":"applicant"}},
+                {"id":"approve","type":"snaker:task","text":{"value":"Approve"},
+                 "properties":{"assignee":"user2"}},
+                {"id":"end","type":"snaker:end","text":{"value":"End"}}
+            ],
+            "edges":[
+                {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+            ]
+        }"#;
+        let mut args2 = HashMap::new();
+        args2.insert("id".to_string(), json!(design_id));
+        args2.insert("content".to_string(), json!(flow_json));
+        let resp2 = facade.flow("processDesign/updateDefine", &args2).await;
+        assert_eq!(resp2["code"], 0, "updateDefine failed: {:?}", resp2);
+
+        // 3. processDesign/deploy
+        let mut args3 = HashMap::new();
+        args3.insert("id".to_string(), json!(design_id));
+        let resp3 = facade.flow("processDesign/deploy", &args3).await;
+        assert_eq!(resp3["code"], 0, "deploy failed: {:?}", resp3);
+
+        // 4. processDefine/startAndExecute (operator=applicant)
+        let mut args4 = HashMap::new();
+        args4.insert("name".to_string(), json!("two-step-flow"));
+        args4.insert("operator".to_string(), json!("applicant"));
+        let resp4 = facade.flow("processDefine/startAndExecute", &args4).await;
+        assert_eq!(resp4["code"], 0, "startAndExecute failed: {:?}", resp4);
+        // taskIds should be stringified (#92) and non-zero
+        let start_task_ids = resp4["data"]["taskIds"].as_array().unwrap();
+        assert!(!start_task_ids.is_empty(), "startAndExecute should return taskIds");
+        let apply_task_id_str = start_task_ids[0].as_str().expect("taskId should be string (#92)");
+        let apply_task_id: i64 = apply_task_id_str.parse().unwrap();
+        assert!(apply_task_id > 0, "apply task id should be non-zero");
+
+        // 5. processTask/execute (applicant completes apply → creates approve task for user2)
+        let mut args5 = HashMap::new();
+        args5.insert("id".to_string(), json!(apply_task_id));
+        args5.insert("operator".to_string(), json!("applicant"));
+        let resp5 = facade.flow("processTask/execute", &args5).await;
+        assert_eq!(resp5["code"], 0, "execute failed: {:?}", resp5);
+        let exec_task_ids = resp5["data"]["taskIds"].as_array().unwrap();
+        assert!(!exec_task_ids.is_empty(), "execute should return new taskIds");
+        // #91: taskIds must be non-zero
+        let new_task_id_str = exec_task_ids[0].as_str().expect("#91: execute taskId should be string (#92) and non-zero (#91)");
+        let new_task_id: i64 = new_task_id_str.parse().unwrap();
+        assert!(new_task_id > 0, "#91: execute taskId should be non-zero, got 0");
+
+        // 6. processTask/todoList (operator=user2) — cross-check id matches
+        let mut args6 = HashMap::new();
+        args6.insert("operator".to_string(), json!("user2"));
+        let resp6 = facade.flow("processTask/todoList", &args6).await;
+        assert_eq!(resp6["code"], 0, "todoList failed: {:?}", resp6);
+        let rows = resp6["data"]["rows"].as_array().unwrap();
+        assert!(!rows.is_empty(), "user2 should have a todo task");
+        let todo_task_id_str = rows[0]["id"].as_str().expect("todoList id should be string");
+        let todo_task_id: i64 = todo_task_id_str.parse().unwrap();
+        // #91: execute response taskId must match todoList task id
+        assert_eq!(new_task_id, todo_task_id,
+            "#91: execute response taskId ({}) must match todoList id ({})", new_task_id, todo_task_id);
     }
 
     // ─── Action count test ───
