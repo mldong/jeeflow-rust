@@ -803,7 +803,8 @@ impl JeeflowEngineImpl {
             }
         }
 
-        // 10b. Non-countersign: continue execution from current node (original path)
+        // 10b. Continue execution from current node: non-countersign tasks always,
+        // and countersign tasks once the gate is merged (issues/94 fall-through).
         if let Some(node) = node {
             let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
                 .iter()
