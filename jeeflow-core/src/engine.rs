@@ -704,10 +704,15 @@ impl JeeflowEngineImpl {
             let node_ref = node.as_ref().unwrap();
             let node_id = &node_ref.id;
 
-            // Collect same-node tasks
-            let same_node_tasks: Vec<&ProcessTask> = exec.process_instance.tasks.iter()
+            // Pre-compute same-node task counts (avoid borrow conflict with abandon)
+            let node_task_counts: Vec<(bool, i32)> = exec.process_instance.tasks.iter()
                 .filter(|t| &t.task_name == node_id)
+                .map(|t| (t.is_finished(), t.task_state))
                 .collect();
+            let total = node_task_counts.len();
+            let finished_count = node_task_counts.iter().filter(|(f, _)| *f).count();
+            let doing_count = node_task_counts.iter().filter(|(_, s)| *s == TaskState::Doing.code()).count();
+            let all_finished = node_task_counts.iter().all(|(f, _)| *f);
 
             let cs_type = node_ref.countersign_type();
             let cond = node_ref.countersign_completion_condition();
@@ -721,19 +726,8 @@ impl JeeflowEngineImpl {
                 // Veto → merged: abandon remaining DOING tasks
                 self.abandon_countersign_remaining(&mut exec, node_id)?;
                 exec.is_merged = true;
-                // Execute end node
-                let end_nodes = exec.process_model.get_end_nodes();
-                if let Some(end) = end_nodes.first() {
-                    let end = (*end).clone();
-                    self.execute_node(&mut exec, &end)?;
-                }
-                // Persist + return
-                self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
-                self.repo().update_instance(&exec.process_instance)?;
-                return Ok(exec.new_tasks);
-            }
-
-            if is_sequential {
+                // Fall through to 10b (follow output edges)
+            } else if is_sequential {
                 // SEQUENTIAL: check if more actors to process
                 let op_list_key = format!("csv_{}_operatorList", node_id);
                 let lc_key = format!("csv_{}_loopCounter", node_id);
@@ -757,17 +751,9 @@ impl JeeflowEngineImpl {
                     self.repo().update_instance(&exec.process_instance)?;
                     return Ok(exec.new_tasks);
                 } else {
-                    // Last person → merged
+                    // Last person → merged, fall through to 10b
                     self.abandon_countersign_remaining(&mut exec, node_id)?;
                     exec.is_merged = true;
-                    let end_nodes = exec.process_model.get_end_nodes();
-                    if let Some(end) = end_nodes.first() {
-                        let end = (*end).clone();
-                        self.execute_node(&mut exec, &end)?;
-                    }
-                    self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
-                    self.repo().update_instance(&exec.process_instance)?;
-                    return Ok(exec.new_tasks);
                 }
             } else {
                 // PARALLEL: check completion condition
@@ -778,10 +764,7 @@ impl JeeflowEngineImpl {
 
                 if has_expr_cond {
                     // Expression condition (e.g. "#nrOfCompletedInstances==2")
-                    let finished_count = same_node_tasks.iter().filter(|t| t.is_finished()).count();
-                    let doing_count = same_node_tasks.iter().filter(|t| t.task_state == TaskState::Doing.code()).count();
-                    let total = same_node_tasks.len();
-                    // Build gate vars
+                    // Build gate vars (using pre-computed counts)
                     exec.gate_vars.insert_i64("nrOfInstances", total as i64);
                     exec.gate_vars.insert_i64("nrOfActivateInstances", doing_count as i64);
                     exec.gate_vars.insert_i64("nrOfCompletedInstances", finished_count as i64);
@@ -796,14 +779,7 @@ impl JeeflowEngineImpl {
                     if merged {
                         self.abandon_countersign_remaining(&mut exec, node_id)?;
                         exec.is_merged = true;
-                        let end_nodes = exec.process_model.get_end_nodes();
-                        if let Some(end) = end_nodes.first() {
-                            let end = (*end).clone();
-                            self.execute_node(&mut exec, &end)?;
-                        }
-                        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
-                        self.repo().update_instance(&exec.process_instance)?;
-                        return Ok(exec.new_tasks);
+                        // Fall through to 10b (follow output edges)
                     } else {
                         // Not merged → return without following edges
                         self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
@@ -812,18 +788,11 @@ impl JeeflowEngineImpl {
                     }
                 } else {
                     // No condition (or ONE_VOTE_VETO without veto hit) → all must finish
-                    let merged = same_node_tasks.iter().all(|t| t.is_finished());
+                    let merged = all_finished;
                     if merged {
                         self.abandon_countersign_remaining(&mut exec, node_id)?;
                         exec.is_merged = true;
-                        let end_nodes = exec.process_model.get_end_nodes();
-                        if let Some(end) = end_nodes.first() {
-                            let end = (*end).clone();
-                            self.execute_node(&mut exec, &end)?;
-                        }
-                        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
-                        self.repo().update_instance(&exec.process_instance)?;
-                        return Ok(exec.new_tasks);
+                        // Fall through to 10b (follow output edges)
                     } else {
                         // Not all finished → return without following edges
                         self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
@@ -888,7 +857,21 @@ impl JeeflowEngineImpl {
                 format!("Operator {} not allowed on task {}", operator, task_id)));
         }
 
+        // Inject countersignDisagreeFlag if submitType==20 (issues/94 round 2)
+        let submit_type = full_args.get_i64("submitType")
+            .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
+        if submit_type == Some(20) {
+            instance.variables.insert_str("countersignDisagreeFlag", "1");
+            full_args.insert_str("countersignDisagreeFlag", "1");
+        }
+
         instance.complete_task(task_id, operator, &full_args).map_err(|e| JeeflowError::Business(e))?;
+        // Set flag on completed task's variables
+        if submit_type == Some(20) {
+            if let Some(t) = instance.tasks.iter_mut().find(|t| t.task_id == task_id) {
+                t.variables.insert_str("countersignDisagreeFlag", "1");
+            }
+        }
         if let Some(t) = instance.tasks.iter().find(|t| t.task_id == task_id) {
             self.repo().update_task(t)?;
         }
@@ -937,7 +920,21 @@ impl JeeflowEngineImpl {
                 format!("Operator {} not allowed on task {}", operator, task_id)));
         }
 
+        // Inject countersignDisagreeFlag if submitType==20 (issues/94 round 2)
+        let submit_type = full_args.get_i64("submitType")
+            .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
+        if submit_type == Some(20) {
+            instance.variables.insert_str("countersignDisagreeFlag", "1");
+            full_args.insert_str("countersignDisagreeFlag", "1");
+        }
+
         instance.complete_task(task_id, operator, &full_args).map_err(|e| JeeflowError::Business(e))?;
+        // Set flag on completed task's variables
+        if submit_type == Some(20) {
+            if let Some(t) = instance.tasks.iter_mut().find(|t| t.task_id == task_id) {
+                t.variables.insert_str("countersignDisagreeFlag", "1");
+            }
+        }
         if let Some(t) = instance.tasks.iter().find(|t| t.task_id == task_id) {
             self.repo().update_task(t)?;
         }
@@ -1658,18 +1655,74 @@ mod tests {
         assert!(result.is_err(), "c27: executing abandoned task should fail");
     }
 
-    /// #94 test #7: regression — c08 with new gate semantics
+    /// #94 round 2 test #1: 08 full chain hard assertions
+    /// Flow: apply(applicant) → task1(SEQUENTIAL userA,userB) → approve(leader) → end
     #[tokio::test]
-    async fn test_c28_countersign_sequential_regression() {
+    async fn test_c28_08_full_chain() {
         let (engine, repo) = make_compliance_engine();
         let flow = load_flow("08-countersign-sequential-approve");
-        let did = save_define(&repo, "cs-seq-regress", &flow);
+        let did = save_define(&repo, "cs-seq-08", &flow);
+        let iid = start_and_apply(&engine, &repo, did).await;
+
+        // Step 1: after apply → DOING==1 actor==userA
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 1, "c28: after apply DOING should be 1");
+        assert_eq!(tasks[0].actor_ids, vec!["userA"], "c28: after apply actor should be userA");
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "c28: after apply state should be 10");
+
+        // Step 2: userA completes → DOING==1 actor==userB (sequential next)
+        let userA_task = tasks.into_iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+        engine.execute_task_async(userA_task.task_id, "userA", &FlowData::new()).await.unwrap();
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 1, "c28: after userA DOING should be 1");
+        assert_eq!(tasks[0].actor_ids, vec!["userB"], "c28: after userA actor should be userB");
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "c28: after userA state should be 10");
+
+        // Step 3: userB completes → merged, fall through to 10b → creates approve(leader)
+        let userB_task = tasks.into_iter().find(|t| t.actor_ids.contains(&"userB".to_string())).unwrap();
+        engine.execute_task_async(userB_task.task_id, "userB", &FlowData::new()).await.unwrap();
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 1, "c28: after userB DOING should be 1 (leader approve)");
+        assert_eq!(tasks[0].actor_ids, vec!["leader"], "c28: after userB actor should be leader");
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "c28: after userB state should be 10 (not finished!)");
+
+        // Step 4: leader completes → follows edge to end → state==20
+        let leader_task = tasks.into_iter().find(|t| t.actor_ids.contains(&"leader".to_string())).unwrap();
+        engine.execute_task_async(leader_task.task_id, "leader", &FlowData::new()).await.unwrap();
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 0, "c28: after leader DOING should be 0");
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 20, "c28: after leader state should be 20");
+    }
+
+    /// #94 round 2 test #2: jump_to_end flag injection (no countersign gate on jump)
+    #[tokio::test]
+    async fn test_c29_jump_flag_injection() {
+        let (engine, repo) = make_compliance_engine();
+        let flow = load_flow("13-countersign-one-vote-veto");
+        let did = save_define(&repo, "cs-jump-flag", &flow);
         let iid = start_and_apply(&engine, &repo, did).await;
         let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
-        assert!(!tasks.is_empty(), "c28: should have tasks after apply");
+        let userA_task = tasks.into_iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+
+        // Execute via jump_to_end with submitType=20
+        let mut args = FlowData::new();
+        args.insert_i64("submitType", 20);
+        engine.execute_and_jump_to_end_async(userA_task.task_id, "userA", &args).await.unwrap();
+
+        // Instance should be rejected (state=45)
         let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
-        assert_eq!(inst.state, 10, "c28: instance should be running");
-        // With the gate fix, sequential should have exactly 1 DOING task
-        // (or more if 08 flow is parallel — just verify state is correct)
+        assert_eq!(inst.state, 45, "c29: instance should be rejected");
+        // Flag should be in instance.variables
+        assert_eq!(inst.variables.get_str("countersignDisagreeFlag").unwrap(), "1",
+            "c29: flag should be in instance variables");
+        // Flag should be on userA's task variables
+        let all_tasks = repo.find_history_tasks(iid).unwrap();
+        let userA_done = all_tasks.iter().find(|t| t.task_id == userA_task.task_id).unwrap();
+        assert_eq!(userA_done.variables.get_str("countersignDisagreeFlag").unwrap(), "1",
+            "c29: flag should be on task variables");
     }
 }
