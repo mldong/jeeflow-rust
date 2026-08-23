@@ -1,0 +1,18 @@
+[package]
+name = "jeeflow-facade"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "jeeflow workflow engine facade - 42 actions unified entry point"
+
+[dependencies]
+jeeflow-core = { path = "../jeeflow-core" }
+jeeflow-persist = { path = "../jeeflow-persist" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

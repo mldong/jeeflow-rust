@@ -1,0 +1,16 @@
+[package]
+name = "jeeflow-persist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "jeeflow workflow engine persist layer (DynamicTableWriter + PersistPostInterceptor)"
+
+[dependencies]
+jeeflow-core = { path = "../jeeflow-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

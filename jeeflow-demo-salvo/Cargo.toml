@@ -1,0 +1,18 @@
+[package]
+name = "jeeflow-demo-salvo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "jeeflow workflow engine demo server (Salvo)"
+
+[dependencies]
+jeeflow-core = { path = "../jeeflow-core" }
+jeeflow-repository-sqlx = { path = "../jeeflow-repository-sqlx" }
+jeeflow-persist = { path = "../jeeflow-persist" }
+jeeflow-facade = { path = "../jeeflow-facade" }
+salvo = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
