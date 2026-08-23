@@ -3,6 +3,7 @@
 
 use crate::engine::Execution;
 use crate::error::JeeflowResult;
+use crate::model::ProcessTask;
 
 /// IHandler trait — node type handler.
 pub trait IHandler: Send + Sync {
@@ -60,84 +61,114 @@ impl IHandler for StartSubProcessHandler {
 }
 
 /// CountersignHandler — evaluates countersign completion conditions.
+/// Refactored from dead IHandler impl to pure functions for engine gate logic (issues/94).
 pub struct CountersignHandler;
 
 impl CountersignHandler {
-    /// Check if countersign is complete based on type and completed count.
-    pub fn is_complete(total: usize, completed: usize, countersign_type: &str,
-                        ratio: Option<f64>, has_rejected: bool) -> bool {
-        if has_rejected {
-            return true; // One veto = complete
-        }
-        match countersign_type.to_uppercase().as_str() {
-            "SEQUENTIAL" | "SERIAL" => completed >= total,
-            "RATIO" => {
-                if let Some(r) = ratio {
-                    completed as f64 / total as f64 >= r
-                } else {
-                    completed >= total
+    /// Check if a countersign node should merge after a task completion.
+    /// Implements: one-vote veto gate + SEQUENTIAL/PARALLEL/RATIO completion conditions.
+    ///
+    /// - `same_node_tasks`: all tasks belonging to the countersign node (FINISHED/DOING/ABANDON)
+    /// - `submit_type`: the submit type from exec args (Some(20) = countersign disagree)
+    /// - `completion_condition`: the node's countersignCompletionCondition (trimmed)
+    /// - `countersign_type`: SEQUENTIAL / PARALLEL
+    pub fn check_merge(same_node_tasks: &[&ProcessTask], submit_type: Option<i64>,
+                        completion_condition: Option<&str>, countersign_type: &str) -> bool {
+        let total = same_node_tasks.len();
+        let finished = same_node_tasks.iter().filter(|t| t.is_finished()).count();
+
+        // One-vote veto gate: submitType==20 AND condition == ONE_VOTE_VETO (case-insensitive)
+        if submit_type == Some(20) {
+            if let Some(cond) = completion_condition {
+                if cond.trim().eq_ignore_ascii_case("ONE_VOTE_VETO") {
+                    return true;
                 }
             }
-            _ => { // PARALLEL (default)
-                completed >= total
+        }
+
+        match countersign_type.to_uppercase().as_str() {
+            "SEQUENTIAL" | "SERIAL" => finished >= total,
+            _ => {
+                // PARALLEL (default)
+                if let Some(cond) = completion_condition {
+                    let cond = cond.trim();
+                    if cond.is_empty() || cond.eq_ignore_ascii_case("ONE_VOTE_VETO") {
+                        // No special condition (or ONE_VOTE_VETO but veto gate not hit) → all must finish
+                        finished >= total
+                    } else {
+                        // Expression condition (e.g. "#nrOfCompletedInstances==2")
+                        // evaluated by the engine with gate vars; this pure function
+                        // cannot evaluate expressions, so the engine handles it separately.
+                        // Return false here; engine will evaluate the expression itself.
+                        false
+                    }
+                } else {
+                    finished >= total
+                }
             }
         }
-    }
-}
-
-impl IHandler for CountersignHandler {
-    fn handle(&self, execution: &mut Execution) -> JeeflowResult<()> {
-        // Countersign completion check
-        if let Some(task) = &execution.process_task {
-            let task_name = &task.task_name;
-            let all_tasks = &execution.process_instance.tasks;
-            let same_node_tasks: Vec<_> = all_tasks.iter()
-                .filter(|t| t.task_name == *task_name)
-                .collect();
-            let total = same_node_tasks.len();
-            let completed = same_node_tasks.iter()
-                .filter(|t| t.is_finished())
-                .count();
-            let has_rejected = same_node_tasks.iter()
-                .any(|t| t.task_state == crate::model::TaskState::Abandon.code());
-
-            let cs_type = execution.current_node.as_ref()
-                .map(|n| n.countersign_type())
-                .unwrap_or_else(|| "PARALLEL".to_string());
-
-            if Self::is_complete(total, completed, &cs_type, None, has_rejected) {
-                execution.is_merged = true;
-            }
-        }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::*;
+    use crate::json::FlowData;
 
-    #[test]
-    fn test_countersign_parallel() {
-        assert!(!CountersignHandler::is_complete(3, 1, "PARALLEL", None, false));
-        assert!(!CountersignHandler::is_complete(3, 2, "PARALLEL", None, false));
-        assert!(CountersignHandler::is_complete(3, 3, "PARALLEL", None, false));
+    fn make_task(name: &str, state: i32) -> ProcessTask {
+        ProcessTask {
+            task_id: 0, process_instance_id: 1,
+            task_name: name.to_string(), display_name: "T".to_string(),
+            task_type: 0, perform_type: 1, task_state: state,
+            actor_id: None, actor_ids: vec!["u".to_string()],
+            finish_time: None, expire_time: None, form_key: None,
+            parent_task_id: None, variables: FlowData::new(),
+            create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        }
     }
 
     #[test]
-    fn test_countersign_sequential() {
-        assert!(!CountersignHandler::is_complete(2, 1, "SEQUENTIAL", None, false));
-        assert!(CountersignHandler::is_complete(2, 2, "SEQUENTIAL", None, false));
+    fn test_countersign_parallel_all_done() {
+        let tasks: Vec<ProcessTask> = (0..3).map(|_| make_task("t", TaskState::Finished.code())).collect();
+        let refs: Vec<&ProcessTask> = tasks.iter().collect();
+        assert!(CountersignHandler::check_merge(&refs, None, None, "PARALLEL"));
     }
 
     #[test]
-    fn test_countersign_ratio() {
-        assert!(CountersignHandler::is_complete(4, 3, "RATIO", Some(0.75), false));
-        assert!(!CountersignHandler::is_complete(4, 2, "RATIO", Some(0.75), false));
+    fn test_countersign_parallel_not_all_done() {
+        let mut tasks: Vec<ProcessTask> = (0..3).map(|_| make_task("t", TaskState::Finished.code())).collect();
+        tasks[2].task_state = TaskState::Doing.code();
+        let refs: Vec<&ProcessTask> = tasks.iter().collect();
+        assert!(!CountersignHandler::check_merge(&refs, None, None, "PARALLEL"));
     }
 
     #[test]
-    fn test_countersign_veto() {
-        assert!(CountersignHandler::is_complete(3, 0, "PARALLEL", None, true));
+    fn test_countersign_sequential_not_all() {
+        let mut tasks: Vec<ProcessTask> = (0..2).map(|_| make_task("t", TaskState::Finished.code())).collect();
+        tasks[1].task_state = TaskState::Doing.code();
+        let refs: Vec<&ProcessTask> = tasks.iter().collect();
+        assert!(!CountersignHandler::check_merge(&refs, None, None, "SEQUENTIAL"));
+    }
+
+    #[test]
+    fn test_countersign_sequential_all_done() {
+        let tasks: Vec<ProcessTask> = (0..2).map(|_| make_task("t", TaskState::Finished.code())).collect();
+        let refs: Vec<&ProcessTask> = tasks.iter().collect();
+        assert!(CountersignHandler::check_merge(&refs, None, None, "SEQUENTIAL"));
+    }
+
+    #[test]
+    fn test_countersign_one_vote_veto() {
+        let mut tasks: Vec<ProcessTask> = (0..3).map(|_| make_task("t", TaskState::Doing.code())).collect();
+        tasks[0].task_state = TaskState::Finished.code();
+        let refs: Vec<&ProcessTask> = tasks.iter().collect();
+        // submitType=20 + ONE_VOTE_VETO → merged
+        assert!(CountersignHandler::check_merge(&refs, Some(20), Some("ONE_VOTE_VETO"), "PARALLEL"));
+        // submitType=20 + no condition → soft reject, NOT merged
+        assert!(!CountersignHandler::check_merge(&refs, Some(20), None, "PARALLEL"));
+        // submitType=1 + ONE_VOTE_VETO → not merged (veto not triggered)
+        assert!(!CountersignHandler::check_merge(&refs, Some(1), Some("ONE_VOTE_VETO"), "PARALLEL"));
     }
 }

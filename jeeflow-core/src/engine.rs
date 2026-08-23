@@ -32,6 +32,8 @@ pub struct Execution {
     pub new_tasks: Vec<ProcessTask>,
     /// Whether the instance was finished/rejected during this step.
     pub instance_finished: bool,
+    /// Gate variables for countersign expression evaluation (nrOfInstances, etc.)
+    pub gate_vars: FlowData,
 }
 
 impl Execution {
@@ -49,6 +51,7 @@ impl Execution {
             is_merged: false,
             new_tasks: Vec::new(),
             instance_finished: false,
+            gate_vars: FlowData::new(),
         }
     }
 }
@@ -319,19 +322,39 @@ impl JeeflowEngineImpl {
         let task_type = TaskType::from_code(node.task_type());
 
         let task = if perform_type == PerformType::Countersign {
-            // Countersign: create one task per actor
-            let tasks = exec.process_instance.create_countersign_tasks(
-                &node.id, &node.display_name, &actor_ids, &exec.operator,
-                task_type, node.form_key(), None);
-            // Fire task start event for each countersign task
-            for t in &tasks {
-                let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, t.task_id);
-                ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+            let cs_type = node.countersign_type();
+            if cs_type.to_uppercase() == "SEQUENTIAL" || cs_type.to_uppercase() == "SERIAL" {
+                // SEQUENTIAL: only create first actor's task (issues/94)
+                if actor_ids.is_empty() {
+                    return Ok(());
+                }
+                // Store full operator list in instance variables
+                let op_list_key = format!("csv_{}_operatorList", node.id);
+                exec.process_instance.variables.insert_str(&op_list_key, actor_ids.join(","));
+                let lc_key = format!("csv_{}_loopCounter", node.id);
+                exec.process_instance.variables.insert_i64(&lc_key, 0);
+                // Create only the first actor's task
+                let tasks = exec.process_instance.create_countersign_tasks(
+                    &node.id, &node.display_name, &[actor_ids[0].clone()], &exec.operator,
+                    task_type, node.form_key(), None);
+                for t in &tasks {
+                    let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, t.task_id);
+                    ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+                }
+                exec.new_tasks.extend(tasks);
+                exec.process_instance.tasks.last().cloned().unwrap()
+            } else {
+                // PARALLEL: create all tasks at once
+                let tasks = exec.process_instance.create_countersign_tasks(
+                    &node.id, &node.display_name, &actor_ids, &exec.operator,
+                    task_type, node.form_key(), None);
+                for t in &tasks {
+                    let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, t.task_id);
+                    ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+                }
+                exec.new_tasks.extend(tasks);
+                exec.process_instance.tasks.last().cloned().unwrap()
             }
-            // Push ALL countersign tasks for persistence
-            exec.new_tasks.extend(tasks);
-            // Return first for reference (e.g. exec.process_task)
-            exec.process_instance.tasks.last().cloned().unwrap()
         } else {
             exec.process_instance.create_task(
                 &node.id, &node.display_name, &actor_ids, &exec.operator,
@@ -417,7 +440,33 @@ impl JeeflowEngineImpl {
                 break;
             }
         }
-        result
+        // Replace #var patterns (countersign gate variables like #nrOfCompletedInstances)
+        let mut out = String::new();
+        let mut i = 0;
+        let chars = result.as_bytes();
+        while i < chars.len() {
+            if chars[i] == b'#' && i + 1 < chars.len() && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == b'_') {
+                let start = i + 1;
+                let mut end = start;
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == b'_') {
+                    end += 1;
+                }
+                let var_name = &result[start..end];
+                // Look up in gate_vars first, then args (handle both string and numeric values)
+                let value = exec.gate_vars.get_str(var_name)
+                    .or_else(|| exec.args.get_str(var_name))
+                    .map(|s| s.to_string())
+                    .or_else(|| exec.gate_vars.get_i64(var_name).map(|n| n.to_string()))
+                    .or_else(|| exec.args.get_i64(var_name).map(|n| n.to_string()))
+                    .unwrap_or_else(|| "0".to_string());
+                out.push_str(&value);
+                i = end;
+            } else {
+                out.push(chars[i] as char);
+                i += 1;
+            }
+        }
+        out
     }
 
     fn compare_values(&self, left: &str, right: &str) -> Option<std::cmp::Ordering> {
@@ -437,6 +486,24 @@ impl JeeflowEngineImpl {
 
     /// Fire post-interceptors.
     fn fire_post_interceptors(&self, _exec: &mut Execution) -> JeeflowResult<()> {
+        Ok(())
+    }
+
+    /// Abandon remaining DOING countersign tasks for a node (issues/94).
+    /// Only abandons tasks with task_name == node_id and state == DOING.
+    /// The just-completed task is already FINISHED so won't be affected.
+    fn abandon_countersign_remaining(&self, exec: &mut Execution, node_id: &str) -> JeeflowResult<()> {
+        let mut abandoned = Vec::new();
+        for task in &mut exec.process_instance.tasks {
+            if task.task_name == node_id && task.task_state == TaskState::Doing.code() {
+                task.task_state = TaskState::Abandon.code();
+                abandoned.push(task.clone());
+            }
+        }
+        // Persist abandoned tasks to repo
+        for t in &abandoned {
+            self.repo().update_task(t)?;
+        }
         Ok(())
     }
 
@@ -601,8 +668,23 @@ impl JeeflowEngineImpl {
                 format!("Operator {} not allowed on task {}", operator, task_id)));
         }
 
+        // 5.5. Inject countersignDisagreeFlag if submitType==20 (issues/94)
+        let submit_type = full_args.get_i64("submitType")
+            .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
+        if submit_type == Some(20) {
+            instance.variables.insert_str("countersignDisagreeFlag", "1");
+            full_args.insert_str("countersignDisagreeFlag", "1");
+        }
+
         // 6. Complete task in aggregate
         instance.complete_task(task_id, operator, &full_args).map_err(|e| JeeflowError::Business(e))?;
+
+        // 6.5. Set countersignDisagreeFlag on the completed task's variables too
+        if submit_type == Some(20) {
+            if let Some(t) = instance.tasks.iter_mut().find(|t| t.task_id == task_id) {
+                t.variables.insert_str("countersignDisagreeFlag", "1");
+            }
+        }
 
         // 7. Persist task update (sync)
         if let Some(t) = instance.tasks.iter().find(|t| t.task_id == task_id) {
@@ -616,7 +698,143 @@ impl JeeflowEngineImpl {
         let mut exec = Execution::new(instance, model, define, operator, full_args);
         exec.process_task = Some(task.clone());
 
-        // 10. Continue execution from current node
+        // 10. Countersign gate check (issues/94)
+        let is_countersign = node.as_ref().map(|n| n.is_countersign()).unwrap_or(false);
+        if is_countersign {
+            let node_ref = node.as_ref().unwrap();
+            let node_id = &node_ref.id;
+
+            // Collect same-node tasks
+            let same_node_tasks: Vec<&ProcessTask> = exec.process_instance.tasks.iter()
+                .filter(|t| &t.task_name == node_id)
+                .collect();
+
+            let cs_type = node_ref.countersign_type();
+            let cond = node_ref.countersign_completion_condition();
+            let is_sequential = cs_type.to_uppercase() == "SEQUENTIAL" || cs_type.to_uppercase() == "SERIAL";
+
+            // Check one-vote veto gate first
+            let veto_hit = submit_type == Some(20)
+                && cond.as_ref().map(|c| c.trim().eq_ignore_ascii_case("ONE_VOTE_VETO")).unwrap_or(false);
+
+            if veto_hit {
+                // Veto → merged: abandon remaining DOING tasks
+                self.abandon_countersign_remaining(&mut exec, node_id)?;
+                exec.is_merged = true;
+                // Execute end node
+                let end_nodes = exec.process_model.get_end_nodes();
+                if let Some(end) = end_nodes.first() {
+                    let end = (*end).clone();
+                    self.execute_node(&mut exec, &end)?;
+                }
+                // Persist + return
+                self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                self.repo().update_instance(&exec.process_instance)?;
+                return Ok(exec.new_tasks);
+            }
+
+            if is_sequential {
+                // SEQUENTIAL: check if more actors to process
+                let op_list_key = format!("csv_{}_operatorList", node_id);
+                let lc_key = format!("csv_{}_loopCounter", node_id);
+                let op_list_str = exec.process_instance.variables.get_str_or(&op_list_key, "");
+                let operator_list: Vec<String> = op_list_str.split(',')
+                    .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                let lc = exec.process_instance.variables.get_i64_or(&lc_key, 0) as usize;
+
+                if lc + 1 < operator_list.len() {
+                    // Create next sequential task, do NOT follow edges
+                    let next_lc = lc + 1;
+                    exec.process_instance.variables.insert_i64(&lc_key, next_lc as i64);
+                    let new_task = exec.process_instance.create_countersign_tasks(
+                        node_id, &node_ref.display_name,
+                        &[operator_list[next_lc].clone()], &exec.operator,
+                        TaskType::from_code(node_ref.task_type()),
+                        node_ref.form_key(), None);
+                    exec.new_tasks.extend(new_task);
+                    // Persist + return (no edge follow)
+                    self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                    self.repo().update_instance(&exec.process_instance)?;
+                    return Ok(exec.new_tasks);
+                } else {
+                    // Last person → merged
+                    self.abandon_countersign_remaining(&mut exec, node_id)?;
+                    exec.is_merged = true;
+                    let end_nodes = exec.process_model.get_end_nodes();
+                    if let Some(end) = end_nodes.first() {
+                        let end = (*end).clone();
+                        self.execute_node(&mut exec, &end)?;
+                    }
+                    self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                    self.repo().update_instance(&exec.process_instance)?;
+                    return Ok(exec.new_tasks);
+                }
+            } else {
+                // PARALLEL: check completion condition
+                let has_expr_cond = cond.as_ref().map(|c| {
+                    let c = c.trim();
+                    !c.is_empty() && !c.eq_ignore_ascii_case("ONE_VOTE_VETO")
+                }).unwrap_or(false);
+
+                if has_expr_cond {
+                    // Expression condition (e.g. "#nrOfCompletedInstances==2")
+                    let finished_count = same_node_tasks.iter().filter(|t| t.is_finished()).count();
+                    let doing_count = same_node_tasks.iter().filter(|t| t.task_state == TaskState::Doing.code()).count();
+                    let total = same_node_tasks.len();
+                    // Build gate vars
+                    exec.gate_vars.insert_i64("nrOfInstances", total as i64);
+                    exec.gate_vars.insert_i64("nrOfActivateInstances", doing_count as i64);
+                    exec.gate_vars.insert_i64("nrOfCompletedInstances", finished_count as i64);
+                    // Also add to instance variables for expression resolution
+                    exec.process_instance.variables.insert_i64("nrOfInstances", total as i64);
+                    exec.process_instance.variables.insert_i64("nrOfActivateInstances", doing_count as i64);
+                    exec.process_instance.variables.insert_i64("nrOfCompletedInstances", finished_count as i64);
+
+                    let cond_str = cond.as_ref().unwrap().trim();
+                    let merged = self.simple_eval(cond_str, &exec);
+
+                    if merged {
+                        self.abandon_countersign_remaining(&mut exec, node_id)?;
+                        exec.is_merged = true;
+                        let end_nodes = exec.process_model.get_end_nodes();
+                        if let Some(end) = end_nodes.first() {
+                            let end = (*end).clone();
+                            self.execute_node(&mut exec, &end)?;
+                        }
+                        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                        self.repo().update_instance(&exec.process_instance)?;
+                        return Ok(exec.new_tasks);
+                    } else {
+                        // Not merged → return without following edges
+                        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                        self.repo().update_instance(&exec.process_instance)?;
+                        return Ok(exec.new_tasks);
+                    }
+                } else {
+                    // No condition (or ONE_VOTE_VETO without veto hit) → all must finish
+                    let merged = same_node_tasks.iter().all(|t| t.is_finished());
+                    if merged {
+                        self.abandon_countersign_remaining(&mut exec, node_id)?;
+                        exec.is_merged = true;
+                        let end_nodes = exec.process_model.get_end_nodes();
+                        if let Some(end) = end_nodes.first() {
+                            let end = (*end).clone();
+                            self.execute_node(&mut exec, &end)?;
+                        }
+                        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                        self.repo().update_instance(&exec.process_instance)?;
+                        return Ok(exec.new_tasks);
+                    } else {
+                        // Not all finished → return without following edges
+                        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                        self.repo().update_instance(&exec.process_instance)?;
+                        return Ok(exec.new_tasks);
+                    }
+                }
+            }
+        }
+
+        // 10b. Non-countersign: continue execution from current node (original path)
         if let Some(node) = node {
             let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
                 .iter()
@@ -1040,17 +1258,38 @@ mod tests {
         let did = save_define(&repo, "countersign-parallel", &flow);
         let iid = start_and_apply(&engine, &repo, did).await;
         let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
-        assert!(tasks.len() >= 2, "c05: parallel countersign should create multiple tasks, got {}", tasks.len());
+        assert_eq!(tasks.len(), 3, "c05: parallel countersign should create exactly 3 tasks, got {}", tasks.len());
     }
 
+    /// #94 regression: sequential countersign creates one at a time with completion gate.
     #[tokio::test]
     async fn test_c06_countersign_sequential() {
         let (engine, repo) = make_compliance_engine();
         let flow = load_flow("06-countersign-sequential");
         let did = save_define(&repo, "countersign-sequential", &flow);
         let iid = start_and_apply(&engine, &repo, did).await;
+
+        // After apply: exactly 1 DOING task for userA
         let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
-        assert!(!tasks.is_empty(), "c06: sequential countersign should create first task");
+        assert_eq!(tasks.len(), 1, "c06: after apply DOING should be exactly 1");
+        assert_eq!(tasks[0].actor_ids[0], "userA", "c06: first task should be for userA");
+
+        // userA completes → state=10, next task for userB created
+        let mut args = FlowData::new();
+        args.insert_i64("submitType", 1);
+        engine.execute_task_async(tasks[0].task_id, "userA", &args).await.unwrap();
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "c06: after userA instance should still be running");
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 1, "c06: after userA DOING should be exactly 1");
+        assert_eq!(tasks[0].actor_ids[0], "userB", "c06: next task should be for userB");
+
+        // userB completes → state=20 (finished)
+        engine.execute_task_async(tasks[0].task_id, "userB", &args).await.unwrap();
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 20, "c06: after userB instance should be finished");
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 0, "c06: no DOING tasks after finish");
     }
 
     #[tokio::test]
@@ -1060,7 +1299,7 @@ mod tests {
         let did = save_define(&repo, "countersign-ratio", &flow);
         let iid = start_and_apply(&engine, &repo, did).await;
         let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
-        assert!(tasks.len() >= 2, "c07: ratio countersign should create multiple tasks");
+        assert_eq!(tasks.len(), 4, "c07: ratio countersign should create exactly 4 tasks, got {}", tasks.len());
     }
 
     #[tokio::test]
@@ -1273,5 +1512,164 @@ mod tests {
         assert!(by_type.len() >= 2, "c22: should have >= 2 assignment handlers");
         let all = registry.all_handlers();
         assert_eq!(all.len(), built_in_count + 2, "c22: total should include built-ins + 2");
+    }
+
+    // ── v1.5.0 #94 countersign gate scenarios (23-28) ──
+
+    /// #94 test #2: parallel soft reject (submitType=20, no ONE_VOTE_VETO)
+    #[tokio::test]
+    async fn test_c23_parallel_soft_reject() {
+        let (engine, repo) = make_compliance_engine();
+        let flow = load_flow("05-countersign-parallel");
+        let did = save_define(&repo, "cs-parallel-soft", &flow);
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 3, "c23: should have 3 DOING tasks");
+        let userA_task = tasks.iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+
+        // userA submitType=20 → soft reject (no ONE_VOTE_VETO configured)
+        let mut args = FlowData::new();
+        args.insert_i64("submitType", 20);
+        engine.execute_task_async(userA_task.task_id, "userA", &args).await.unwrap();
+
+        // Instance still running, userA FINISHED, userB/userC still DOING
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "c23: soft reject should not finish instance");
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(doing.len(), 2, "c23: userB/userC should still be DOING");
+        // countersignDisagreeFlag=1 in instance variables
+        assert_eq!(inst.variables.get_str("countersignDisagreeFlag"), Some("1"),
+            "c23: countersignDisagreeFlag should be 1 in instance variables");
+        // Task variable also has the flag
+        let all_tasks = repo.find_history_tasks(iid).unwrap();
+        let userA_done = all_tasks.iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+        assert_eq!(userA_done.variables.get_str("countersignDisagreeFlag"), Some("1"),
+            "c23: countersignDisagreeFlag should be 1 in task variables");
+    }
+
+    /// #94 test #3: one-vote veto (13)
+    #[tokio::test]
+    async fn test_c24_one_vote_veto() {
+        let (engine, repo) = make_compliance_engine();
+        let flow = load_flow("13-countersign-one-vote-veto");
+        let did = save_define(&repo, "cs-one-vote-veto", &flow);
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 3, "c24: should have 3 DOING tasks");
+        let userA_task = tasks.iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+
+        // userA submitType=20 → ONE_VOTE_VETO triggers → instance finished
+        let mut args = FlowData::new();
+        args.insert_i64("submitType", 20);
+        engine.execute_task_async(userA_task.task_id, "userA", &args).await.unwrap();
+
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 20, "c24: veto should finish instance");
+        // userB/userC tasks should be ABANDON (99)
+        let all_tasks = repo.find_history_tasks(iid).unwrap();
+        let userB_task = all_tasks.iter().find(|t| t.actor_ids.contains(&"userB".to_string())).unwrap();
+        let userC_task = all_tasks.iter().find(|t| t.actor_ids.contains(&"userC".to_string())).unwrap();
+        assert_eq!(userB_task.task_state, 99, "c24: userB task should be ABANDON(99)");
+        assert_eq!(userC_task.task_state, 99, "c24: userC task should be ABANDON(99)");
+        // userA FINISHED
+        let userA_done = all_tasks.iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+        assert_eq!(userA_done.task_state, 20, "c24: userA task should be FINISHED(20)");
+        // flag present
+        assert_eq!(inst.variables.get_str("countersignDisagreeFlag"), Some("1"),
+            "c24: countersignDisagreeFlag should be 1");
+    }
+
+    /// #94 test #4: ratio expression (#nrOfCompletedInstances==2)
+    #[tokio::test]
+    async fn test_c25_ratio_expression() {
+        let (engine, repo) = make_compliance_engine();
+        let flow = load_flow("07-countersign-ratio");
+        let did = save_define(&repo, "cs-ratio", &flow);
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 4, "c25: should have 4 DOING tasks");
+
+        // Complete 1 person → still running, 3 DOING
+        let userA_task = tasks.iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+        engine.execute_task_async(userA_task.task_id, "userA", &FlowData::new()).await.unwrap();
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "c25: after 1 completion should still be running");
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(doing.len(), 3, "c25: should have 3 DOING after 1 completion");
+
+        // Complete 2nd person → merged (ratio 2/4 met), 2 remaining ABANDON
+        let userB_task = doing.iter().find(|t| t.actor_ids.contains(&"userB".to_string())).unwrap();
+        engine.execute_task_async(userB_task.task_id, "userB", &FlowData::new()).await.unwrap();
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 20, "c25: after 2nd completion should be finished (ratio met)");
+        let all_tasks = repo.find_history_tasks(iid).unwrap();
+        let abandon_count = all_tasks.iter().filter(|t| t.task_state == 99).count();
+        assert_eq!(abandon_count, 2, "c25: 2 remaining tasks should be ABANDON");
+    }
+
+    /// #94 test #5: soft reject follow-up (remaining complete normally)
+    #[tokio::test]
+    async fn test_c26_soft_reject_followup() {
+        let (engine, repo) = make_compliance_engine();
+        let flow = load_flow("05-countersign-parallel");
+        let did = save_define(&repo, "cs-soft-followup", &flow);
+        let iid = start_and_apply(&engine, &repo, did).await;
+
+        // userA soft-rejects (submitType=20)
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        let userA_task = tasks.iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+        let mut args = FlowData::new();
+        args.insert_i64("submitType", 20);
+        engine.execute_task_async(userA_task.task_id, "userA", &args).await.unwrap();
+
+        // userB completes normally
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        let userB_task = doing.iter().find(|t| t.actor_ids.contains(&"userB".to_string())).unwrap();
+        engine.execute_task_async(userB_task.task_id, "userB", &FlowData::new()).await.unwrap();
+
+        // userC completes normally → instance finished
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        let userC_task = doing.iter().find(|t| t.actor_ids.contains(&"userC".to_string())).unwrap();
+        engine.execute_task_async(userC_task.task_id, "userC", &FlowData::new()).await.unwrap();
+
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 20, "c26: after all complete, instance should be finished");
+    }
+
+    /// #94 test #6: negative — execute abandoned task should fail
+    #[tokio::test]
+    async fn test_c27_execute_abandoned_task_fails() {
+        let (engine, repo) = make_compliance_engine();
+        let flow = load_flow("13-countersign-one-vote-veto");
+        let did = save_define(&repo, "cs-abandon-neg", &flow);
+        let iid = start_and_apply(&engine, &repo, did).await;
+
+        // Trigger veto to abandon userB/userC
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        let userA_task = tasks.iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+        let userB_task = tasks.iter().find(|t| t.actor_ids.contains(&"userB".to_string())).unwrap();
+        let userB_id = userB_task.task_id;
+        let mut args = FlowData::new();
+        args.insert_i64("submitType", 20);
+        engine.execute_task_async(userA_task.task_id, "userA", &args).await.unwrap();
+
+        // Try to execute abandoned userB task → should fail
+        let result = engine.execute_task_async(userB_id, "userB", &FlowData::new()).await;
+        assert!(result.is_err(), "c27: executing abandoned task should fail");
+    }
+
+    /// #94 test #7: regression — c08 with new gate semantics
+    #[tokio::test]
+    async fn test_c28_countersign_sequential_regression() {
+        let (engine, repo) = make_compliance_engine();
+        let flow = load_flow("08-countersign-sequential-approve");
+        let did = save_define(&repo, "cs-seq-regress", &flow);
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert!(!tasks.is_empty(), "c28: should have tasks after apply");
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "c28: instance should be running");
+        // With the gate fix, sequential should have exactly 1 DOING task
+        // (or more if 08 flow is parallel — just verify state is correct)
     }
 }

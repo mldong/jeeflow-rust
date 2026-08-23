@@ -183,6 +183,25 @@ impl NodeModel {
         self.prop_str("countersignType").unwrap_or_else(|| "PARALLEL".to_string())
     }
 
+    /// Countersign completion condition (from top-level properties or field sub-object).
+    pub fn countersign_completion_condition(&self) -> Option<String> {
+        // Check top-level properties first
+        if let Some(cond) = self.prop_str("countersignCompletionCondition") {
+            return Some(cond);
+        }
+        // Fallback: check inside field sub-object (some flow definitions nest it there)
+        if let Some(field_val) = self.properties.get("field") {
+            if let Some(field_obj) = field_val.as_object() {
+                for (k, v) in field_obj {
+                    if k == "countersignCompletionCondition" {
+                        return v.as_str().map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Expression (for decision edges).
     pub fn expr(&self) -> Option<String> {
         self.prop_str("expr")

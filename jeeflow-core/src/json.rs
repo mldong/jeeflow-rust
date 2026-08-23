@@ -427,6 +427,16 @@ impl FlowData {
         self.inner
     }
 
+    /// Get i64 or default.
+    pub fn get_i64_or(&self, key: &str, default: i64) -> i64 {
+        self.get_i64(key).unwrap_or(default)
+    }
+
+    /// Get string or default.
+    pub fn get_str_or(&self, key: &str, default: &str) -> String {
+        self.get_str(key).map(|s| s.to_string()).unwrap_or_else(|| default.to_string())
+    }
+
     /// Get all keys with a given prefix.
     pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
         self.inner.keys()
