@@ -6,8 +6,8 @@ license.workspace = true
 description = "jeeflow workflow engine facade - 42 actions unified entry point"
 
 [dependencies]
-jeeflow-core = { path = "../jeeflow-core" }
-jeeflow-persist = { path = "../jeeflow-persist" }
+jeeflow-core = { path = "../jeeflow-core", version = "0.1.0" }
+jeeflow-persist = { path = "../jeeflow-persist", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

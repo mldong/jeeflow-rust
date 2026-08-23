@@ -1,0 +1,42 @@
+name: Demo Deploy
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy Rust demo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout jeeflow-rust
+        uses: actions/checkout@v4
+      - name: Build Docker image
+        run: |
+          docker build -f Dockerfile.demo -t jeeflow-rust-demo:latest .
+      - name: Export image
+        run: |
+          docker save jeeflow-rust-demo:latest -o jeeflow-rust-demo.tar
+          chmod 644 jeeflow-rust-demo.tar
+      - name: Upload to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: jeeflow-rust-demo.tar
+          target: /java_projects/jeeflow/demo/
+      - name: Load image and restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /java_projects/jeeflow/demo
+            docker load -i jeeflow-rust-demo.tar
+            # Stop and remove old container if exists
+            docker stop jeeflow-rust-demo 2>/dev/null && docker rm jeeflow-rust-demo 2>/dev/null || true
+            docker run -d --name jeeflow-rust-demo --restart always -p 16085:8091 jeeflow-rust-demo:latest
+            rm -f jeeflow-rust-demo.tar
+            echo "✅ Rust demo deployed (port 16085->8091)"

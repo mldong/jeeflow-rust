@@ -6,7 +6,7 @@ license.workspace = true
 description = "jeeflow workflow engine sqlx repository implementation"
 
 [dependencies]
-jeeflow-core = { path = "../jeeflow-core" }
+jeeflow-core = { path = "../jeeflow-core", version = "0.1.0" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

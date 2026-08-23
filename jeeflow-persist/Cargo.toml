@@ -6,7 +6,7 @@ license.workspace = true
 description = "jeeflow workflow engine persist layer (DynamicTableWriter + PersistPostInterceptor)"
 
 [dependencies]
-jeeflow-core = { path = "../jeeflow-core" }
+jeeflow-core = { path = "../jeeflow-core", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

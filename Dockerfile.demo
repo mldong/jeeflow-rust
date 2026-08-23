@@ -1,0 +1,47 @@
+# jeeflow-rust demo Docker 镜像（多阶段构建）
+# 构建上下文：jeeflow-rust 仓库根目录
+# Rust demo 使用 MemoryRepository，不依赖共享 flows / MySQL
+FROM rust:1.97-slim AS builder
+
+WORKDIR /build
+
+# 先复制 workspace 配置 + 各 crate Cargo.toml（利用 Docker 层缓存）
+COPY Cargo.toml Cargo.lock ./
+COPY jeeflow-core/Cargo.toml jeeflow-core/Cargo.toml
+COPY jeeflow-repository-sqlx/Cargo.toml jeeflow-repository-sqlx/Cargo.toml
+COPY jeeflow-persist/Cargo.toml jeeflow-persist/Cargo.toml
+COPY jeeflow-facade/Cargo.toml jeeflow-facade/Cargo.toml
+COPY jeeflow-demo-salvo/Cargo.toml jeeflow-demo-salvo/Cargo.toml
+
+# 创建 dummy src 以通过编译缓存
+RUN mkdir -p jeeflow-core/src && echo "pub fn dummy(){}" > jeeflow-core/src/lib.rs && \
+    mkdir -p jeeflow-repository-sqlx/src && echo "pub fn dummy(){}" > jeeflow-repository-sqlx/src/lib.rs && \
+    mkdir -p jeeflow-persist/src && echo "pub fn dummy(){}" > jeeflow-persist/src/lib.rs && \
+    mkdir -p jeeflow-facade/src && echo "pub fn dummy(){}" > jeeflow-facade/src/lib.rs && \
+    mkdir -p jeeflow-demo-salvo/src && echo "fn main(){}" > jeeflow-demo-salvo/src/main.rs
+
+# 预编译依赖（缓存层）
+RUN cargo build --release -p jeeflow-demo-salvo 2>/dev/null || true
+
+# 复制真实源码
+COPY jeeflow-core/src jeeflow-core/src
+COPY jeeflow-repository-sqlx/src jeeflow-repository-sqlx/src
+COPY jeeflow-persist/src jeeflow-persist/src
+COPY jeeflow-facade/src jeeflow-facade/src
+COPY jeeflow-demo-salvo/src jeeflow-demo-salvo/src
+
+# 编译 release binary
+RUN cargo build --release -p jeeflow-demo-salvo && \
+    cp target/release/jeeflow-demo-salvo /build/jeeflow-demo-salvo
+
+# ─── runtime ───
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /build/jeeflow-demo-salvo ./jeeflow-demo-salvo
+
+EXPOSE 8091
+CMD ["./jeeflow-demo-salvo"]
