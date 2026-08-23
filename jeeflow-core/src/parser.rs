@@ -155,7 +155,16 @@ impl NodeModel {
     }
 
     /// Perform type (0=normal, 1=countersign).
+    /// Handles both JSON number (1) and string ("1") for cross-language compatibility.
     pub fn perform_type(&self) -> i32 {
+        // Try numeric first (handles JSON number 1 and string "1")
+        if let Some(n) = self.prop_i64("performType") {
+            return match n {
+                1 => 1,
+                _ => 0,
+            };
+        }
+        // Fall back to string parsing
         self.prop_str("performType")
             .map(|s| match s.to_uppercase().as_str() {
                 "1" | "ALL" | "COUNTERSIGN" => 1,

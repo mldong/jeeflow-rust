@@ -260,8 +260,37 @@ impl ProcessRepository for MemoryRepository {
         Ok(PageResult::empty())
     }
 
-    fn page_cc_instances(&self, _query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
-        Ok(PageResult::empty())
+    fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
+        let ccs = self.cc_instances.lock().unwrap();
+        let instances = self.instances.lock().unwrap();
+        let defines = self.defines.lock().unwrap();
+        let rows: Vec<InstanceRow> = ccs.iter().map(|cc| {
+            let inst = instances.get(&cc.process_instance_id);
+            let define = inst.and_then(|i| defines.get(&i.define_id));
+            InstanceRow {
+                id: cc.id,
+                parent_id: None,
+                process_define_id: inst.map(|i| i.define_id).unwrap_or(0),
+                state: cc.state,
+                parent_node_name: None,
+                business_no: inst.and_then(|i| i.business_no.clone()),
+                operator: cc.actor_id.clone(),
+                expire_time: None,
+                variable: None,
+                create_time: cc.create_time.clone(),
+                create_user: cc.create_user.clone(),
+                update_time: cc.update_time.clone(),
+                update_user: cc.update_user.clone(),
+                define_name: define.map(|d| d.name.clone()),
+                define_display_name: define.map(|d| d.display_name.clone()),
+                define_version: define.map(|d| d.version),
+            }
+        }).collect();
+        let total = rows.len() as i64;
+        let start = ((query.page_num - 1) * query.page_size) as usize;
+        let end = std::cmp::min(start + query.page_size as usize, rows.len());
+        let page_rows = if start < rows.len() { rows[start..end].to_vec() } else { vec![] };
+        Ok(PageResult::new(query.page_num, query.page_size, total, page_rows))
     }
 
     fn page_defines(&self, query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>> {

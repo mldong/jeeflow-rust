@@ -307,16 +307,131 @@ fn arg_str(args: &HashMap<String, Json>, key: &str) -> Option<String> {
     args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
-fn arg_i64(args: &HashMap<String, Json>, key: &str) -> Option<i64> {
-    args.get(key).and_then(|v| v.as_i64())
+/// Parse i64 from JSON number or string (C2 dual-tolerance).
+/// Returns Ok(None) if key missing, Ok(Some(v)) if valid, Err if present but unparseable.
+fn arg_i64(args: &HashMap<String, Json>, key: &str) -> JeeflowResult<Option<i64>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(v) => {
+            if let Some(n) = v.as_i64() {
+                Ok(Some(n))
+            } else if let Some(s) = v.as_str() {
+                s.parse::<i64>()
+                    .map(Some)
+                    .map_err(|_| JeeflowError::Business(format!("非法id: {}", s)))
+            } else {
+                Err(JeeflowError::Business(format!("非法id: {}", v)))
+            }
+        }
+    }
 }
 
 fn arg_str_or(args: &HashMap<String, Json>, key: &str, default: &str) -> String {
     arg_str(args, key).unwrap_or_else(|| default.to_string())
 }
 
-fn arg_i64_or(args: &HashMap<String, Json>, key: &str, default: i64) -> i64 {
-    arg_i64(args, key).unwrap_or(default)
+fn arg_i64_or(args: &HashMap<String, Json>, key: &str, default: i64) -> JeeflowResult<i64> {
+    Ok(arg_i64(args, key)?.unwrap_or(default))
+}
+
+// ═══════════════════════════════════════════════════════
+// C8 m_ three-segment query parser (spec/06 §2.2)
+// ═══════════════════════════════════════════════════════
+
+fn camel_to_snake(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 { result.push('_'); }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn is_known_op(s: &str) -> bool {
+    matches!(s.to_uppercase().as_str(),
+        "EQ" | "NE" | "LIKE" | "LLIKE" | "RLIKE" |
+        "GT" | "LT" | "GE" | "LE" | "IN" | "NIN" | "BT")
+}
+
+/// Parse m_ prefixed query parameters into QueryFilter list.
+/// Supports: `m_{op}_{col}` (2-segment, alias="t") and `m_{alias}_{op}_{col}` (3-segment).
+fn parse_m_params(args: &HashMap<String, Json>) -> Vec<jeeflow_core::model::QueryFilter> {
+    let mut filters = Vec::new();
+    for (key, value) in args {
+        if !key.starts_with("m_") { continue; }
+        let rest = &key[2..];
+        let parts: Vec<&str> = rest.split('_').collect();
+        let val_str = match value.as_str() {
+            Some(s) => s.to_string(),
+            None => value.to_string().trim_matches('"').to_string(),
+        };
+        if parts.len() >= 3 {
+            let alias = parts[0];
+            let op_str = parts[1];
+            let column = camel_to_snake(parts[2..].join("_").as_str());
+            if let Some(op) = jeeflow_core::model::FilterOp::from_str(op_str) {
+                filters.push(jeeflow_core::model::QueryFilter {
+                    alias: alias.to_string(), op, column, value: val_str,
+                });
+            }
+        } else if parts.len() == 2 {
+            let op_str = parts[0];
+            if is_known_op(op_str) {
+                let column = camel_to_snake(parts[1]);
+                if let Some(op) = jeeflow_core::model::FilterOp::from_str(op_str) {
+                    filters.push(jeeflow_core::model::QueryFilter {
+                        alias: "t".to_string(), op, column, value: val_str,
+                    });
+                }
+            }
+        }
+    }
+    filters
+}
+
+/// Apply filters to JSON rows (camelCase field names).
+fn matches_filter(row: &Json, f: &jeeflow_core::model::QueryFilter) -> bool {
+    let camel_col = to_camel(&f.column);
+    let field_val = row.get(&camel_col).or_else(|| row.get(&f.column));
+    let field_str = match field_val {
+        Some(Json::String(s)) => s.clone(),
+        Some(v) => v.to_string().trim_matches('"').to_string(),
+        None => return false,
+    };
+    use jeeflow_core::model::FilterOp;
+    match f.op {
+        FilterOp::Eq => field_str == f.value,
+        FilterOp::Ne => field_str != f.value,
+        FilterOp::Like => field_str.contains(&f.value),
+        FilterOp::Gt => field_str > f.value,
+        FilterOp::Lt => field_str < f.value,
+        FilterOp::Ge => field_str >= f.value,
+        FilterOp::Le => field_str <= f.value,
+        FilterOp::In => f.value.split(',').any(|v| v.trim() == field_str),
+        FilterOp::Nin => !f.value.split(',').any(|v| v.trim() == field_str),
+        FilterOp::Bt => {
+            let parts: Vec<&str> = f.value.split(',').collect();
+            parts.len() == 2 && field_str.as_str() >= parts[0].trim() && field_str.as_str() <= parts[1].trim()
+        }
+    }
+}
+
+fn apply_filters_to_rows(rows: &mut Vec<Json>, filters: &[jeeflow_core::model::QueryFilter]) {
+    if filters.is_empty() { return; }
+    rows.retain(|row| filters.iter().all(|f| matches_filter(row, f)));
+}
+
+/// Re-paginate filtered rows (called when facade-level filtering is applied after repo pagination).
+fn re_paginate(rows: Vec<Json>, page_num: i64, page_size: i64) -> (Vec<Json>, i64) {
+    let total = rows.len() as i64;
+    let start = ((page_num - 1) * page_size) as usize;
+    let end = std::cmp::min(start + page_size as usize, rows.len());
+    let page_rows = if start < rows.len() { rows[start..end].to_vec() } else { vec![] };
+    (page_rows, total)
 }
 
 fn args_to_flow_data(args: &HashMap<String, Json>) -> FlowData {
@@ -352,13 +467,13 @@ impl JeeflowFacade {
         JeeflowFacade { engine, repo, ext_repo }
     }
 
-    /// Main entry point: dispatch to 42 actions.
-    pub fn flow(&self, action: &str, args: &HashMap<String, Json>) -> Json {
+    /// Main entry point: dispatch to 42 actions (async to avoid nested runtime panic).
+    pub async fn flow(&self, action: &str, args: &HashMap<String, Json>) -> Json {
         let result = match action {
             // ═══ processDefine (8) ═══
             "processDefine/page" => self.process_define_page(args),
             "processDefine/detail" => self.process_define_detail(args),
-            "processDefine/startAndExecute" => self.process_define_start_and_execute(args),
+            "processDefine/startAndExecute" => self.process_define_start_and_execute(args).await,
             "processDefine/deploy" => self.process_define_deploy(args),
             "processDefine/redeploy" => self.process_define_redeploy(args),
             "processDefine/remove" => self.process_define_remove(args),
@@ -368,7 +483,7 @@ impl JeeflowFacade {
             // ═══ processInstance (11) ═══
             "processInstance/page" => self.process_instance_page(args),
             "processInstance/detail" => self.process_instance_detail(args),
-            "processInstance/startAndExecute" => self.process_instance_start_and_execute(args),
+            "processInstance/startAndExecute" => self.process_instance_start_and_execute(args).await,
             "processInstance/withdraw" => self.process_instance_withdraw(args),
             "processInstance/highLight" => self.process_instance_high_light(args),
             "processInstance/approvalRecord" => self.process_instance_approval_record(args),
@@ -381,7 +496,7 @@ impl JeeflowFacade {
             // ═══ processTask (9) ═══
             "processTask/todoList" => self.process_task_todo_list(args),
             "processTask/doneList" => self.process_task_done_list(args),
-            "processTask/execute" => self.process_task_execute(args),
+            "processTask/execute" => self.process_task_execute(args).await,
             "processTask/detail" => self.process_task_detail(args),
             "processTask/jumpAbleTaskNameList" => self.process_task_jump_able_task_name_list(args),
             "processTask/candidatePage" => self.process_task_candidate_page(args),
@@ -437,15 +552,20 @@ impl JeeflowFacade {
     // ═══════════════════════════════════════════════════════
 
     fn process_define_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let query = PageQuery::new(arg_i64_or(args, "pageNum", 1), arg_i64_or(args, "pageSize", 20));
+        let page_num = arg_i64_or(args, "pageNum", 1)?;
+        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let filters = parse_m_params(args);
+        let query = PageQuery::new(page_num, page_size);
         let page = self.repo.page_defines(&query)?;
-        let rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(define_row_to_json(r)).unwrap()).collect();
-        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
+        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(define_row_to_json(r)).unwrap()).collect();
+        apply_filters_to_rows(&mut rows, &filters);
+        let (page_rows, total) = re_paginate(rows, page_num, page_size);
+        let result = PageResult::new(page_num, page_size, total, page_rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
     fn process_define_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let define = self.repo.find_define_by_id(id)?
             .ok_or(JeeflowError::DefineNotFound(id))?;
         Ok(json!({
@@ -457,7 +577,7 @@ impl JeeflowFacade {
         }))
     }
 
-    fn process_define_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+    async fn process_define_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let define_name = arg_str(args, "name").ok_or(JeeflowError::Business("缺少name参数".into()))?;
         let operator = arg_str_or(args, "operator", "flow.auto");
 
@@ -472,7 +592,7 @@ impl JeeflowFacade {
         let flow_data = args_to_flow_data(args);
 
         // Start instance
-        let instance = block_on(self.engine.start_async(define_id, &operator, &flow_data))?;
+        let instance = self.engine.start_async(define_id, &operator, &flow_data).await?;
 
         // Get first task and execute if possible
         let tasks = self.repo.find_doing_tasks(instance.instance_id, &[])?;
@@ -489,26 +609,26 @@ impl JeeflowFacade {
     }
 
     fn process_define_deploy(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         self.repo.update_define_state(id, 1)?;
         Ok(json!({"id": id, "state": 1}))
     }
 
     fn process_define_redeploy(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         self.repo.update_define_state(id, 1)?;
         Ok(json!({"id": id, "state": 1}))
     }
 
     fn process_define_remove(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         self.repo.remove_define(id)?;
         Ok(json!({"id": id}))
     }
 
     fn process_define_up_and_down(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let state = arg_i64(args, "state").unwrap_or(0) as i32;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let state = arg_i64(args, "state")?.unwrap_or(0) as i32;
         self.repo.update_define_state(id, state)?;
         Ok(json!({"id": id, "state": state}))
     }
@@ -531,16 +651,21 @@ impl JeeflowFacade {
     // ═══════════════════════════════════════════════════════
 
     fn process_instance_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let mut query = PageQuery::new(arg_i64_or(args, "pageNum", 1), arg_i64_or(args, "pageSize", 20));
+        let page_num = arg_i64_or(args, "pageNum", 1)?;
+        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let filters = parse_m_params(args);
+        let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
         let page = self.repo.page_instances(&query)?;
-        let rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(instance_row_to_json(r)).unwrap()).collect();
-        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
+        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(instance_row_to_json(r)).unwrap()).collect();
+        apply_filters_to_rows(&mut rows, &filters);
+        let (page_rows, total) = re_paginate(rows, page_num, page_size);
+        let result = PageResult::new(page_num, page_size, total, page_rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
     fn process_instance_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let inst = self.repo.find_instance_by_id(id)?
             .ok_or(JeeflowError::InstanceNotFound(id))?;
         let tasks = self.repo.find_history_tasks(id)?;
@@ -557,12 +682,12 @@ impl JeeflowFacade {
         }))
     }
 
-    fn process_instance_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        self.process_define_start_and_execute(args)
+    async fn process_instance_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        self.process_define_start_and_execute(args).await
     }
 
     fn process_instance_withdraw(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let mut inst = self.repo.find_instance_by_id(id)?
             .ok_or(JeeflowError::InstanceNotFound(id))?;
         inst.withdraw();
@@ -579,7 +704,7 @@ impl JeeflowFacade {
     }
 
     fn process_instance_high_light(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let tasks = self.repo.find_history_tasks(id)?;
         let finished: Vec<String> = tasks.iter()
             .filter(|t| t.task_state == TaskState::Finished.code())
@@ -593,7 +718,7 @@ impl JeeflowFacade {
     }
 
     fn process_instance_approval_record(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let tasks = self.repo.find_history_tasks(id)?;
         let records: Vec<Json> = tasks.iter().map(|t| json!({
             "task_name": t.task_name, "display_name": t.display_name,
@@ -604,7 +729,7 @@ impl JeeflowFacade {
     }
 
     fn process_instance_get_assignee_text_data(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let tasks = self.repo.find_history_tasks(id)?;
         let data: Vec<Json> = tasks.iter().map(|t| json!({
             "task_name": t.task_name, "actor_id": t.actor_id,
@@ -613,7 +738,7 @@ impl JeeflowFacade {
     }
 
     fn process_instance_biz_data(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let inst = self.repo.find_instance_by_id(id)?
             .ok_or(JeeflowError::InstanceNotFound(id))?;
         // Return instance variables as biz data
@@ -624,7 +749,7 @@ impl JeeflowFacade {
     }
 
     fn process_instance_create_cc(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let creator = arg_str_or(args, "operator", "flow.auto");
         let actor_str = arg_str(args, "actorIds").unwrap_or_default();
         let actors: Vec<String> = actor_str.split(',')
@@ -636,17 +761,22 @@ impl JeeflowFacade {
     }
 
     fn process_instance_update_cc_status(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let actor_id = arg_str_or(args, "actorId", "");
         self.repo.update_cc_status(id, &actor_id)?;
         Ok(json!({"id": id}))
     }
 
     fn process_instance_cc_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let query = PageQuery::new(arg_i64_or(args, "pageNum", 1), arg_i64_or(args, "pageSize", 20));
+        let page_num = arg_i64_or(args, "pageNum", 1)?;
+        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let filters = parse_m_params(args);
+        let query = PageQuery::new(page_num, page_size);
         let page = self.repo.page_cc_instances(&query)?;
-        let rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(instance_row_to_json(r)).unwrap()).collect();
-        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
+        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(instance_row_to_json(r)).unwrap()).collect();
+        apply_filters_to_rows(&mut rows, &filters);
+        let (page_rows, total) = re_paginate(rows, page_num, page_size);
+        let result = PageResult::new(page_num, page_size, total, page_rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
@@ -655,36 +785,46 @@ impl JeeflowFacade {
     // ═══════════════════════════════════════════════════════
 
     fn process_task_todo_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let mut query = PageQuery::new(arg_i64_or(args, "pageNum", 1), arg_i64_or(args, "pageSize", 20));
+        let page_num = arg_i64_or(args, "pageNum", 1)?;
+        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let filters = parse_m_params(args);
+        let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
         let page = self.repo.page_todo_tasks(&query)?;
-        let rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(task_row_to_json(r)).unwrap()).collect();
-        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
+        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(task_row_to_json(r)).unwrap()).collect();
+        apply_filters_to_rows(&mut rows, &filters);
+        let (page_rows, total) = re_paginate(rows, page_num, page_size);
+        let result = PageResult::new(page_num, page_size, total, page_rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
     fn process_task_done_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let mut query = PageQuery::new(arg_i64_or(args, "pageNum", 1), arg_i64_or(args, "pageSize", 20));
+        let page_num = arg_i64_or(args, "pageNum", 1)?;
+        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let filters = parse_m_params(args);
+        let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
         let page = self.repo.page_done_tasks(&query)?;
-        let rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(task_row_to_json(r)).unwrap()).collect();
-        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
+        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(task_row_to_json(r)).unwrap()).collect();
+        apply_filters_to_rows(&mut rows, &filters);
+        let (page_rows, total) = re_paginate(rows, page_num, page_size);
+        let result = PageResult::new(page_num, page_size, total, page_rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
-    fn process_task_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let task_id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+    async fn process_task_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        let task_id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let operator = arg_str_or(args, "operator", "flow.auto");
         let flow_data = args_to_flow_data(args);
 
-        let new_tasks = block_on(self.engine.execute_task_async(task_id, &operator, &flow_data))?;
+        let new_tasks = self.engine.execute_task_async(task_id, &operator, &flow_data).await?;
         let task_ids: Vec<i64> = new_tasks.iter().map(|t| t.task_id).collect();
 
         Ok(json!({"task_ids": task_ids}))
     }
 
     fn process_task_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let task = self.repo.find_task_by_id(id)?
             .ok_or(JeeflowError::TaskNotFound(id))?;
         let actors = self.repo.find_task_actors(id)?;
@@ -700,7 +840,7 @@ impl JeeflowFacade {
     }
 
     fn process_task_jump_able_task_name_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let task = self.repo.find_task_by_id(id)?
             .ok_or(JeeflowError::TaskNotFound(id))?;
         let inst = self.repo.find_instance_by_id(task.process_instance_id)?
@@ -716,9 +856,10 @@ impl JeeflowFacade {
     }
 
     fn process_task_candidate_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        // Simplified: return empty page
-        let query = PageQuery::new(arg_i64_or(args, "pageNum", 1), arg_i64_or(args, "pageSize", 20));
-        Ok(serde_json::to_value(page_to_json(&PageResult::<Json>::new(query.page_num, query.page_size, 0, vec![]))).unwrap())
+        // Simplified: return empty page (m_ filters parsed but no data to filter)
+        let page_num = arg_i64_or(args, "pageNum", 1)?;
+        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        Ok(serde_json::to_value(page_to_json(&PageResult::<Json>::new(page_num, page_size, 0, vec![]))).unwrap())
     }
 
     fn process_task_surrogate(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -735,7 +876,7 @@ impl JeeflowFacade {
     }
 
     fn process_task_add_candidate(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let task_id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let task_id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let actor_str = arg_str(args, "actorIds").unwrap_or_default();
         let actors: Vec<String> = actor_str.split(',')
             .map(|s| s.trim().to_string())
@@ -746,7 +887,7 @@ impl JeeflowFacade {
     }
 
     fn process_task_latest(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let instance_id = arg_i64(args, "instanceId").ok_or(JeeflowError::Business("缺少instanceId参数".into()))?;
+        let instance_id = arg_i64(args, "instanceId")?.ok_or(JeeflowError::Business("缺少instanceId参数".into()))?;
         let tasks = self.repo.find_doing_tasks(instance_id, &[])?;
         if let Some(task) = tasks.first() {
             Ok(json!({
@@ -764,16 +905,21 @@ impl JeeflowFacade {
 
     fn process_design_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let query = PageQuery::new(arg_i64_or(args, "pageNum", 1), arg_i64_or(args, "pageSize", 20));
+        let page_num = arg_i64_or(args, "pageNum", 1)?;
+        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let filters = parse_m_params(args);
+        let query = PageQuery::new(page_num, page_size);
         let page = ext.page_designs(&query)?;
-        let rows: Vec<Json> = page.rows.iter().map(|d| serde_json::to_value(design_to_json(d)).unwrap()).collect();
-        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
+        let mut rows: Vec<Json> = page.rows.iter().map(|d| serde_json::to_value(design_to_json(d)).unwrap()).collect();
+        apply_filters_to_rows(&mut rows, &filters);
+        let (page_rows, total) = re_paginate(rows, page_num, page_size);
+        let result = PageResult::new(page_num, page_size, total, page_rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
     fn process_design_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let design = ext.find_design_by_id(id)?
             .ok_or(JeeflowError::Business(format!("设计不存在: {}", id)))?;
         Ok(serde_json::to_value(design_to_json(&design)).unwrap())
@@ -798,7 +944,7 @@ impl JeeflowFacade {
 
     fn process_design_update(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let design = ext.find_design_by_id(id)?
             .ok_or(JeeflowError::Business(format!("设计不存在: {}", id)))?;
         let updated = ProcessDesign {
@@ -814,7 +960,7 @@ impl JeeflowFacade {
 
     fn process_design_update_define(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         // Verify design exists, then save history
         let _design = ext.find_design_by_id(id)?
             .ok_or(JeeflowError::Business(format!("设计不存在: {}", id)))?;
@@ -832,14 +978,14 @@ impl JeeflowFacade {
 
     fn process_design_remove(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         ext.remove_design(id)?;
         Ok(json!({"id": id}))
     }
 
     fn process_design_deploy(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         // Deploy: create a new define from design
         let design = ext.find_design_by_id(id)?
             .ok_or(JeeflowError::Business(format!("设计不存在: {}", id)))?;
@@ -893,7 +1039,7 @@ impl JeeflowFacade {
 
     fn process_surrogate_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let query = PageQuery::new(arg_i64_or(args, "pageNum", 1), arg_i64_or(args, "pageSize", 20));
+        let query = PageQuery::new(arg_i64_or(args, "pageNum", 1)?, arg_i64_or(args, "pageSize", 20)?);
         let page = ext.page_surrogates(&query)?;
         let rows: Vec<Json> = page.rows.iter().map(|s| serde_json::to_value(surrogate_to_json(s)).unwrap()).collect();
         let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
@@ -919,14 +1065,14 @@ impl JeeflowFacade {
 
     fn process_surrogate_update(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let sg = ext.find_surrogate_by_id(id)?
             .ok_or(JeeflowError::Business(format!("委托不存在: {}", id)))?;
         let updated = ProcessSurrogate {
             surrogate: arg_str(args, "surrogate").unwrap_or(sg.surrogate),
             start_time: arg_str(args, "startTime").or(sg.start_time),
             end_time: arg_str(args, "endTime").or(sg.end_time),
-            enabled: arg_i64(args, "enabled").map(|v| v as i32).unwrap_or(sg.enabled),
+            enabled: arg_i64(args, "enabled")?.map(|v| v as i32).unwrap_or(sg.enabled),
             update_user: arg_str(args, "updateUser"),
             ..sg
         };
@@ -936,7 +1082,7 @@ impl JeeflowFacade {
 
     fn process_surrogate_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let sg = ext.find_surrogate_by_id(id)?
             .ok_or(JeeflowError::Business(format!("委托不存在: {}", id)))?;
         Ok(serde_json::to_value(surrogate_to_json(&sg)).unwrap())
@@ -944,27 +1090,13 @@ impl JeeflowFacade {
 
     fn process_surrogate_remove(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id").ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         ext.remove_surrogate(id)?;
         Ok(json!({"id": id}))
     }
 }
 
-// ═══════════════════════════════════════════════════════
-// Async-to-sync bridge
-// ═══════════════════════════════════════════════════════
-
-/// Block on a future synchronously. Uses current tokio handle if available,
-/// otherwise creates a new runtime.
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(f),
-        Err(_) => {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-            rt.block_on(f)
-        }
-    }
-}
+// block_on removed — flow() is now fully async to avoid nested runtime panic (P0-1 fix)
 
 // ═══════════════════════════════════════════════════════
 // JsonValue → serde_json::Value conversion
@@ -1091,93 +1223,93 @@ mod tests {
 
     // ─── Unknown action test ───
 
-    #[test]
-    fn test_unknown_action() {
+    #[tokio::test]
+    async fn test_unknown_action() {
         let facade = make_facade();
         let args = HashMap::new();
-        let resp = facade.flow("unknown/action", &args);
+        let resp = facade.flow("unknown/action", &args).await;
         assert_eq!(resp["code"], CODE_ERROR);
         assert!(resp["msg"].as_str().unwrap().contains("未知"));
     }
 
     // ─── processDefine tests ───
 
-    #[test]
-    fn test_process_define_page() {
+    #[tokio::test]
+    async fn test_process_define_page() {
         let (facade, _id) = make_facade_with_define();
         let args = HashMap::new();
-        let resp = facade.flow("processDefine/page", &args);
+        let resp = facade.flow("processDefine/page", &args).await;
         assert_eq!(resp["code"], 0);
         assert!(resp["data"]["rows"].is_array());
     }
 
-    #[test]
-    fn test_process_define_detail() {
+    #[tokio::test]
+    async fn test_process_define_detail() {
         let (facade, id) = make_facade_with_define();
         let mut args = HashMap::new();
         args.insert("id".to_string(), json!(id));
-        let resp = facade.flow("processDefine/detail", &args);
+        let resp = facade.flow("processDefine/detail", &args).await;
         assert_eq!(resp["code"], 0);
         assert_eq!(resp["data"]["name"], "test-flow");
     }
 
-    #[test]
-    fn test_process_define_deploy() {
+    #[tokio::test]
+    async fn test_process_define_deploy() {
         let (facade, id) = make_facade_with_define();
         let mut args = HashMap::new();
         args.insert("id".to_string(), json!(id));
-        let resp = facade.flow("processDefine/deploy", &args);
+        let resp = facade.flow("processDefine/deploy", &args).await;
         assert_eq!(resp["code"], 0);
     }
 
-    #[test]
-    fn test_process_define_up_and_down() {
+    #[tokio::test]
+    async fn test_process_define_up_and_down() {
         let (facade, id) = make_facade_with_define();
         let mut args = HashMap::new();
         args.insert("id".to_string(), json!(id));
         args.insert("state".to_string(), json!(0)); // disable
-        let resp = facade.flow("processDefine/upAndDown", &args);
+        let resp = facade.flow("processDefine/upAndDown", &args).await;
         assert_eq!(resp["code"], 0);
     }
 
-    #[test]
-    fn test_process_define_remove() {
+    #[tokio::test]
+    async fn test_process_define_remove() {
         let (facade, id) = make_facade_with_define();
         let mut args = HashMap::new();
         args.insert("id".to_string(), json!(id));
-        let resp = facade.flow("processDefine/remove", &args);
+        let resp = facade.flow("processDefine/remove", &args).await;
         assert_eq!(resp["code"], 0);
     }
 
     // ─── processDesign tests ───
 
-    #[test]
-    fn test_process_design_save_and_detail() {
+    #[tokio::test]
+    async fn test_process_design_save_and_detail() {
         let facade = make_facade();
         let mut args = HashMap::new();
         args.insert("name".to_string(), json!("test-design"));
         args.insert("displayName".to_string(), json!("Test Design"));
-        let resp = facade.flow("processDesign/save", &args);
+        let resp = facade.flow("processDesign/save", &args).await;
         assert_eq!(resp["code"], 0);
         let design_id = resp["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
 
         let mut detail_args = HashMap::new();
         detail_args.insert("id".to_string(), json!(design_id));
-        let resp2 = facade.flow("processDesign/detail", &detail_args);
+        let resp2 = facade.flow("processDesign/detail", &detail_args).await;
         assert_eq!(resp2["code"], 0);
     }
 
-    #[test]
-    fn test_process_design_page() {
+    #[tokio::test]
+    async fn test_process_design_page() {
         let facade = make_facade();
-        let resp = facade.flow("processDesign/page", &HashMap::new());
+        let resp = facade.flow("processDesign/page", &HashMap::new()).await;
         assert_eq!(resp["code"], 0);
     }
 
     // ─── processSurrogate tests ───
 
-    #[test]
-    fn test_process_surrogate_crud() {
+    #[tokio::test]
+    async fn test_process_surrogate_crud() {
         let facade = make_facade();
 
         // Save
@@ -1185,36 +1317,36 @@ mod tests {
         args.insert("processName".to_string(), json!("test-flow"));
         args.insert("operator".to_string(), json!("user1"));
         args.insert("surrogate".to_string(), json!("user2"));
-        let resp = facade.flow("processSurrogate/save", &args);
+        let resp = facade.flow("processSurrogate/save", &args).await;
         assert_eq!(resp["code"], 0);
         let sg_id = resp["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
 
         // Detail
         let mut detail_args = HashMap::new();
         detail_args.insert("id".to_string(), json!(sg_id));
-        let resp2 = facade.flow("processSurrogate/detail", &detail_args);
+        let resp2 = facade.flow("processSurrogate/detail", &detail_args).await;
         assert_eq!(resp2["code"], 0);
 
         // Update
         let mut update_args = HashMap::new();
         update_args.insert("id".to_string(), json!(sg_id));
         update_args.insert("surrogate".to_string(), json!("user3"));
-        let resp3 = facade.flow("processSurrogate/update", &update_args);
+        let resp3 = facade.flow("processSurrogate/update", &update_args).await;
         assert_eq!(resp3["code"], 0);
 
         // Remove
         let mut remove_args = HashMap::new();
         remove_args.insert("id".to_string(), json!(sg_id));
-        let resp4 = facade.flow("processSurrogate/remove", &remove_args);
+        let resp4 = facade.flow("processSurrogate/remove", &remove_args).await;
         assert_eq!(resp4["code"], 0);
     }
 
     // ─── Pagination envelope tests ───
 
-    #[test]
-    fn test_pagination_envelope() {
+    #[tokio::test]
+    async fn test_pagination_envelope() {
         let facade = make_facade();
-        let resp = facade.flow("processDefine/page", &HashMap::new());
+        let resp = facade.flow("processDefine/page", &HashMap::new()).await;
         let data = &resp["data"];
         assert!(data.get("pageNum").is_some());
         assert!(data.get("pageSize").is_some());
@@ -1240,150 +1372,226 @@ mod tests {
         assert_eq!(output["id"], "123");
     }
 
+    // ─── C2 string id dual-tolerance tests ───
+
+    #[tokio::test]
+    async fn test_c2_string_id_accepted() {
+        let (facade, id) = make_facade_with_define();
+        // Pass id as string — should work identically to number
+        let mut args = HashMap::new();
+        args.insert("id".to_string(), json!(id.to_string()));
+        let resp = facade.flow("processDefine/detail", &args).await;
+        assert_eq!(resp["code"], 0, "string id should be accepted");
+        assert_eq!(resp["data"]["name"], "test-flow");
+    }
+
+    #[tokio::test]
+    async fn test_c2_number_id_still_works() {
+        let (facade, id) = make_facade_with_define();
+        // Pass id as number — original behavior
+        let mut args = HashMap::new();
+        args.insert("id".to_string(), json!(id));
+        let resp = facade.flow("processDefine/detail", &args).await;
+        assert_eq!(resp["code"], 0, "number id should still work");
+    }
+
+    #[tokio::test]
+    async fn test_c2_18digit_snowflake_string_id() {
+        let facade = make_facade();
+        // 18-digit snowflake-scale string id — should not be rejected
+        // (will get "not found" error, not "invalid id" or "missing id")
+        let mut args = HashMap::new();
+        args.insert("id".to_string(), json!("999999999999999999"));
+        let resp = facade.flow("processDefine/detail", &args).await;
+        assert_eq!(resp["code"], 99999999);
+        // Should be "not found", NOT "invalid id" or "missing id"
+        let msg = resp["msg"].as_str().unwrap();
+        assert!(msg.contains("不存在") || msg.contains("999999999999999999"),
+            "18-digit id should parse but not found, got msg: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_c2_invalid_string_id_returns_illegal() {
+        let facade = make_facade();
+        let mut args = HashMap::new();
+        args.insert("id".to_string(), json!("abc"));
+        let resp = facade.flow("processDefine/detail", &args).await;
+        assert_eq!(resp["code"], 99999999);
+        let msg = resp["msg"].as_str().unwrap();
+        assert!(msg.contains("非法id"), "invalid string id should say '非法id', got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_c2_invalid_string_id_execute() {
+        let facade = make_facade();
+        let mut args = HashMap::new();
+        args.insert("id".to_string(), json!("not_a_number"));
+        let resp = facade.flow("processTask/execute", &args).await;
+        assert_eq!(resp["code"], 99999999);
+        assert!(resp["msg"].as_str().unwrap().contains("非法id"));
+    }
+
+    #[tokio::test]
+    async fn test_c2_string_id_all_actions() {
+        // Verify string id works across multiple action types
+        let (facade, id) = make_facade_with_define();
+        let id_str = id.to_string();
+
+        // processDefine/deploy with string id
+        let mut args = HashMap::new();
+        args.insert("id".to_string(), json!(&id_str));
+        let resp = facade.flow("processDefine/deploy", &args).await;
+        assert_eq!(resp["code"], 0, "deploy with string id should work");
+
+        // processDefine/remove with string id
+        let resp = facade.flow("processDefine/remove", &args).await;
+        assert_eq!(resp["code"], 0, "remove with string id should work");
+    }
+
     // ─── Negative tests (error code 99999999) ───
 
-    #[test]
-    fn test_unknown_action_returns_error_code() {
+    #[tokio::test]
+    async fn test_unknown_action_returns_error_code() {
         let facade = make_facade();
-        let resp = facade.flow("unknown/action", &HashMap::new());
+        let resp = facade.flow("unknown/action", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
         assert!(resp["msg"].as_str().unwrap().contains("未知 action"));
     }
 
-    #[test]
-    fn test_detail_missing_id_returns_error() {
+    #[tokio::test]
+    async fn test_detail_missing_id_returns_error() {
         let facade = make_facade();
-        let resp = facade.flow("processDefine/detail", &HashMap::new());
+        let resp = facade.flow("processDefine/detail", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
     }
 
-    #[test]
-    fn test_task_execute_missing_id() {
+    #[tokio::test]
+    async fn test_task_execute_missing_id() {
         let facade = make_facade();
-        let resp = facade.flow("processTask/execute", &HashMap::new());
+        let resp = facade.flow("processTask/execute", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
     }
 
-    #[test]
-    fn test_instance_withdraw_missing_id() {
+    #[tokio::test]
+    async fn test_instance_withdraw_missing_id() {
         let facade = make_facade();
-        let resp = facade.flow("processInstance/withdraw", &HashMap::new());
+        let resp = facade.flow("processInstance/withdraw", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
     }
 
     // ─── processInstance action tests ───
 
-    #[test]
-    fn test_process_instance_page() {
+    #[tokio::test]
+    async fn test_process_instance_page() {
         let facade = make_facade();
-        let resp = facade.flow("processInstance/page", &HashMap::new());
+        let resp = facade.flow("processInstance/page", &HashMap::new()).await;
         assert_eq!(resp["code"], 0);
         assert!(resp["data"]["rows"].is_array());
     }
 
-    #[test]
-    fn test_process_instance_detail_missing() {
+    #[tokio::test]
+    async fn test_process_instance_detail_missing() {
         let facade = make_facade();
         let mut args = HashMap::new();
         args.insert("id".to_string(), json!(99999));
-        let resp = facade.flow("processInstance/detail", &args);
+        let resp = facade.flow("processInstance/detail", &args).await;
         assert_eq!(resp["code"], 99999999);
     }
 
-    #[test]
-    fn test_process_instance_cc_list() {
+    #[tokio::test]
+    async fn test_process_instance_cc_list() {
         let facade = make_facade();
-        let resp = facade.flow("processInstance/ccList", &HashMap::new());
+        let resp = facade.flow("processInstance/ccList", &HashMap::new()).await;
         assert_eq!(resp["code"], 0);
     }
 
     // ─── processTask action tests ───
 
-    #[test]
-    fn test_process_task_todo_list() {
+    #[tokio::test]
+    async fn test_process_task_todo_list() {
         let facade = make_facade();
-        let resp = facade.flow("processTask/todoList", &HashMap::new());
+        let resp = facade.flow("processTask/todoList", &HashMap::new()).await;
         assert_eq!(resp["code"], 0);
         assert!(resp["data"]["rows"].is_array());
     }
 
-    #[test]
-    fn test_process_task_done_list() {
+    #[tokio::test]
+    async fn test_process_task_done_list() {
         let facade = make_facade();
-        let resp = facade.flow("processTask/doneList", &HashMap::new());
+        let resp = facade.flow("processTask/doneList", &HashMap::new()).await;
         assert_eq!(resp["code"], 0);
     }
 
-    #[test]
-    fn test_process_task_latest() {
+    #[tokio::test]
+    async fn test_process_task_latest() {
         let facade = make_facade();
-        let resp = facade.flow("processTask/latest", &HashMap::new());
+        let resp = facade.flow("processTask/latest", &HashMap::new()).await;
         assert!(resp.get("code").is_some());
     }
 
-    #[test]
-    fn test_process_task_detail_missing() {
+    #[tokio::test]
+    async fn test_process_task_detail_missing() {
         let facade = make_facade();
         let mut args = HashMap::new();
         args.insert("id".to_string(), json!(99999));
-        let resp = facade.flow("processTask/detail", &args);
+        let resp = facade.flow("processTask/detail", &args).await;
         assert_eq!(resp["code"], 99999999);
     }
 
     // ─── processDesign action tests ───
 
-    #[test]
-    fn test_process_design_list_by_type() {
+    #[tokio::test]
+    async fn test_process_design_list_by_type() {
         let facade = make_facade();
         let mut args = HashMap::new();
         args.insert("designType".to_string(), json!("approval"));
-        let resp = facade.flow("processDesign/listByType", &args);
+        let resp = facade.flow("processDesign/listByType", &args).await;
         assert_eq!(resp["code"], 0);
     }
 
-    #[test]
-    fn test_process_design_update_missing_id() {
+    #[tokio::test]
+    async fn test_process_design_update_missing_id() {
         let facade = make_facade();
-        let resp = facade.flow("processDesign/update", &HashMap::new());
+        let resp = facade.flow("processDesign/update", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
     }
 
-    #[test]
-    fn test_process_design_remove_missing_id() {
+    #[tokio::test]
+    async fn test_process_design_remove_missing_id() {
         let facade = make_facade();
-        let resp = facade.flow("processDesign/remove", &HashMap::new());
+        let resp = facade.flow("processDesign/remove", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
     }
 
     // ─── processSurrogate action tests ───
 
-    #[test]
-    fn test_process_surrogate_page() {
+    #[tokio::test]
+    async fn test_process_surrogate_page() {
         let facade = make_facade();
-        let resp = facade.flow("processSurrogate/page", &HashMap::new());
+        let resp = facade.flow("processSurrogate/page", &HashMap::new()).await;
         assert_eq!(resp["code"], 0);
     }
 
-    #[test]
-    fn test_process_surrogate_detail_missing() {
+    #[tokio::test]
+    async fn test_process_surrogate_detail_missing() {
         let facade = make_facade();
         let mut args = HashMap::new();
         args.insert("id".to_string(), json!(99999));
-        let resp = facade.flow("processSurrogate/detail", &args);
+        let resp = facade.flow("processSurrogate/detail", &args).await;
         assert_eq!(resp["code"], 99999999);
     }
 
-    #[test]
-    fn test_process_surrogate_update_missing_id() {
+    #[tokio::test]
+    async fn test_process_surrogate_update_missing_id() {
         let facade = make_facade();
-        let resp = facade.flow("processSurrogate/update", &HashMap::new());
+        let resp = facade.flow("processSurrogate/update", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
     }
 
-    #[test]
-    fn test_process_surrogate_remove_missing_id() {
+    #[tokio::test]
+    async fn test_process_surrogate_remove_missing_id() {
         let facade = make_facade();
-        let resp = facade.flow("processSurrogate/remove", &HashMap::new());
+        let resp = facade.flow("processSurrogate/remove", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
     }
 
@@ -1434,8 +1642,8 @@ mod tests {
 
     // ─── Action count test ───
 
-    #[test]
-    fn test_all_42_actions_dispatchable() {
+    #[tokio::test]
+    async fn test_all_42_actions_dispatchable() {
         let facade = make_facade();
         let actions = vec![
             "processDefine/page", "processDefine/detail", "processDefine/startAndExecute",
@@ -1462,9 +1670,114 @@ mod tests {
         assert_eq!(actions.len(), 42, "Should have exactly 42 actions");
         // All actions should return a response (not panic)
         for action in &actions {
-            let resp = facade.flow(action, &HashMap::new());
+            let resp = facade.flow(action, &HashMap::new()).await;
             // Should have code field (either success or error)
             assert!(resp.get("code").is_some(), "Action {} should return a response with code", action);
         }
+    }
+
+    // ─── C8 m_ query parser tests ───
+
+    #[test]
+    fn test_c8_parse_m_params_2segment() {
+        let mut args = HashMap::new();
+        args.insert("m_EQ_taskName".to_string(), json!("leaveApply"));
+        let filters = parse_m_params(&args);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].alias, "t");
+        assert_eq!(filters[0].op, jeeflow_core::model::FilterOp::Eq);
+        assert_eq!(filters[0].column, "task_name");
+        assert_eq!(filters[0].value, "leaveApply");
+    }
+
+    #[test]
+    fn test_c8_parse_m_params_3segment() {
+        let mut args = HashMap::new();
+        args.insert("m_t_LIKE_displayName".to_string(), json!("请假"));
+        let filters = parse_m_params(&args);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].alias, "t");
+        assert_eq!(filters[0].op, jeeflow_core::model::FilterOp::Like);
+        assert_eq!(filters[0].column, "display_name");
+        assert_eq!(filters[0].value, "请假");
+    }
+
+    #[test]
+    fn test_c8_parse_m_params_pd_alias() {
+        let mut args = HashMap::new();
+        args.insert("m_pd_LIKE_name".to_string(), json!("simple"));
+        let filters = parse_m_params(&args);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].alias, "pd");
+        assert_eq!(filters[0].op, jeeflow_core::model::FilterOp::Like);
+        assert_eq!(filters[0].column, "name");
+    }
+
+    #[test]
+    fn test_c8_parse_m_params_multiple() {
+        let mut args = HashMap::new();
+        args.insert("m_EQ_name".to_string(), json!("test"));
+        args.insert("m_LIKE_displayName".to_string(), json!("Test"));
+        args.insert("pageNum".to_string(), json!(1));
+        let filters = parse_m_params(&args);
+        assert_eq!(filters.len(), 2);
+    }
+
+    #[test]
+    fn test_c8_parse_m_params_all_operators() {
+        for op in &["EQ", "NE", "LIKE", "GT", "LT", "GE", "LE", "IN", "BT"] {
+            let mut args = HashMap::new();
+            args.insert(format!("m_{}_name", op), json!("val"));
+            let filters = parse_m_params(&args);
+            assert_eq!(filters.len(), 1, "Operator {} should be parsed", op);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_c8_filter_define_by_name_eq() {
+        let (facade, _) = make_facade_with_define();
+        let mut args = HashMap::new();
+        args.insert("m_EQ_name".to_string(), json!("test-flow"));
+        let resp = facade.flow("processDefine/page", &args).await;
+        assert_eq!(resp["code"], 0);
+        assert_eq!(resp["data"]["recordCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_c8_filter_define_by_name_eq_no_match() {
+        let (facade, _) = make_facade_with_define();
+        let mut args = HashMap::new();
+        args.insert("m_EQ_name".to_string(), json!("nonexistent"));
+        let resp = facade.flow("processDefine/page", &args).await;
+        assert_eq!(resp["code"], 0);
+        assert_eq!(resp["data"]["recordCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_c8_filter_define_by_name_like() {
+        let (facade, _) = make_facade_with_define();
+        let mut args = HashMap::new();
+        args.insert("m_LIKE_name".to_string(), json!("test"));
+        let resp = facade.flow("processDefine/page", &args).await;
+        assert_eq!(resp["code"], 0);
+        assert_eq!(resp["data"]["recordCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_c8_filter_define_by_display_name_3segment() {
+        let (facade, _) = make_facade_with_define();
+        let mut args = HashMap::new();
+        args.insert("m_t_LIKE_displayName".to_string(), json!("Test"));
+        let resp = facade.flow("processDefine/page", &args).await;
+        assert_eq!(resp["code"], 0);
+        assert_eq!(resp["data"]["recordCount"], 1);
+    }
+
+    #[test]
+    fn test_c8_camel_to_snake() {
+        assert_eq!(camel_to_snake("taskName"), "task_name");
+        assert_eq!(camel_to_snake("displayName"), "display_name");
+        assert_eq!(camel_to_snake("name"), "name");
+        assert_eq!(camel_to_snake("processInstanceId"), "process_instance_id");
     }
 }

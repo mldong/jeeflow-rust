@@ -609,12 +609,51 @@ pub struct TaskActor {
 // Query / Page types
 // ═══════════════════════════════════════════════════════
 
+/// Filter operator for m_ three-segment query (C8).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterOp {
+    Eq, Ne, Like, Gt, Lt, Ge, Le, In, Nin, Bt,
+}
+
+impl FilterOp {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "EQ" => Some(FilterOp::Eq),
+            "NE" => Some(FilterOp::Ne),
+            "LIKE" => Some(FilterOp::Like),
+            "LLIKE" => Some(FilterOp::Like), // treat as LIKE
+            "RLIKE" => Some(FilterOp::Like), // treat as LIKE
+            "GT" => Some(FilterOp::Gt),
+            "LT" => Some(FilterOp::Lt),
+            "GE" => Some(FilterOp::Ge),
+            "LE" => Some(FilterOp::Le),
+            "IN" => Some(FilterOp::In),
+            "NIN" => Some(FilterOp::Nin),
+            "BT" => Some(FilterOp::Bt),
+            _ => None,
+        }
+    }
+}
+
+/// Parsed m_ filter condition (C8: spec/06 §2.2).
+#[derive(Debug, Clone)]
+pub struct QueryFilter {
+    /// Table alias: "t" (main), "pd" (process define), etc.
+    pub alias: String,
+    pub op: FilterOp,
+    /// snake_case column name
+    pub column: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PageQuery {
     pub page_num: i64,
     pub page_size: i64,
     pub operator: Option<String>,
     pub conditions: HashMap<String, JsonValue>,
+    /// Parsed m_ filter conditions (C8).
+    pub filters: Vec<QueryFilter>,
 }
 
 impl PageQuery {

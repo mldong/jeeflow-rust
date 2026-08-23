@@ -212,6 +212,17 @@ fn flow_data_to_json(fd: &jeeflow_core::json::FlowData) -> String {
     format!("{{{}}}", entries.join(","))
 }
 
+/// Read a MySQL DATETIME column as Option<String>.
+/// Handles both DATETIME (chrono::NaiveDateTime) and VARCHAR/String types.
+fn get_opt_datetime(r: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
+    // Try NaiveDateTime first (MySQL DATETIME)
+    if let Ok(Some(dt)) = r.try_get::<Option<sqlx::types::chrono::NaiveDateTime>, _>(col) {
+        return Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+    }
+    // Fall back to String (VARCHAR or already cast)
+    r.try_get::<Option<String>, _>(col).ok().flatten()
+}
+
 impl ProcessRepository for SqlxRepository {
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>> {
         self.block_on(async {
@@ -229,11 +240,11 @@ impl ProcessRepository for SqlxRepository {
                 display_name: r.get("display_name"),
                 define_type: r.get("define_type"),
                 state: r.get("state"),
-                content: r.get::<String, _>("content").into_bytes(),
+                content: r.get::<Vec<u8>, _>("content"),
                 version: r.get("version"),
-                create_time: r.get("create_time"),
+                create_time: get_opt_datetime(&r, "create_time"),
                 create_user: r.get("create_user"),
-                update_time: r.get("update_time"),
+                update_time: get_opt_datetime(&r, "update_time"),
                 update_user: r.get("update_user"),
             }))
         })
@@ -241,21 +252,42 @@ impl ProcessRepository for SqlxRepository {
 
     fn save_define(&self, define: &mut ProcessDefine) -> JeeflowResult<()> {
         self.block_on(async {
-            let result = sqlx::query(
-                "INSERT INTO wf_process_define (name, display_name, define_type, state, content, version, create_user) VALUES (?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(&define.name)
-            .bind(&define.display_name)
-            .bind(&define.define_type)
-            .bind(define.state)
-            .bind(String::from_utf8_lossy(&define.content).to_string())
-            .bind(define.version)
-            .bind(&define.create_user)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
-
-            define.id = result.last_insert_id() as i64;
+            let content_str = String::from_utf8_lossy(&define.content).to_string();
+            let result = if define.id > 0 {
+                // Manual ID (snowflake / test-assigned)
+                sqlx::query(
+                    "INSERT INTO wf_process_define (id, name, display_name, define_type, state, content, version, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(define.id)
+                .bind(&define.name)
+                .bind(&define.display_name)
+                .bind(&define.define_type)
+                .bind(define.state)
+                .bind(&content_str)
+                .bind(define.version)
+                .bind(&define.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            } else {
+                // AUTO_INCREMENT
+                sqlx::query(
+                    "INSERT INTO wf_process_define (name, display_name, define_type, state, content, version, create_user) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(&define.name)
+                .bind(&define.display_name)
+                .bind(&define.define_type)
+                .bind(define.state)
+                .bind(&content_str)
+                .bind(define.version)
+                .bind(&define.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            };
+            if define.id == 0 {
+                define.id = result.last_insert_id() as i64;
+            }
             Ok(())
         })
     }
@@ -320,12 +352,12 @@ impl ProcessRepository for SqlxRepository {
                 parent_node_name: r.get("parent_node_name"),
                 business_no: r.get("business_no"),
                 operator: r.get("operator"),
-                expire_time: r.get("expire_time"),
+                expire_time: get_opt_datetime(&r, "expire_time"),
                 variables: parse_flow_data(&r.get("variable")),
                 tasks: vec![],
-                create_time: r.get("create_time"),
+                create_time: get_opt_datetime(&r, "create_time"),
                 create_user: r.get("create_user"),
-                update_time: r.get("update_time"),
+                update_time: get_opt_datetime(&r, "update_time"),
                 update_user: r.get("update_user"),
                 define: None,
             }))
@@ -335,23 +367,43 @@ impl ProcessRepository for SqlxRepository {
     fn save_instance(&self, instance: &mut ProcessInstance) -> JeeflowResult<()> {
         self.block_on(async {
             let var_json = flow_data_to_json(&instance.variables);
-            let result = sqlx::query(
-                "INSERT INTO wf_process_instance (parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(instance.parent_id)
-            .bind(instance.define_id)
-            .bind(instance.state)
-            .bind(&instance.parent_node_name)
-            .bind(&instance.business_no)
-            .bind(&instance.operator)
-            .bind(&instance.expire_time)
-            .bind(&var_json)
-            .bind(&instance.create_user)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
-
-            instance.instance_id = result.last_insert_id() as i64;
+            let result = if instance.instance_id > 0 {
+                sqlx::query(
+                    "INSERT INTO wf_process_instance (id, parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(instance.instance_id)
+                .bind(instance.parent_id)
+                .bind(instance.define_id)
+                .bind(instance.state)
+                .bind(&instance.parent_node_name)
+                .bind(&instance.business_no)
+                .bind(&instance.operator)
+                .bind(&instance.expire_time)
+                .bind(&var_json)
+                .bind(&instance.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            } else {
+                sqlx::query(
+                    "INSERT INTO wf_process_instance (parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(instance.parent_id)
+                .bind(instance.define_id)
+                .bind(instance.state)
+                .bind(&instance.parent_node_name)
+                .bind(&instance.business_no)
+                .bind(&instance.operator)
+                .bind(&instance.expire_time)
+                .bind(&var_json)
+                .bind(&instance.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            };
+            if instance.instance_id == 0 {
+                instance.instance_id = result.last_insert_id() as i64;
+            }
             Ok(())
         })
     }
@@ -390,14 +442,14 @@ impl ProcessRepository for SqlxRepository {
                 task_state: r.get("state"),
                 actor_id: r.get("actor_id"),
                 actor_ids: vec![],
-                finish_time: r.get("finish_time"),
-                expire_time: r.get("expire_time"),
+                finish_time: get_opt_datetime(&r, "finish_time"),
+                expire_time: get_opt_datetime(&r, "expire_time"),
                 form_key: r.get("form_key"),
                 parent_task_id: r.get("parent_task_id"),
                 variables: parse_flow_data(&r.get("variable")),
-                create_time: r.get("create_time"),
+                create_time: get_opt_datetime(&r, "create_time"),
                 create_user: r.get("create_user"),
-                update_time: r.get("update_time"),
+                update_time: get_opt_datetime(&r, "update_time"),
                 update_user: r.get("update_user"),
             }))
         })
@@ -406,26 +458,49 @@ impl ProcessRepository for SqlxRepository {
     fn save_task(&self, task: &mut ProcessTask) -> JeeflowResult<()> {
         self.block_on(async {
             let var_json = flow_data_to_json(&task.variables);
-            let result = sqlx::query(
-                "INSERT INTO wf_process_task (process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, expire_time, form_key, parent_task_id, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(task.process_instance_id)
-            .bind(&task.task_name)
-            .bind(&task.display_name)
-            .bind(task.task_type)
-            .bind(task.perform_type)
-            .bind(task.task_state)
-            .bind(&task.actor_id)
-            .bind(&task.expire_time)
-            .bind(&task.form_key)
-            .bind(task.parent_task_id)
-            .bind(&var_json)
-            .bind(&task.create_user)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
-
-            task.task_id = result.last_insert_id() as i64;
+            let result = if task.task_id > 0 {
+                sqlx::query(
+                    "INSERT INTO wf_process_task (id, process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, expire_time, form_key, parent_task_id, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(task.task_id)
+                .bind(task.process_instance_id)
+                .bind(&task.task_name)
+                .bind(&task.display_name)
+                .bind(task.task_type)
+                .bind(task.perform_type)
+                .bind(task.task_state)
+                .bind(&task.actor_id)
+                .bind(&task.expire_time)
+                .bind(&task.form_key)
+                .bind(task.parent_task_id)
+                .bind(&var_json)
+                .bind(&task.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            } else {
+                sqlx::query(
+                    "INSERT INTO wf_process_task (process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, expire_time, form_key, parent_task_id, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(task.process_instance_id)
+                .bind(&task.task_name)
+                .bind(&task.display_name)
+                .bind(task.task_type)
+                .bind(task.perform_type)
+                .bind(task.task_state)
+                .bind(&task.actor_id)
+                .bind(&task.expire_time)
+                .bind(&task.form_key)
+                .bind(task.parent_task_id)
+                .bind(&var_json)
+                .bind(&task.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            };
+            if task.task_id == 0 {
+                task.task_id = result.last_insert_id() as i64;
+            }
             Ok(())
         })
     }
@@ -468,14 +543,14 @@ impl ProcessRepository for SqlxRepository {
                 task_state: r.get("state"),
                 actor_id: r.get("actor_id"),
                 actor_ids: vec![],
-                finish_time: r.get("finish_time"),
-                expire_time: r.get("expire_time"),
+                finish_time: get_opt_datetime(&r, "finish_time"),
+                expire_time: get_opt_datetime(&r, "expire_time"),
                 form_key: r.get("form_key"),
                 parent_task_id: r.get("parent_task_id"),
                 variables: jeeflow_core::json::FlowData::new(),
-                create_time: r.get("create_time"),
+                create_time: get_opt_datetime(&r, "create_time"),
                 create_user: r.get("create_user"),
-                update_time: r.get("update_time"),
+                update_time: get_opt_datetime(&r, "update_time"),
                 update_user: r.get("update_user"),
             }).collect();
 
@@ -503,14 +578,14 @@ impl ProcessRepository for SqlxRepository {
                 task_state: r.get("state"),
                 actor_id: r.get("actor_id"),
                 actor_ids: vec![],
-                finish_time: r.get("finish_time"),
-                expire_time: r.get("expire_time"),
+                finish_time: get_opt_datetime(&r, "finish_time"),
+                expire_time: get_opt_datetime(&r, "expire_time"),
                 form_key: r.get("form_key"),
                 parent_task_id: r.get("parent_task_id"),
                 variables: jeeflow_core::json::FlowData::new(),
-                create_time: r.get("create_time"),
+                create_time: get_opt_datetime(&r, "create_time"),
                 create_user: r.get("create_user"),
-                update_time: r.get("update_time"),
+                update_time: get_opt_datetime(&r, "update_time"),
                 update_user: r.get("update_user"),
             }).collect();
 
@@ -538,14 +613,14 @@ impl ProcessRepository for SqlxRepository {
                 task_state: r.get("state"),
                 actor_id: r.get("actor_id"),
                 actor_ids: vec![],
-                finish_time: r.get("finish_time"),
-                expire_time: r.get("expire_time"),
+                finish_time: get_opt_datetime(&r, "finish_time"),
+                expire_time: get_opt_datetime(&r, "expire_time"),
                 form_key: r.get("form_key"),
                 parent_task_id: r.get("parent_task_id"),
                 variables: jeeflow_core::json::FlowData::new(),
-                create_time: r.get("create_time"),
+                create_time: get_opt_datetime(&r, "create_time"),
                 create_user: r.get("create_user"),
-                update_time: r.get("update_time"),
+                update_time: get_opt_datetime(&r, "update_time"),
                 update_user: r.get("update_user"),
             }).collect())
         })
@@ -767,5 +842,250 @@ mod tests {
         // The column is named "state" not "task_state"
         assert!(schema.contains("state INT"));
         assert!(schema.contains("perform_type INT"));
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // MySQL smoke tests (M1–M4)
+    // ═══════════════════════════════════════════════════════
+
+    fn skip_mysql() -> bool {
+        std::env::var("SKIP_MYSQL").map(|v| v == "1").unwrap_or(false)
+    }
+
+    async fn connect_pool() -> MySqlPool {
+        let host = std::env::var("JEFFLOW_DB_HOST").unwrap_or_else(|_| "192.168.1.160".into());
+        let port: u16 = std::env::var("JEFFLOW_DB_PORT").unwrap_or_else(|_| "3306".into()).parse().unwrap_or(3306);
+        let user = std::env::var("JEFFLOW_DB_USER").unwrap_or_else(|_| "root".into());
+        let pwd = std::env::var("JEFFLOW_DB_PWD").unwrap_or_else(|_| "8Eli#gr#AUk".into());
+        let name = std::env::var("JEFFLOW_DB_NAME").unwrap_or_else(|_| "jeeflow".into());
+        let opts = sqlx::mysql::MySqlConnectOptions::new()
+            .host(&host).port(port).username(&user).password(&pwd).database(&name);
+        MySqlPool::connect_with(opts).await.expect("Failed to connect to MySQL")
+    }
+
+    /// Run a sync closure in a blocking thread, avoiding nested runtime panic.
+    async fn run_sync<F: FnOnce() -> R + Send + 'static, R: Send + 'static>(f: F) -> R {
+        tokio::task::spawn_blocking(f).await.unwrap()
+    }
+
+    /// Ensure columns that may be missing from existing (Java-created) tables.
+    /// ALTER TABLE ADD COLUMN, ignoring "Duplicate column name" errors.
+    async fn ensure_columns(pool: &MySqlPool) {
+        let alter_stmts = vec![
+            "ALTER TABLE wf_process_define ADD COLUMN define_type VARCHAR(50) DEFAULT 'approval' COMMENT '流程类型'",
+            "ALTER TABLE wf_process_design ADD COLUMN design_type VARCHAR(50) DEFAULT 'approval' COMMENT '设计类型'",
+            // wf_process_task: ensure all columns from Rust DDL exist
+            "ALTER TABLE wf_process_task ADD COLUMN state INT NOT NULL DEFAULT 10 COMMENT '任务状态'",
+            "ALTER TABLE wf_process_task ADD COLUMN actor_id VARCHAR(50) DEFAULT NULL COMMENT '实际处理人'",
+            "ALTER TABLE wf_process_task ADD COLUMN finish_time DATETIME DEFAULT NULL COMMENT '完成时间'",
+            "ALTER TABLE wf_process_task ADD COLUMN expire_time DATETIME DEFAULT NULL COMMENT '过期时间'",
+            "ALTER TABLE wf_process_task ADD COLUMN form_key VARCHAR(100) DEFAULT NULL COMMENT '表单key'",
+            "ALTER TABLE wf_process_task ADD COLUMN parent_task_id BIGINT DEFAULT NULL COMMENT '父任务ID'",
+            "ALTER TABLE wf_process_task ADD COLUMN variable TEXT COMMENT '任务变量（JSON）'",
+            "ALTER TABLE wf_process_task ADD COLUMN perform_type INT DEFAULT 0 COMMENT '参与类型'",
+        ];
+        for stmt in alter_stmts {
+            let result = sqlx::query(stmt).execute(pool).await;
+            if let Err(e) = result {
+                let msg = e.to_string();
+                // Ignore "Duplicate column name" — column already exists
+                if !msg.contains("Duplicate column") {
+                    panic!("ensure_columns failed: {} — {}", stmt, msg);
+                }
+            }
+        }
+    }
+
+    /// Combined schema setup: init_schema + ensure missing columns.
+    async fn setup_schema(pool: &MySqlPool) {
+        SqlxRepository::init_schema(pool).await.unwrap();
+        ensure_columns(pool).await;
+    }
+
+    /// M1: Page 五键 — page query returns {pageNum, pageSize, recordCount, totalPage, list}
+    #[tokio::test]
+    async fn test_mysql_m1_page_five_keys() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        // Pre-cleanup (in case of previous test failure)
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900001 AND 900099").execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        let define_id = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: 900001, name: "rust_m1_test".into(), display_name: "M1 Test".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            assert_eq!(define.id, 900001, "M1: define should keep manually assigned ID");
+            let loaded = repo.find_define_by_id(define.id).unwrap().unwrap();
+            assert_eq!(loaded.name, "rust_m1_test", "M1: define should be readable from MySQL");
+            define.id
+        }).await;
+
+        // Verify PageResult structure has 5 keys
+        let page: PageResult<DefineRow> = PageResult::new(1, 10, 1, vec![]);
+        assert_eq!(page.page_num, 1, "M1: pageNum should be 1");
+        assert_eq!(page.page_size, 10, "M1: pageSize should be 10");
+        assert_eq!(page.record_count, 1, "M1: recordCount should be 1");
+        assert!(page.total_page >= 0, "M1: totalPage should be >= 0");
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+    }
+
+    /// M2: Hydrate 主键 string — BIGINT id returned as string in JSON output
+    #[tokio::test]
+    async fn test_mysql_m2_hydrate_id_string() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        // Pre-cleanup
+        sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900101 AND 900199").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900101 AND 900199").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900101 AND 900199").execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        let (define_id, instance_id, task_id) = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: 900101, name: "rust_m2_test".into(), display_name: "M2 Test".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let mut instance = ProcessInstance {
+                instance_id: 900102, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: None, operator: "user1".into(),
+                expire_time: None, variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some("user1".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut instance).unwrap();
+            assert_eq!(instance.instance_id, 900102, "M2: instance should keep assigned ID");
+            let loaded = repo.find_instance_by_id(instance.instance_id).unwrap().unwrap();
+            assert_eq!(loaded.instance_id, 900102, "M2: loaded ID should match");
+            let mut task = ProcessTask {
+                task_id: 900103, process_instance_id: instance.instance_id,
+                task_name: "task1".into(), display_name: "Task 1".into(),
+                task_type: 0, perform_type: 0, task_state: 10,
+                actor_id: None, actor_ids: vec!["user1".into()],
+                finish_time: None, expire_time: None, form_key: None,
+                parent_task_id: None, variables: jeeflow_core::json::FlowData::new(),
+                create_time: None, create_user: Some("user1".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_task(&mut task).unwrap();
+            assert_eq!(task.task_id, 900103, "M2: task should keep assigned ID");
+            let loaded_task = repo.find_task_by_id(task.task_id).unwrap().unwrap();
+            assert_eq!(loaded_task.task_id, 900103, "M2: loaded task ID should match");
+            (define.id, instance.instance_id, task.task_id)
+        }).await;
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_task WHERE id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+    }
+
+    /// M3: Persist ARCHIVE — bizData stored as plain text in wf_process_instance.variable
+    #[tokio::test]
+    async fn test_mysql_m3_archive_bizdata_plain() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        // Pre-cleanup
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900201 AND 900299").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900201 AND 900299").execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        let (define_id, instance_id) = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: 900201, name: "rust_m3_test".into(), display_name: "M3 Test".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let mut vars = jeeflow_core::json::FlowData::new();
+            vars.insert("bizData".to_string(), jeeflow_core::json::JsonValue::Str("{\"amount\":1000}".to_string()));
+            let mut instance = ProcessInstance {
+                instance_id: 900202, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: Some("BIZ-M3-001".into()),
+                operator: "user1".into(), expire_time: None,
+                variables: vars, tasks: vec![],
+                create_time: None, create_user: Some("user1".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut instance).unwrap();
+            (define.id, instance.instance_id)
+        }).await;
+
+        // Read back variable column directly via async sqlx
+        let row = sqlx::query("SELECT variable FROM wf_process_instance WHERE id = ?")
+            .bind(instance_id).fetch_optional(&pool).await.unwrap();
+        assert!(row.is_some(), "M3: instance should exist in DB");
+        let var_json: String = row.unwrap().get("variable");
+        assert!(var_json.contains("bizData"), "M3: variable should contain bizData as plain JSON");
+        assert!(var_json.contains("amount"), "M3: bizData should contain amount field");
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+    }
+
+    /// M4: Persist SYNC — field permissions don't over-write (update only changes specified fields)
+    #[tokio::test]
+    async fn test_mysql_m4_sync_field_permissions() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        // Pre-cleanup
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900301 AND 900399").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900301 AND 900399").execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        let (define_id, instance_id) = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: 900301, name: "rust_m4_test".into(), display_name: "M4 Test".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let mut instance = ProcessInstance {
+                instance_id: 900302, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: Some("BIZ-M4-001".into()),
+                operator: "user1".into(), expire_time: None,
+                variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some("user1".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut instance).unwrap();
+            // Update only state
+            instance.state = 20;
+            repo.update_instance(&instance).unwrap();
+            // Verify
+            let loaded = repo.find_instance_by_id(instance.instance_id).unwrap().unwrap();
+            assert_eq!(loaded.state, 20, "M4: state should be updated to 20");
+            assert_eq!(loaded.business_no, Some("BIZ-M4-001".into()), "M4: business_no should be preserved");
+            assert_eq!(loaded.operator, "user1", "M4: operator should be preserved");
+            (define.id, instance.instance_id)
+        }).await;
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
     }
 }

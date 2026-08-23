@@ -1,7 +1,9 @@
 //! jeeflow-demo-salvo: Demo server using Salvo framework.
+//! **仅演示，非宿主集成** — 内存仓、无鉴权，用于引擎功能验证。
+//! 宿主集成见第二步 M4。
 //! Port: 8091
 //! Routes:
-//!   POST /wf/{group}/{action} → facade.flow("group/action", body)
+//!   POST /wf/{**action} → facade.flow("action", body)
 //!   GET  /healthz     → health check
 //!   GET  /api/stats   → todoCount / instanceCount
 //!   POST /api/reset   → reset all data
@@ -57,7 +59,7 @@ impl UserProvider for DemoUserProvider {
 // ═══════════════════════════════════════════════════════
 
 struct AppState {
-    facade: JeeflowFacade,
+    facade: Arc<JeeflowFacade>,
     #[allow(dead_code)]
     repo: Arc<MemoryRepository>,
 }
@@ -71,7 +73,7 @@ impl AppState {
             .with_user_provider(Arc::new(DemoUserProvider))
             .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
 
-        let facade = JeeflowFacade::new(ctx);
+        let facade = Arc::new(JeeflowFacade::new(ctx));
         AppState { facade, repo }
     }
 }
@@ -99,16 +101,32 @@ async fn wf_action(req: &mut Request, res: &mut Response) {
     let action = req.param::<String>("action").unwrap_or_default();
 
     // Parse body first (before locking mutex)
-    let body: Json = req.parse_json().await.unwrap_or(json!({}));
+    // Demo error handling: log + return 99999999 on invalid body
+    let body: Json = match req.parse_json().await {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("非法请求body: {}", e);
+            eprintln!("[wf_action] body parse error: {}", e);
+            res.render(salvo::prelude::Json(json!({
+                "code": 99999999,
+                "msg": msg,
+                "data": null
+            })));
+            return;
+        }
+    };
 
     let args: HashMap<String, Json> = match body.as_object() {
         Some(map) => map.clone().into_iter().collect(),
         None => HashMap::new(),
     };
 
-    // Now lock and process
-    let state = STATE.lock().unwrap();
-    let result = state.facade.flow(&action, &args);
+    // Clone facade Arc before awaiting (avoid holding MutexGuard across .await)
+    let facade = {
+        let state = STATE.lock().unwrap();
+        state.facade.clone()
+    };
+    let result = facade.flow(&action, &args).await;
     res.render(salvo::prelude::Json(result));
 }
 
