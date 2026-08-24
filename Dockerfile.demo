@@ -15,14 +15,14 @@ COPY jeeflow-rust/jeeflow-persist/Cargo.toml jeeflow-persist/Cargo.toml
 COPY jeeflow-rust/jeeflow-facade/Cargo.toml jeeflow-facade/Cargo.toml
 COPY jeeflow-rust/jeeflow-demo-salvo/Cargo.toml jeeflow-demo-salvo/Cargo.toml
 
-# 创建 dummy src 以通过编译缓存
+# 创建 dummy src 以通过依赖编译缓存
 RUN mkdir -p jeeflow-core/src && echo "pub fn dummy(){}" > jeeflow-core/src/lib.rs && \
     mkdir -p jeeflow-repository-sqlx/src && echo "pub fn dummy(){}" > jeeflow-repository-sqlx/src/lib.rs && \
     mkdir -p jeeflow-persist/src && echo "pub fn dummy(){}" > jeeflow-persist/src/lib.rs && \
     mkdir -p jeeflow-facade/src && echo "pub fn dummy(){}" > jeeflow-facade/src/lib.rs && \
     mkdir -p jeeflow-demo-salvo/src && echo "fn main(){}" > jeeflow-demo-salvo/src/main.rs
 
-# 预编译依赖（缓存层）
+# 预编译依赖（缓存层；失败可忽略）
 RUN cargo build --release -p jeeflow-demo-salvo 2>/dev/null || true
 
 # 复制真实源码
@@ -32,11 +32,18 @@ COPY jeeflow-rust/jeeflow-persist/src jeeflow-persist/src
 COPY jeeflow-rust/jeeflow-facade/src jeeflow-facade/src
 COPY jeeflow-rust/jeeflow-demo-salvo/src jeeflow-demo-salvo/src
 
-# 编译 release binary —— 输出到 /out，避免与 crate 目录 jeeflow-demo-salvo/ 撞名
-RUN cargo build --release -p jeeflow-demo-salvo && \
+# 关键：COPY 保留 git 旧 mtime，会比 dummy 产物还旧 → cargo 跳过重编，镜像里变成空 main！
+# 必须清掉该 package 产物并 touch 源码后再编
+RUN find jeeflow-core/src jeeflow-repository-sqlx/src jeeflow-persist/src \
+        jeeflow-facade/src jeeflow-demo-salvo/src -type f -exec touch {} + && \
+    cargo clean -p jeeflow-demo-salvo -p jeeflow-facade -p jeeflow-persist \
+        -p jeeflow-repository-sqlx -p jeeflow-core && \
+    cargo build --release -p jeeflow-demo-salvo && \
     mkdir -p /out && \
     cp target/release/jeeflow-demo-salvo /out/jeeflow-demo-salvo && \
-    chmod 755 /out/jeeflow-demo-salvo
+    chmod 755 /out/jeeflow-demo-salvo && \
+    # 真实二进制至少数 MB；dummy 空 main ~几百 KB
+    test "$(wc -c < /out/jeeflow-demo-salvo)" -gt 1000000
 
 # ─── runtime ───
 FROM debian:bookworm-slim
@@ -45,10 +52,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-# BuildKit COPY --chmod；旧 Docker 若丢可执行位仍可用下面 ENTRYPOINT 兜底
-COPY --chmod=755 --from=builder /out/jeeflow-demo-salvo /app/jeeflow-demo-salvo
+COPY --chmod=755 --from=builder /out/jeeflow-demo-salvo /usr/local/bin/jeeflow-demo-salvo
 COPY jeeflow-java/jeeflow-core/src/test/resources/flows /app/flows
 
 ENV JEFFLOW_FLOWS_DIR=/app/flows
 EXPOSE 8091
-ENTRYPOINT ["/bin/sh", "-c", "chmod +x /app/jeeflow-demo-salvo && exec /app/jeeflow-demo-salvo"]
+# 直接 exec 二进制（放 /usr/local/bin，避开旧 runc 对相对路径/丢失 +x 的坑）
+CMD ["/usr/local/bin/jeeflow-demo-salvo"]
