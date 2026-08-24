@@ -591,34 +591,44 @@ impl JeeflowFacade {
     }
 
     async fn process_define_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let define_name = arg_str(args, "name").ok_or(JeeflowError::Business("缺少name参数".into()))?;
-        let operator = arg_str_or(args, "operator", "flow.auto");
+        // 对齐 Java：优先 processDefineId / id；兼容 name
+        let define_id = if let Some(id) = arg_i64(args, "processDefineId")?.or(arg_i64(args, "id")?) {
+            id
+        } else if let Some(define_name) = arg_str(args, "name") {
+            let query = PageQuery::new(1, 1000);
+            let page = self.repo.page_defines(&query)?;
+            page.rows
+                .iter()
+                .find(|d| d.name == define_name && d.state == 1)
+                .map(|d| d.id)
+                .ok_or_else(|| JeeflowError::Business(format!("流程定义不存在或未启用: {}", define_name)))?
+        } else {
+            return Err(JeeflowError::Business("缺少processDefineId参数".into()));
+        };
 
-        // Find define by name — search through page
-        let query = PageQuery::new(1, 1000);
-        let page = self.repo.page_defines(&query)?;
-        let define = page.rows.iter()
-            .find(|d| d.name == define_name && d.state == 1)
-            .ok_or(JeeflowError::Business(format!("流程定义不存在或未启用: {}", define_name)))?;
-
-        let define_id = define.id;
-        let flow_data = args_to_flow_data(args);
+        let operator = arg_str_or(args, "operator", "user1");
+        let mut flow_data = args_to_flow_data(args);
 
         // Start instance
         let instance = self.engine.start_async(define_id, &operator, &flow_data).await?;
 
-        // Get first task and execute if possible
+        // 对齐 Java/boot2：自动完成申请节点（assignee=applicant → 发起人）
         let tasks = self.repo.find_doing_tasks(instance.instance_id, &[])?;
-        let mut task_ids = vec![];
         for task in &tasks {
-            task_ids.push(task.task_id);
+            let _ = self.repo.add_task_actor(task.task_id, &[operator.clone()]);
+            flow_data.insert_i64("submitType", 0); // Apply
+            // f_nextNodeOperator → tf_nextNodeOperator（若有）
+            if let Some(next_op) = flow_data.get_str("f_nextNodeOperator") {
+                let v = next_op.to_string();
+                flow_data.insert_str("tf_nextNodeOperator", v);
+            }
+            let _ = self
+                .engine
+                .execute_task_async(task.task_id, &operator, &flow_data)
+                .await?;
         }
 
-        Ok(json!({
-            "instance_id": instance.instance_id,
-            "state": instance.state,
-            "task_ids": task_ids,
-        }))
+        Ok(json!({ "process_instance_id": instance.instance_id }))
     }
 
     fn process_define_deploy(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -802,7 +812,8 @@ impl JeeflowFacade {
         let page_size = arg_i64_or(args, "pageSize", 20)?;
         let filters = parse_m_params(args);
         let mut query = PageQuery::new(page_num, page_size);
-        query.operator = arg_str(args, "operator");
+        // UI 注入 operator；兼容 userId（curl/旧客户端）
+        query.operator = arg_str(args, "operator").or_else(|| arg_str(args, "userId"));
         let page = self.repo.page_todo_tasks(&query)?;
         let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(task_row_to_json(r)).unwrap()).collect();
         apply_filters_to_rows(&mut rows, &filters);
@@ -826,11 +837,58 @@ impl JeeflowFacade {
     }
 
     async fn process_task_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let task_id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        // 对齐 UI/Java：processTaskId 优先，兼容 id
+        let task_id = arg_i64(args, "processTaskId")?
+            .or(arg_i64(args, "id")?)
+            .ok_or(JeeflowError::Business("缺少processTaskId参数".into()))?;
         let operator = arg_str_or(args, "operator", "flow.auto");
-        let flow_data = args_to_flow_data(args);
+        let submit_type = arg_i64_or(args, "submitType", 1)?; // 默认同意
+        let mut flow_data = args_to_flow_data(args);
+        flow_data.insert_i64("submitType", submit_type);
 
-        let new_tasks = self.engine.execute_task_async(task_id, &operator, &flow_data).await?;
+        // 对齐 Java JeeflowFacade.execute / spec §11.2 分发
+        let new_tasks = match submit_type {
+            2 => {
+                // REJECT → 跳到结束
+                self.engine
+                    .execute_and_jump_to_end_async(task_id, &operator, &flow_data)
+                    .await?;
+                vec![]
+            }
+            3 => {
+                // ROLLBACK → 退回上一步（target=None）
+                self.engine
+                    .execute_and_jump_async(task_id, &operator, &flow_data, None)
+                    .await?
+            }
+            4 => {
+                // JUMP → 跳转指定节点
+                let task_name = arg_str(args, "taskName");
+                self.engine
+                    .execute_and_jump_async(task_id, &operator, &flow_data, task_name.as_deref())
+                    .await?
+            }
+            6 => {
+                // ROLLBACK_TO_OPERATOR → 退回发起人
+                self.engine
+                    .execute_and_jump_to_first_async(task_id, &operator, &flow_data)
+                    .await?;
+                vec![]
+            }
+            20 => {
+                // COUNTERSIGN_DISAGREE
+                flow_data.insert_i64("countersignDisagreeFlag", 1);
+                self.engine
+                    .execute_task_async(task_id, &operator, &flow_data)
+                    .await?
+            }
+            _ => {
+                // 0 APPLY / 1 AGREE / 5 重新提交
+                self.engine
+                    .execute_task_async(task_id, &operator, &flow_data)
+                    .await?
+            }
+        };
         let task_ids: Vec<i64> = new_tasks.iter().map(|t| t.task_id).collect();
 
         Ok(json!({"task_ids": task_ids}))
@@ -1779,44 +1837,35 @@ mod tests {
         let resp3 = facade.flow("processDesign/deploy", &args3).await;
         assert_eq!(resp3["code"], 0, "deploy failed: {:?}", resp3);
 
-        // 4. processDefine/startAndExecute (operator=applicant)
+        // 4. processDefine/startAndExecute（对齐 Java：自动完成 apply，返回 processInstanceId）
         let mut args4 = HashMap::new();
         args4.insert("name".to_string(), json!("two-step-flow"));
         args4.insert("operator".to_string(), json!("applicant"));
         let resp4 = facade.flow("processDefine/startAndExecute", &args4).await;
         assert_eq!(resp4["code"], 0, "startAndExecute failed: {:?}", resp4);
-        // taskIds should be stringified (#92) and non-zero
-        let start_task_ids = resp4["data"]["taskIds"].as_array().unwrap();
-        assert!(!start_task_ids.is_empty(), "startAndExecute should return taskIds");
-        let apply_task_id_str = start_task_ids[0].as_str().expect("taskId should be string (#92)");
-        let apply_task_id: i64 = apply_task_id_str.parse().unwrap();
-        assert!(apply_task_id > 0, "apply task id should be non-zero");
+        let inst_id = resp4["data"]["processInstanceId"]
+            .as_str()
+            .expect("processInstanceId should be string (#92)");
+        assert!(!inst_id.is_empty() && inst_id != "0", "processInstanceId should be non-zero");
 
-        // 5. processTask/execute (applicant completes apply → creates approve task for user2)
-        let mut args5 = HashMap::new();
-        args5.insert("id".to_string(), json!(apply_task_id));
-        args5.insert("operator".to_string(), json!("applicant"));
-        let resp5 = facade.flow("processTask/execute", &args5).await;
-        assert_eq!(resp5["code"], 0, "execute failed: {:?}", resp5);
-        let exec_task_ids = resp5["data"]["taskIds"].as_array().unwrap();
-        assert!(!exec_task_ids.is_empty(), "execute should return new taskIds");
-        // #91: taskIds must be non-zero
-        let new_task_id_str = exec_task_ids[0].as_str().expect("#91: execute taskId should be string (#92) and non-zero (#91)");
-        let new_task_id: i64 = new_task_id_str.parse().unwrap();
-        assert!(new_task_id > 0, "#91: execute taskId should be non-zero, got 0");
-
-        // 6. processTask/todoList (operator=user2) — cross-check id matches
+        // 5. processTask/todoList (operator=user2) — apply 已自动完成，待办应为 approve
         let mut args6 = HashMap::new();
         args6.insert("operator".to_string(), json!("user2"));
         let resp6 = facade.flow("processTask/todoList", &args6).await;
         assert_eq!(resp6["code"], 0, "todoList failed: {:?}", resp6);
         let rows = resp6["data"]["rows"].as_array().unwrap();
-        assert!(!rows.is_empty(), "user2 should have a todo task");
+        assert!(!rows.is_empty(), "user2 should have a todo task after startAndExecute");
         let todo_task_id_str = rows[0]["id"].as_str().expect("todoList id should be string");
         let todo_task_id: i64 = todo_task_id_str.parse().unwrap();
-        // #91: execute response taskId must match todoList task id
-        assert_eq!(new_task_id, todo_task_id,
-            "#91: execute response taskId ({}) must match todoList id ({})", new_task_id, todo_task_id);
+        assert!(todo_task_id > 0, "todo task id should be non-zero");
+
+        // 6. processTask/execute（兼容 id / processTaskId）
+        let mut args5 = HashMap::new();
+        args5.insert("processTaskId".to_string(), json!(todo_task_id));
+        args5.insert("operator".to_string(), json!("user2"));
+        args5.insert("submitType".to_string(), json!(1));
+        let resp5 = facade.flow("processTask/execute", &args5).await;
+        assert_eq!(resp5["code"], 0, "execute failed: {:?}", resp5);
     }
 
     // ─── Action count test ───

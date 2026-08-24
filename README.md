@@ -129,8 +129,12 @@ SKIP_MYSQL=0 cargo test --workspace --features mysql-smoke   # T1 本地 160 MyS
 cargo run -p jeeflow-demo-salvo       # :8091
 ```
 
+- 启动时从共享 `jeeflow-java/.../flows/` 加载种子流程（id=1..N）
+- 演示用户与其他语言 demo / jeeflow-ui 对齐（user1 / leader / manager …）
 - `POST /wf/{action}` → `facade.flow(action, body)`（门面 action 全转发）
-- `GET /healthz` / `GET /api/stats` / `POST /api/reset`
+- `GET /healthz` / `GET /api/stats` / `POST /api/reset`（reset 会重载种子）
+
+联调 jeeflow-ui：`pnpm --filter @jeeflow/demo dev`，分段控件选 **Rust**（代理 `/rust-api` → `:8091`），或打开 `?lang=rust`。
 
 仅演示用（内存仓、无鉴权）；宿主集成走 mldong-salvo 框架。
 
