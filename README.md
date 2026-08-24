@@ -3,13 +3,12 @@
 [![Rust](https://img.shields.io/badge/Rust-1.97+-orange?logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache-2.0-orange)](./LICENSE)
 
-[jeeflow](https://jeeflow-doc.mldong.com) 引擎规范的 **Rust 语言实现**（多语言联邦第 6 语言，
+[jeeflow](https://jeeflow-doc.mldong.com) 引擎规范的 **Rust 语言实现**（多语言联邦，
 与 Java/Go/Python/Node/PHP 共享同一套流程 JSON 与契约规范）。核心引擎**零第三方依赖**，
 纯 Rust stdlib。
 
-> **v1.0.0**：首个正式版本。引擎核心（节点/会签门控/驳回跳转/委托/CC）+ 42 个门面 action
-> 统一入口 + sqlx MySQL 仓储 + Salvo 演示服务；串行/并行/按比例会签与一票否决
-> （ONE_VOTE_VETO）语义对齐五语言契约，227 测试全绿。
+统一门面入口 + sqlx MySQL 仓储 + Salvo 演示服务；串行/并行/按比例会签与一票否决
+（ONE_VOTE_VETO）语义对齐联邦契约。
 
 ---
 
@@ -47,7 +46,7 @@ let mut define = ProcessDefine {
 };
 repo.save_define(&mut define).unwrap();
 
-// 3. 统一门面：42 个 action 一个入口
+// 3. 统一门面：一个入口转发全部 action
 let facade = JeeflowFacade::new(ctx);
 
 // 发起（startAndExecute：发起并自动完成发起节点）
@@ -70,16 +69,16 @@ let done = facade.flow("processTask/execute", &exec_args).await;
 
 ## 安装
 
-crates.io 发布准备中（workspace 版本 1.0.0，打 tag `v*.*.*` 后 CI 自动按
+crates.io 发布准备中（打 tag `v*.*.*` 后 CI 按
 `jeeflow-core → jeeflow-repository-sqlx → jeeflow-persist → jeeflow-facade` 拓扑序发布）。
-发布后：
+发布后按 crates.io 最新版本依赖即可，例如：
 
 ```toml
 [dependencies]
-jeeflow-facade = "1.0"        # 统一门面（42 actions）
-jeeflow-core = "1.0"          # 引擎核心（零第三方依赖）
-jeeflow-persist = "1.0"       # 持久层（DynamicTableWriter + PersistPostInterceptor）
-jeeflow-repository-sqlx = { version = "1.0", features = ["mysql"] }  # MySQL 仓储
+jeeflow-facade = "1"          # 统一门面
+jeeflow-core = "1"            # 引擎核心（零第三方依赖）
+jeeflow-persist = "1"         # 持久层
+jeeflow-repository-sqlx = { version = "1", features = ["mysql"] }
 ```
 
 ## 目录结构
@@ -89,7 +88,7 @@ jeeflow-rust/
 ├── jeeflow-core/            ← 引擎核心（零第三方依赖，对标 jeeflow-java jeeflow-core）
 ├── jeeflow-persist/         ← 持久层（元数据驱动动态表写入 + 持久后拦截器）
 ├── jeeflow-repository-sqlx/ ← MySQL 仓储（sqlx，T0 单测 + T1 冒烟）
-├── jeeflow-facade/          ← 统一门面（42 个 action，对齐 spec/06）
+├── jeeflow-facade/          ← 统一门面（对齐 spec/06）
 ├── jeeflow-demo-salvo/      ← Salvo 演示服务（:8091，内存仓，非宿主集成）
 └── Dockerfile.demo          ← demo 镜像（CI demo-deploy 用）
 ```
@@ -109,7 +108,7 @@ jeeflow-rust/
 | countersign（ONE_VOTE_VETO 一票否决） | ✅（软拒绝默认，否决需节点显式配置） |
 | reject（驳回）/ jump（跳转） | ✅ |
 
-会签契约与五语言一致：`submitType=20` 默认软拒绝（任务正常完成、
+会签契约与联邦其他语言一致：`submitType=20` 默认软拒绝（任务正常完成、
 `countersignDisagreeFlag=1` 记录、不阻断）；仅当节点
 `countersignCompletionCondition == "ONE_VOTE_VETO"` 时提前流转；
 merged（任何路径）后废弃该节点剩余 DOING 任务（状态 99）。
@@ -117,7 +116,7 @@ merged（任何路径）后废弃该节点剩余 DOING 任务（状态 99）。
 ## 测试
 
 ```bash
-cargo test --workspace                # 227 测试（T0 内存仓，CI 同款，SKIP_MYSQL=1）
+cargo test --workspace                # T0 内存仓（CI 同款，SKIP_MYSQL=1）
 SKIP_MYSQL=0 cargo test --workspace --features mysql-smoke   # T1 本地 160 MySQL 冒烟
 ```
 
@@ -130,11 +129,14 @@ SKIP_MYSQL=0 cargo test --workspace --features mysql-smoke   # T1 本地 160 MyS
 cargo run -p jeeflow-demo-salvo       # :8091
 ```
 
-- `POST /wf/{action}` → `facade.flow(action, body)`（42 个 action 全转发）
+- `POST /wf/{action}` → `facade.flow(action, body)`（门面 action 全转发）
 - `GET /healthz` / `GET /api/stats` / `POST /api/reset`
 
 仅演示用（内存仓、无鉴权）；宿主集成走 mldong-salvo 框架。
 
 ## License
 
-Apache-2.0
+Copyright © 2025-2026 mldong
+
+Licensed under the Apache License, Version 2.0.
+See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
