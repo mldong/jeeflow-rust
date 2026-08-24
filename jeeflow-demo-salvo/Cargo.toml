@@ -6,10 +6,10 @@ license.workspace = true
 description = "jeeflow workflow engine demo server (Salvo)"
 
 [dependencies]
-jeeflow-core = { path = "../jeeflow-core", version = "0.1.0" }
-jeeflow-repository-sqlx = { path = "../jeeflow-repository-sqlx", version = "0.1.0" }
-jeeflow-persist = { path = "../jeeflow-persist", version = "0.1.0" }
-jeeflow-facade = { path = "../jeeflow-facade", version = "0.1.0" }
+jeeflow-core = { path = "../jeeflow-core", version = "1.0.0" }
+jeeflow-repository-sqlx = { path = "../jeeflow-repository-sqlx", version = "1.0.0" }
+jeeflow-persist = { path = "../jeeflow-persist", version = "1.0.0" }
+jeeflow-facade = { path = "../jeeflow-facade", version = "1.0.0" }
 salvo = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
