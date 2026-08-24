@@ -32,10 +32,11 @@ COPY jeeflow-rust/jeeflow-persist/src jeeflow-persist/src
 COPY jeeflow-rust/jeeflow-facade/src jeeflow-facade/src
 COPY jeeflow-rust/jeeflow-demo-salvo/src jeeflow-demo-salvo/src
 
-# 编译 release binary
+# 编译 release binary —— 输出到 /out，避免与 crate 目录 jeeflow-demo-salvo/ 撞名
 RUN cargo build --release -p jeeflow-demo-salvo && \
-    cp target/release/jeeflow-demo-salvo /build/jeeflow-demo-salvo && \
-    chmod +x /build/jeeflow-demo-salvo
+    mkdir -p /out && \
+    cp target/release/jeeflow-demo-salvo /out/jeeflow-demo-salvo && \
+    chmod 755 /out/jeeflow-demo-salvo
 
 # ─── runtime ───
 FROM debian:bookworm-slim
@@ -44,13 +45,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-# 部分 Docker/OCI 运行时 COPY 会丢可执行位 → permission denied
-COPY --from=builder /build/jeeflow-demo-salvo /app/jeeflow-demo-salvo
-RUN chmod +x /app/jeeflow-demo-salvo
-
-# 共享 LogicFlow JSON（与五语言 demo 同源）
+# BuildKit COPY --chmod；旧 Docker 若丢可执行位仍可用下面 ENTRYPOINT 兜底
+COPY --chmod=755 --from=builder /out/jeeflow-demo-salvo /app/jeeflow-demo-salvo
 COPY jeeflow-java/jeeflow-core/src/test/resources/flows /app/flows
 
 ENV JEFFLOW_FLOWS_DIR=/app/flows
 EXPOSE 8091
-CMD ["/app/jeeflow-demo-salvo"]
+ENTRYPOINT ["/bin/sh", "-c", "chmod +x /app/jeeflow-demo-salvo && exec /app/jeeflow-demo-salvo"]
