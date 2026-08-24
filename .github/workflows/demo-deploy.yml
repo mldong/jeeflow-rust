@@ -45,7 +45,9 @@ jobs:
             cd /java_projects/jeeflow/demo
             docker load -i jeeflow-rust-demo.tar
             docker stop jeeflow-rust-demo 2>/dev/null && docker rm jeeflow-rust-demo 2>/dev/null || true
-            docker run -d --name jeeflow-rust-demo --restart always -p 16085:8091 jeeflow-rust-demo:latest
+            docker run -d --name jeeflow-rust-demo --restart always \
+              -p 16085:8091 --security-opt seccomp=unconfined \
+              jeeflow-rust-demo:latest
             rm -f jeeflow-rust-demo.tar
             sleep 3
             if ! curl -sf http://127.0.0.1:16085/healthz; then

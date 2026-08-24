@@ -352,7 +352,7 @@ async fn api_reset(res: &mut Response) {
     })));
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cors = salvo::cors::Cors::new()
         .allow_origin(salvo::cors::Any)
