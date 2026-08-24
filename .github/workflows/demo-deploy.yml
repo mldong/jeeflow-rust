@@ -9,11 +9,19 @@ jobs:
     name: Build & Deploy Rust demo
     runs-on: ubuntu-latest
     steps:
+      # 共享 flows：Dockerfile 需要 jeeflow-java/.../flows
+      - name: Checkout jeeflow-java
+        uses: actions/checkout@v4
+        with:
+          repository: mldong/jeeflow-java
+          path: jeeflow-java
       - name: Checkout jeeflow-rust
         uses: actions/checkout@v4
+        with:
+          path: jeeflow-rust
       - name: Build Docker image
         run: |
-          docker build -f Dockerfile.demo -t jeeflow-rust-demo:latest .
+          docker build -f jeeflow-rust/Dockerfile.demo -t jeeflow-rust-demo:latest .
       - name: Export image
         run: |
           docker save jeeflow-rust-demo:latest -o jeeflow-rust-demo.tar
@@ -35,8 +43,9 @@ jobs:
           script: |
             cd /java_projects/jeeflow/demo
             docker load -i jeeflow-rust-demo.tar
-            # Stop and remove old container if exists
             docker stop jeeflow-rust-demo 2>/dev/null && docker rm jeeflow-rust-demo 2>/dev/null || true
             docker run -d --name jeeflow-rust-demo --restart always -p 16085:8091 jeeflow-rust-demo:latest
             rm -f jeeflow-rust-demo.tar
+            sleep 2
+            curl -sf http://127.0.0.1:16085/healthz || (docker logs jeeflow-rust-demo 2>&1 | tail -50; exit 1)
             echo "✅ Rust demo deployed (port 16085->8091)"

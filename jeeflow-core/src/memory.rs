@@ -10,6 +10,15 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 /// In-memory process repository for testing.
+
+fn flow_data_json_string(fd: &crate::json::FlowData) -> Option<String> {
+    let entries: Vec<(String, crate::json::JsonValue)> = fd
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    Some(crate::json::JsonValue::Object(entries).to_json_string())
+}
+
 pub struct MemoryRepository {
     id_counter: AtomicI64,
     defines: Mutex<HashMap<i64, ProcessDefine>>,
@@ -82,8 +91,20 @@ impl ProcessRepository for MemoryRepository {
     }
 
     fn find_instance_by_id(&self, instance_id: i64) -> JeeflowResult<Option<ProcessInstance>> {
-        let instances = self.instances.lock().unwrap();
-        Ok(instances.get(&instance_id).cloned())
+        let mut inst = {
+            let instances = self.instances.lock().unwrap();
+            instances.get(&instance_id).cloned()
+        };
+        // 任务落在独立 map；聚合内 tasks 可能仍是 task_id=0 的草稿——读侧用仓储真相回填
+        if let Some(ref mut i) = inst {
+            let tasks = self.tasks.lock().unwrap();
+            i.tasks = tasks
+                .values()
+                .filter(|t| t.process_instance_id == instance_id)
+                .cloned()
+                .collect();
+        }
+        Ok(inst)
     }
 
     fn save_instance(&self, instance: &mut ProcessInstance) -> JeeflowResult<()> {
@@ -228,7 +249,7 @@ impl ProcessRepository for MemoryRepository {
                     expire_time: t.expire_time.clone(),
                     form_key: t.form_key.clone(),
                     task_parent_id: t.parent_task_id,
-                    variable: None,
+                    variable: flow_data_json_string(&t.variables),
                     create_time: t.create_time.clone(),
                     create_user: t.create_user.clone(),
                     update_time: t.update_time.clone(),
@@ -237,6 +258,8 @@ impl ProcessRepository for MemoryRepository {
                     instance_state: inst.map(|i| i.state),
                     instance_operator: inst.map(|i| i.operator.clone()),
                     business_no: inst.and_then(|i| i.business_no.clone()),
+                    instance_variable: inst.and_then(|i| flow_data_json_string(&i.variables)),
+                    instance_create_time: inst.and_then(|i| i.create_time.clone()),
                     define_name: define.map(|d| d.name.clone()),
                     define_display_name: define.map(|d| d.display_name.clone()),
                     define_version: define.map(|d| d.version),
@@ -252,19 +275,125 @@ impl ProcessRepository for MemoryRepository {
         Ok(PageResult::new(query.page_num, query.page_size, total, page_rows))
     }
 
-    fn page_done_tasks(&self, _query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
-        Ok(PageResult::empty())
+    fn page_done_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
+        let tasks = self.tasks.lock().unwrap();
+        let instances = self.instances.lock().unwrap();
+        let defines = self.defines.lock().unwrap();
+
+        let rows: Vec<TaskRow> = tasks
+            .values()
+            .filter(|t| {
+                t.task_state == TaskState::Finished.code()
+                    && (query.operator.is_none()
+                        || t.actor_id.as_ref() == query.operator.as_ref()
+                        || t.create_user.as_ref() == query.operator.as_ref())
+            })
+            .map(|t| {
+                let inst = instances.get(&t.process_instance_id);
+                let define = inst.and_then(|i| defines.get(&i.define_id));
+                TaskRow {
+                    id: t.task_id,
+                    process_instance_id: t.process_instance_id,
+                    task_name: t.task_name.clone(),
+                    display_name: t.display_name.clone(),
+                    task_type: t.task_type,
+                    perform_type: t.perform_type,
+                    task_state: t.task_state,
+                    operator: t.actor_id.clone(),
+                    actor_id: t.actor_ids.first().cloned(),
+                    finish_time: t.finish_time.clone(),
+                    expire_time: t.expire_time.clone(),
+                    form_key: t.form_key.clone(),
+                    task_parent_id: t.parent_task_id,
+                    variable: flow_data_json_string(&t.variables),
+                    create_time: t.create_time.clone(),
+                    create_user: t.create_user.clone(),
+                    update_time: t.update_time.clone(),
+                    update_user: t.update_user.clone(),
+                    process_define_id: inst.map(|i| i.define_id),
+                    instance_state: inst.map(|i| i.state),
+                    instance_operator: inst.map(|i| i.operator.clone()),
+                    business_no: inst.and_then(|i| i.business_no.clone()),
+                    instance_variable: inst.and_then(|i| flow_data_json_string(&i.variables)),
+                    instance_create_time: inst.and_then(|i| i.create_time.clone()),
+                    define_name: define.map(|d| d.name.clone()),
+                    define_display_name: define.map(|d| d.display_name.clone()),
+                    define_version: define.map(|d| d.version),
+                }
+            })
+            .collect();
+
+        let total = rows.len() as i64;
+        let start = ((query.page_num - 1) * query.page_size) as usize;
+        let end = std::cmp::min(start + query.page_size as usize, rows.len());
+        let page_rows = if start < rows.len() {
+            rows[start..end].to_vec()
+        } else {
+            vec![]
+        };
+        Ok(PageResult::new(query.page_num, query.page_size, total, page_rows))
     }
 
-    fn page_instances(&self, _query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
-        Ok(PageResult::empty())
+    fn page_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
+        let instances = self.instances.lock().unwrap();
+        let defines = self.defines.lock().unwrap();
+        let rows: Vec<InstanceRow> = instances
+            .values()
+            .filter(|i| {
+                query
+                    .operator
+                    .as_ref()
+                    .map(|op| &i.operator == op)
+                    .unwrap_or(true)
+            })
+            .map(|i| {
+                let define = defines.get(&i.define_id);
+                InstanceRow {
+                    id: i.instance_id,
+                    parent_id: i.parent_id,
+                    process_define_id: i.define_id,
+                    state: i.state,
+                    parent_node_name: i.parent_node_name.clone(),
+                    business_no: i.business_no.clone(),
+                    operator: i.operator.clone(),
+                    expire_time: i.expire_time.clone(),
+                    variable: flow_data_json_string(&i.variables),
+                    create_time: i.create_time.clone(),
+                    create_user: i.create_user.clone(),
+                    update_time: i.update_time.clone(),
+                    update_user: i.update_user.clone(),
+                    define_name: define.map(|d| d.name.clone()),
+                    define_display_name: define.map(|d| d.display_name.clone()),
+                    define_version: define.map(|d| d.version),
+                }
+            })
+            .collect();
+
+        let total = rows.len() as i64;
+        let start = ((query.page_num - 1) * query.page_size) as usize;
+        let end = std::cmp::min(start + query.page_size as usize, rows.len());
+        let page_rows = if start < rows.len() {
+            rows[start..end].to_vec()
+        } else {
+            vec![]
+        };
+        Ok(PageResult::new(query.page_num, query.page_size, total, page_rows))
     }
 
     fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
         let ccs = self.cc_instances.lock().unwrap();
         let instances = self.instances.lock().unwrap();
         let defines = self.defines.lock().unwrap();
-        let rows: Vec<InstanceRow> = ccs.iter().map(|cc| {
+        let rows: Vec<InstanceRow> = ccs
+            .iter()
+            .filter(|cc| {
+                query
+                    .operator
+                    .as_ref()
+                    .map(|op| &cc.actor_id == op)
+                    .unwrap_or(true)
+            })
+            .map(|cc| {
             let inst = instances.get(&cc.process_instance_id);
             let define = inst.and_then(|i| defines.get(&i.define_id));
             InstanceRow {
@@ -367,7 +496,14 @@ impl ProcessExtRepository for MemoryRepository {
 
     fn list_design_his(&self, design_id: i64) -> JeeflowResult<Vec<ProcessDesignHis>> {
         let h = self.design_his.lock().unwrap();
-        Ok(h.iter().filter(|d| d.process_design_id == design_id).cloned().collect())
+        // Newest first (index 0) — align Java JDBC order / design detail jsonObject
+        let mut list: Vec<ProcessDesignHis> = h
+            .iter()
+            .filter(|d| d.process_design_id == design_id)
+            .cloned()
+            .collect();
+        list.reverse();
+        Ok(list)
     }
 
     fn find_surrogate_by_id(&self, surrogate_id: i64) -> JeeflowResult<Option<ProcessSurrogate>> {

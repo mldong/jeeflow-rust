@@ -9,6 +9,7 @@ use jeeflow_core::error::{JeeflowError, JeeflowResult};
 use jeeflow_core::json::{FlowData, JsonValue};
 use jeeflow_core::model::*;
 use jeeflow_core::spi::*;
+use jeeflow_persist::MetaTableReader;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,17 +49,52 @@ fn to_camel(s: &str) -> String {
     result
 }
 
-/// Convert a snake_case JSON object to camelCase.
+/// Keys whose values are free-form maps / LogicFlow graphs — keep inner keys as-is
+/// (对齐 Java/Go：VO 顶层 camelCase，ext/variable/jsonObject 内保留 u_realName、PERMISSION_* 等原键)。
+fn is_opaque_value_key(k: &str) -> bool {
+    matches!(
+        k,
+        "jsonObject"
+            | "json_object"
+            | "ext"
+            | "instanceExt"
+            | "instance_ext"
+            | "variable"
+            | "taskFormData"
+            | "task_form_data"
+            | "formData"
+            | "form_data"
+            | "nodeProgress"
+            | "node_progress"
+    )
+}
+
+/// Convert snake_case VO keys to camelCase; do not rewrite opaque nested maps.
 fn to_camel_json(val: &Json) -> Json {
+    to_camel_json_inner(val, true)
+}
+
+fn to_camel_json_inner(val: &Json, convert_keys: bool) -> Json {
     match val {
         Json::Object(map) => {
             let mut new_map = serde_json::Map::new();
             for (k, v) in map {
-                new_map.insert(to_camel(k), to_camel_json(v));
+                let new_key = if convert_keys {
+                    to_camel(k)
+                } else {
+                    k.clone()
+                };
+                let child_convert =
+                    convert_keys && !is_opaque_value_key(k) && !is_opaque_value_key(&new_key);
+                new_map.insert(new_key, to_camel_json_inner(v, child_convert));
             }
             Json::Object(new_map)
         }
-        Json::Array(arr) => Json::Array(arr.iter().map(to_camel_json).collect()),
+        Json::Array(arr) => Json::Array(
+            arr.iter()
+                .map(|v| to_camel_json_inner(v, convert_keys))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -127,6 +163,23 @@ fn format_time_value(v: &Json) -> Json {
         Json::String(s) if s == "NOW()" || s == "NOW" => {
             Json::String(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
         }
+        Json::String(s) => {
+            // ISO-like → yyyy-MM-dd HH:mm:ss when easily parseable
+            let t = s.trim();
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S") {
+                return Json::String(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+            }
+            if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S%.f") {
+                return Json::String(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+            }
+            if t.len() >= 19 && t.as_bytes().get(10) == Some(&b'T') {
+                let approx = format!("{} {}", &t[0..10], &t[11..19]);
+                if chrono::NaiveDateTime::parse_from_str(&approx, "%Y-%m-%d %H:%M:%S").is_ok() {
+                    return Json::String(approx);
+                }
+            }
+            Json::String(s.clone())
+        }
         Json::Null => Json::Null,
         other => other.clone(),
     }
@@ -154,162 +207,198 @@ fn page_to_json<T: serde::Serialize>(page: &PageResult<T>) -> Json {
 }
 
 // ═══════════════════════════════════════════════════════
-// Serde-serializable row types (snake_case → camelCase via transform)
+// Row VO（对齐 Java JeeflowFacade *RowToMap / issues/05）
+// 字段名用 snake_case，由 transform_output → camelCase；
+// 例外：契约键 `type` 直接输出（不能变成 defineType）。
 // ═══════════════════════════════════════════════════════
 
-use serde::Serialize;
+const FORM_DATA_PREFIX: &str = "f_";
+const TASK_FORM_DATA_PREFIX: &str = "tf_";
 
-#[derive(Serialize)]
-struct DefineRowJson {
-    id: i64,
-    name: String,
-    display_name: String,
-    define_type: String,
-    state: i32,
-    version: i32,
-    create_time: Option<String>,
-    create_user: Option<String>,
-    update_time: Option<String>,
-    update_user: Option<String>,
+fn parse_graph(content: &str) -> Option<Json> {
+    let t = content.trim();
+    if t.is_empty() {
+        return None;
+    }
+    serde_json::from_str(t).ok()
 }
 
-#[derive(Serialize)]
-struct InstanceRowJson {
-    id: i64,
-    parent_id: Option<i64>,
-    process_define_id: i64,
-    state: i32,
-    parent_node_name: Option<String>,
-    business_no: Option<String>,
-    operator: String,
-    expire_time: Option<String>,
-    variable: Option<String>,
-    create_time: Option<String>,
-    create_user: Option<String>,
-    update_time: Option<String>,
-    update_user: Option<String>,
-    define_name: Option<String>,
-    define_display_name: Option<String>,
-    define_version: Option<i32>,
-}
-
-#[derive(Serialize)]
-struct TaskRowJson {
-    id: i64,
-    process_instance_id: i64,
-    task_name: String,
-    display_name: String,
-    task_type: i32,
-    perform_type: i32,
-    task_state: i32,
-    operator: Option<String>,
-    actor_id: Option<String>,
-    finish_time: Option<String>,
-    expire_time: Option<String>,
-    form_key: Option<String>,
-    task_parent_id: Option<i64>,
-    variable: Option<String>,
-    create_time: Option<String>,
-    create_user: Option<String>,
-    update_time: Option<String>,
-    update_user: Option<String>,
-    process_define_id: Option<i64>,
-    instance_state: Option<i32>,
-    instance_operator: Option<String>,
-    business_no: Option<String>,
-    define_name: Option<String>,
-    define_display_name: Option<String>,
-    define_version: Option<i32>,
-}
-
-#[derive(Serialize)]
-struct DesignJson {
-    id: i64,
-    name: String,
-    display_name: String,
-    design_type: String,
-    icon: Option<String>,
-    is_deployed: i32,
-    remark: Option<String>,
-    create_time: Option<String>,
-    create_user: Option<String>,
-    update_time: Option<String>,
-    update_user: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SurrogateJson {
-    id: i64,
-    process_name: String,
-    operator: String,
-    surrogate: String,
-    start_time: Option<String>,
-    end_time: Option<String>,
-    enabled: i32,
-    create_time: Option<String>,
-    create_user: Option<String>,
-    update_time: Option<String>,
-    update_user: Option<String>,
-}
-
-fn define_row_to_json(r: &DefineRow) -> DefineRowJson {
-    DefineRowJson {
-        id: r.id, name: r.name.clone(), display_name: r.display_name.clone(),
-        define_type: r.define_type.clone(), state: r.state, version: r.version,
-        create_time: r.create_time.clone(), create_user: r.create_user.clone(),
-        update_time: r.update_time.clone(), update_user: r.update_user.clone(),
+fn parse_json_map(s: Option<&str>) -> serde_json::Map<String, Json> {
+    match s {
+        Some(raw) if !raw.trim().is_empty() => {
+            serde_json::from_str::<Json>(raw)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default()
+        }
+        _ => serde_json::Map::new(),
     }
 }
 
-fn task_row_to_json(r: &TaskRow) -> TaskRowJson {
-    TaskRowJson {
-        id: r.id, process_instance_id: r.process_instance_id,
-        task_name: r.task_name.clone(), display_name: r.display_name.clone(),
-        task_type: r.task_type, perform_type: r.perform_type, task_state: r.task_state,
-        operator: r.operator.clone(), actor_id: r.actor_id.clone(),
-        finish_time: r.finish_time.clone(), expire_time: r.expire_time.clone(),
-        form_key: r.form_key.clone(), task_parent_id: r.task_parent_id,
-        variable: r.variable.clone(),
-        create_time: r.create_time.clone(), create_user: r.create_user.clone(),
-        update_time: r.update_time.clone(), update_user: r.update_user.clone(),
-        process_define_id: r.process_define_id, instance_state: r.instance_state,
-        instance_operator: r.instance_operator.clone(), business_no: r.business_no.clone(),
-        define_name: r.define_name.clone(), define_display_name: r.define_display_name.clone(),
-        define_version: r.define_version,
+fn form_data_of_map(vars: &serde_json::Map<String, Json>, prefix: &str) -> Json {
+    let mut out = serde_json::Map::new();
+    for (k, v) in vars {
+        if k.starts_with(prefix) {
+            out.insert(k.clone(), v.clone());
+            out.insert(k[prefix.len()..].to_string(), v.clone());
+        }
     }
+    Json::Object(out)
 }
 
-fn instance_row_to_json(r: &InstanceRow) -> InstanceRowJson {
-    InstanceRowJson {
-        id: r.id, parent_id: r.parent_id, process_define_id: r.process_define_id,
-        state: r.state, parent_node_name: r.parent_node_name.clone(),
-        business_no: r.business_no.clone(), operator: r.operator.clone(),
-        expire_time: r.expire_time.clone(), variable: r.variable.clone(),
-        create_time: r.create_time.clone(), create_user: r.create_user.clone(),
-        update_time: r.update_time.clone(), update_user: r.update_user.clone(),
-        define_name: r.define_name.clone(), define_display_name: r.define_display_name.clone(),
-        define_version: r.define_version,
+fn form_data_of_flow(vars: &FlowData, prefix: &str) -> Json {
+    let mut out = serde_json::Map::new();
+    for (k, v) in vars.inner() {
+        if k.starts_with(prefix) {
+            let sv = json_value_to_serde(v);
+            out.insert(k.clone(), sv.clone());
+            out.insert(k[prefix.len()..].to_string(), sv);
+        }
     }
+    Json::Object(out)
 }
 
-fn design_to_json(d: &ProcessDesign) -> DesignJson {
-    DesignJson {
-        id: d.id, name: d.name.clone(), display_name: d.display_name.clone(),
-        design_type: d.design_type.clone(), icon: d.icon.clone(),
-        is_deployed: d.is_deployed, remark: d.remark.clone(),
-        create_time: d.create_time.clone(), create_user: d.create_user.clone(),
-        update_time: d.update_time.clone(), update_user: d.update_user.clone(),
+fn flow_data_to_object(vars: &FlowData) -> Json {
+    let mut map = serde_json::Map::new();
+    for (k, v) in vars.inner() {
+        map.insert(k.clone(), json_value_to_serde(v));
     }
+    Json::Object(map)
 }
 
-fn surrogate_to_json(s: &ProcessSurrogate) -> SurrogateJson {
-    SurrogateJson {
-        id: s.id, process_name: s.process_name.clone(), operator: s.operator.clone(),
-        surrogate: s.surrogate.clone(), start_time: s.start_time.clone(),
-        end_time: s.end_time.clone(), enabled: s.enabled,
-        create_time: s.create_time.clone(), create_user: s.create_user.clone(),
-        update_time: s.update_time.clone(), update_user: s.update_user.clone(),
+fn first_task_node_id(json_object: &Json) -> Option<String> {
+    let nodes = json_object.get("nodes")?.as_array()?;
+    for n in nodes {
+        if n.get("type").and_then(|t| t.as_str()) == Some("snaker:task") {
+            return n.get("id").and_then(|id| id.as_str()).map(|s| s.to_string());
+        }
     }
+    None
+}
+
+fn define_row_to_json(r: &DefineRow) -> Json {
+    json!({
+        "id": r.id,
+        "name": r.name,
+        "display_name": r.display_name,
+        "type": r.define_type,
+        "state": r.state,
+        "version": r.version,
+        "create_time": r.create_time,
+        "create_user": r.create_user,
+        "update_time": r.update_time,
+        "update_user": r.update_user,
+    })
+}
+
+fn task_row_to_json(r: &TaskRow) -> Json {
+    let instance_ext = parse_json_map(r.instance_variable.as_deref());
+    let mut ext = parse_json_map(r.variable.as_deref());
+    if ext.is_empty() {
+        ext = instance_ext.clone();
+    }
+    json!({
+        "id": r.id,
+        "process_instance_id": r.process_instance_id,
+        "task_name": r.task_name,
+        "display_name": r.display_name,
+        "task_type": r.task_type,
+        "perform_type": r.perform_type,
+        "task_state": r.task_state,
+        "operator": r.operator,
+        "finish_time": r.finish_time,
+        "expire_time": r.expire_time,
+        "form_key": r.form_key,
+        "task_parent_id": r.task_parent_id,
+        "variable": r.variable,
+        "create_time": r.create_time,
+        "create_user": r.create_user,
+        "update_time": r.update_time,
+        "update_user": r.update_user,
+        "process_define_name": r.define_name,
+        "process_define_display_name": r.define_display_name,
+        "ext": Json::Object(ext),
+        "instance_ext": Json::Object(instance_ext),
+        "instance_create_time": r.instance_create_time,
+        "version": r.define_version,
+        "task_form_data": form_data_of_map(&parse_json_map(r.variable.as_deref()), TASK_FORM_DATA_PREFIX),
+    })
+}
+
+fn instance_row_to_json(r: &InstanceRow) -> Json {
+    json!({
+        "id": r.id,
+        "parent_id": r.parent_id,
+        "process_define_id": r.process_define_id,
+        "state": r.state,
+        "parent_node_name": r.parent_node_name,
+        "business_no": r.business_no,
+        "operator": r.operator,
+        "expire_time": r.expire_time,
+        "variable": r.variable,
+        "create_time": r.create_time,
+        "create_user": r.create_user,
+        "update_time": r.update_time,
+        "update_user": r.update_user,
+        "process_define_name": r.define_name,
+        "process_define_display_name": r.define_display_name,
+        "process_define_version": r.define_version,
+        "ext": Json::Object(parse_json_map(r.variable.as_deref())),
+        "display_name": r.define_display_name,
+        "version": r.define_version,
+    })
+}
+
+fn design_to_json(d: &ProcessDesign) -> Json {
+    json!({
+        "id": d.id,
+        "name": d.name,
+        "display_name": d.display_name,
+        "type": d.design_type,
+        "icon": d.icon,
+        "is_deployed": d.is_deployed,
+        "remark": d.remark,
+        "create_time": d.create_time,
+        "create_user": d.create_user,
+        "update_time": d.update_time,
+        "update_user": d.update_user,
+    })
+}
+
+fn surrogate_to_json(s: &ProcessSurrogate) -> Json {
+    json!({
+        "id": s.id,
+        "process_name": s.process_name,
+        "operator": s.operator,
+        "surrogate": s.surrogate,
+        "start_time": s.start_time,
+        "end_time": s.end_time,
+        "enabled": s.enabled,
+        "create_time": s.create_time,
+        "create_user": s.create_user,
+        "update_time": s.update_time,
+        "update_user": s.update_user,
+    })
+}
+
+/// 对齐 Java taskVo（detail / instance.tasks）
+fn task_vo(t: &ProcessTask) -> Json {
+    json!({
+        "id": t.task_id,
+        "process_instance_id": t.process_instance_id,
+        "task_name": t.task_name,
+        "display_name": t.display_name,
+        "task_type": t.task_type,
+        "perform_type": t.perform_type,
+        "task_state": t.task_state,
+        "operator": t.actor_id,
+        "form_key": t.form_key,
+        "task_parent_id": t.parent_task_id,
+        "task_actor_id_list": t.actor_ids,
+        "task_form_data": form_data_of_flow(&t.variables, TASK_FORM_DATA_PREFIX),
+        "finish_time": t.finish_time,
+        "create_time": t.create_time,
+    })
 }
 
 // ═══════════════════════════════════════════════════════
@@ -345,6 +434,178 @@ fn arg_str_or(args: &HashMap<String, Json>, key: &str, default: &str) -> String 
 
 fn arg_i64_or(args: &HashMap<String, Json>, key: &str, default: i64) -> JeeflowResult<i64> {
     Ok(arg_i64(args, key)?.unwrap_or(default))
+}
+
+/// First present i64 among preferred Java/UI keys.
+fn arg_id(args: &HashMap<String, Json>, keys: &[&str]) -> JeeflowResult<Option<i64>> {
+    for k in keys {
+        if let Some(v) = arg_i64(args, k)? {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
+}
+
+/// Accept JSON array or comma-separated string → Vec<String>.
+fn arg_actor_ids(args: &HashMap<String, Json>) -> Vec<String> {
+    match args.get("actorIds") {
+        Some(Json::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else if let Some(n) = v.as_i64() {
+                    Some(n.to_string())
+                } else if !v.is_null() {
+                    Some(v.to_string().trim_matches('"').to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(Json::String(s)) => s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn arg_ids(args: &HashMap<String, Json>) -> JeeflowResult<Vec<i64>> {
+    if let Some(Json::Array(arr)) = args.get("ids") {
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            if let Some(n) = v.as_i64() {
+                out.push(n);
+            } else if let Some(s) = v.as_str() {
+                out.push(
+                    s.parse::<i64>()
+                        .map_err(|_| JeeflowError::Business(format!("非法id: {}", s)))?,
+                );
+            } else {
+                return Err(JeeflowError::Business(format!("非法id: {}", v)));
+            }
+        }
+        return Ok(out);
+    }
+    if let Some(id) = arg_i64(args, "id")? {
+        return Ok(vec![id]);
+    }
+    Ok(Vec::new())
+}
+
+/// Parse `content` (string or object→string); boot3-compatible top-level fallback.
+fn content_bytes(args: &HashMap<String, Json>) -> Option<Vec<u8>> {
+    match args.get("content") {
+        Some(Json::String(s)) => Some(s.as_bytes().to_vec()),
+        Some(Json::Object(_) | Json::Array(_)) => {
+            Some(serde_json::to_vec(args.get("content").unwrap()).unwrap_or_default())
+        }
+        Some(other) if !other.is_null() => {
+            Some(other.to_string().trim_matches('"').as_bytes().to_vec())
+        }
+        _ => {
+            let mut copy = serde_json::Map::new();
+            for (k, v) in args {
+                if matches!(
+                    k.as_str(),
+                    "processDesignId"
+                        | "processDefineId"
+                        | "operator"
+                        | "id"
+                        | "pageNum"
+                        | "pageSize"
+                ) {
+                    continue;
+                }
+                copy.insert(k.clone(), v.clone());
+            }
+            if copy.is_empty() {
+                None
+            } else {
+                Some(Json::Object(copy).to_string().into_bytes())
+            }
+        }
+    }
+}
+
+fn resolve_rel_table_name(content: &str) -> Option<String> {
+    let meta: Json = serde_json::from_str(content).ok()?;
+    let obj = meta.as_object()?;
+    obj.get("relTableName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            obj.get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
+fn design_his_to_json(h: &ProcessDesignHis) -> Json {
+    json!({
+        "id": h.id,
+        "process_design_id": h.process_design_id,
+        "content": String::from_utf8_lossy(&h.content).to_string(),
+        "create_time": h.create_time,
+        "create_user": h.create_user,
+    })
+}
+
+fn candidate_row(actor_id: &str, real_name: &str, extra: Option<&Json>) -> Json {
+    let mut row = json!({
+        "id": actor_id,
+        "realName": if real_name.is_empty() { actor_id } else { real_name },
+    });
+    if let Some(Json::Object(src)) = extra {
+        if let Some(obj) = row.as_object_mut() {
+            if let Some(v) = src.get("userId").or_else(|| src.get("user_id")) {
+                obj.insert("userId".into(), v.clone());
+            }
+            if let Some(v) = src.get("userName").or_else(|| src.get("user_name")) {
+                obj.insert("userName".into(), v.clone());
+            }
+            if let Some(v) = src.get("deptName").or_else(|| src.get("dept_name")) {
+                obj.insert("deptName".into(), v.clone());
+            }
+        }
+    }
+    row
+}
+
+fn collect_static_candidate_actors(
+    model: &jeeflow_core::parser::ProcessModel,
+    task_name: &str,
+) -> Vec<String> {
+    let mut actors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for edge in model.get_output_edges(task_name) {
+        let Some(node) = model.get_node(&edge.target_node_id) else {
+            continue;
+        };
+        if node.node_type != jeeflow_core::parser::NodeType::Task {
+            continue;
+        }
+        if let Some(a) = node.assignee() {
+            let t = a.trim().to_string();
+            if !t.is_empty() && t != "applicant" && seen.insert(t.clone()) {
+                actors.push(t);
+            }
+        }
+        if let Some(cu) = node.candidate_users() {
+            for u in cu.split(',') {
+                let t = u.trim().to_string();
+                if !t.is_empty() && seen.insert(t.clone()) {
+                    actors.push(t);
+                }
+            }
+        }
+    }
+    actors
 }
 
 // ═══════════════════════════════════════════════════════
@@ -560,6 +821,39 @@ impl JeeflowFacade {
         self.ext_repo.as_ref()
     }
 
+    /// deploy 版本管理（对齐 Java）：按 name 取最新 version，存在则 +1，否则从 0。
+    fn save_deployed_define(
+        &self,
+        model: &jeeflow_core::parser::ProcessModel,
+        bytes: &[u8],
+        operator: &str,
+    ) -> JeeflowResult<i64> {
+        let page = self.repo.page_defines(&PageQuery::new(1, i64::MAX / 4))?;
+        let version = page
+            .rows
+            .iter()
+            .filter(|r| r.name == model.name)
+            .map(|r| r.version)
+            .max()
+            .map(|v| v + 1)
+            .unwrap_or(0);
+        let mut define = ProcessDefine {
+            id: 0,
+            name: model.name.clone(),
+            display_name: model.display_name.clone(),
+            define_type: model.model_type.clone(),
+            state: 1,
+            content: bytes.to_vec(),
+            version,
+            create_time: None,
+            create_user: Some(operator.to_string()),
+            update_time: None,
+            update_user: Some(operator.to_string()),
+        };
+        self.repo.save_define(&mut define)?;
+        Ok(define.id)
+    }
+
     // ═══════════════════════════════════════════════════════
     // processDefine actions (8)
     // ═══════════════════════════════════════════════════════
@@ -570,7 +864,7 @@ impl JeeflowFacade {
         let filters = parse_m_params(args);
         let query = PageQuery::new(page_num, page_size);
         let page = self.repo.page_defines(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(define_row_to_json(r)).unwrap()).collect();
+        let mut rows: Vec<Json> = page.rows.iter().map(define_row_to_json).collect();
         apply_filters_to_rows(&mut rows, &filters);
         let (page_rows, total) = re_paginate(rows, page_num, page_size);
         let result = PageResult::new(page_num, page_size, total, page_rows);
@@ -581,12 +875,15 @@ impl JeeflowFacade {
         let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let define = self.repo.find_define_by_id(id)?
             .ok_or(JeeflowError::DefineNotFound(id))?;
+        // 对齐 Java defineDetail：type + jsonObject（非 defineType/content）
         Ok(json!({
-            "id": define.id, "name": define.name, "display_name": define.display_name,
-            "define_type": define.define_type, "state": define.state, "version": define.version,
-            "content": define.content_str(),
-            "create_time": define.create_time, "create_user": define.create_user,
-            "update_time": define.update_time, "update_user": define.update_user,
+            "id": define.id,
+            "name": define.name,
+            "display_name": define.display_name,
+            "type": define.define_type,
+            "state": define.state,
+            "version": define.version,
+            "json_object": parse_graph(&define.content_str()),
         }))
     }
 
@@ -632,40 +929,91 @@ impl JeeflowFacade {
     }
 
     fn process_define_deploy(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        self.repo.update_define_state(id, 1)?;
-        Ok(json!({"id": id, "state": 1}))
+        let bytes = content_bytes(args).ok_or(JeeflowError::Business("content 缺失".into()))?;
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let model = jeeflow_core::parser::ModelParser::parse(&content)?;
+        let operator = arg_str_or(args, "operator", "system");
+        let define_id = self.save_deployed_define(&model, &bytes, &operator)?;
+        Ok(json!({"process_define_id": define_id}))
     }
 
     fn process_define_redeploy(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        self.repo.update_define_state(id, 1)?;
-        Ok(json!({"id": id, "state": 1}))
+        let define_id = arg_id(args, &["processDefineId", "id"])?
+            .ok_or(JeeflowError::Business("缺少processDefineId参数".into()))?;
+        let bytes = content_bytes(args).ok_or(JeeflowError::Business("content 缺失".into()))?;
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let model = jeeflow_core::parser::ModelParser::parse(&content)?;
+        let operator = arg_str_or(args, "operator", "system");
+        let def = ProcessDefine {
+            id: define_id,
+            name: model.name.clone(),
+            display_name: model.display_name.clone(),
+            define_type: model.model_type.clone(),
+            state: 1,
+            content: bytes,
+            version: 0, // updateDefine 不改 version（仓储侧保留原值）
+            create_time: None,
+            create_user: None,
+            update_time: None,
+            update_user: Some(operator),
+        };
+        // 保留原 version：先读再写
+        if let Some(old) = self.repo.find_define_by_id(define_id)? {
+            let mut updated = def;
+            updated.version = old.version;
+            updated.state = old.state;
+            updated.create_time = old.create_time;
+            updated.create_user = old.create_user;
+            self.repo.update_define(&updated)?;
+        } else {
+            self.repo.update_define(&def)?;
+        }
+        Ok(json!({}))
     }
 
     fn process_define_remove(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        self.repo.remove_define(id)?;
-        Ok(json!({"id": id}))
+        let ids = arg_ids(args)?;
+        if ids.is_empty() {
+            return Err(JeeflowError::Business("缺少id参数".into()));
+        }
+        for id in ids {
+            self.repo.remove_define(id)?;
+        }
+        Ok(json!({}))
     }
 
     fn process_define_up_and_down(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let state = arg_i64(args, "state")?.unwrap_or(0) as i32;
-        self.repo.update_define_state(id, state)?;
-        Ok(json!({"id": id, "state": state}))
+        let state = arg_i64(args, "opType")?
+            .or(arg_i64(args, "state")?)
+            .ok_or(JeeflowError::Business("缺少state/opType参数".into()))? as i32;
+        let ids = arg_ids(args)?;
+        if ids.is_empty() {
+            return Err(JeeflowError::Business("缺少id参数".into()));
+        }
+        for id in ids {
+            self.repo.update_define_state(id, state)?;
+        }
+        Ok(json!({}))
     }
 
     fn process_define_get_last_by_name(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let name = arg_str(args, "name").ok_or(JeeflowError::Business("缺少name参数".into()))?;
-        let query = PageQuery::new(1, 1000);
-        let page = self.repo.page_defines(&query)?;
-        let define = page.rows.iter()
-            .find(|d| d.name == name)
+        let name = arg_str(args, "processDefineName")
+            .or_else(|| arg_str(args, "name"))
+            .ok_or(JeeflowError::Business("缺少processDefineName参数".into()))?;
+        let page = self.repo.page_defines(&PageQuery::new(1, i64::MAX / 4))?;
+        let define = page
+            .rows
+            .iter()
+            .filter(|d| d.name == name)
+            .max_by_key(|d| d.version)
             .ok_or(JeeflowError::Business(format!("流程定义不存在: {}", name)))?;
         Ok(json!({
-            "id": define.id, "name": define.name, "display_name": define.display_name,
-            "state": define.state, "version": define.version,
+            "id": define.id,
+            "name": define.name,
+            "display_name": define.display_name,
+            "type": define.define_type,
+            "state": define.state,
+            "version": define.version,
         }))
     }
 
@@ -680,7 +1028,7 @@ impl JeeflowFacade {
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
         let page = self.repo.page_instances(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(instance_row_to_json(r)).unwrap()).collect();
+        let mut rows: Vec<Json> = page.rows.iter().map(instance_row_to_json).collect();
         apply_filters_to_rows(&mut rows, &filters);
         let (page_rows, total) = re_paginate(rows, page_num, page_size);
         let result = PageResult::new(page_num, page_size, total, page_rows);
@@ -688,20 +1036,55 @@ impl JeeflowFacade {
     }
 
     fn process_instance_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let inst = self.repo.find_instance_by_id(id)?
             .ok_or(JeeflowError::InstanceNotFound(id))?;
-        let tasks = self.repo.find_history_tasks(id)?;
-        let task_jsons: Vec<Json> = tasks.iter().map(|t| json!({
-            "id": t.task_id, "task_name": t.task_name, "display_name": t.display_name,
-            "task_state": t.task_state, "actor_id": t.actor_id,
-            "finish_time": t.finish_time, "create_time": t.create_time,
-        })).collect();
+        let def0 = self.repo.find_define_by_id(inst.define_id)?;
+        let json_object = def0.as_ref().and_then(|d| parse_graph(&d.content_str()));
+        let first_node = json_object.as_ref().and_then(first_task_node_id);
+
+        let mut tasks_out: Vec<Json> = Vec::new();
+        let mut active: Vec<Json> = Vec::new();
+        for t in &inst.tasks {
+            let mut vo = task_vo(t);
+            let mut ext = flow_data_to_object(&t.variables);
+            let doing = t.task_state == TaskState::Doing.code();
+            let is_first = doing
+                && first_node
+                    .as_ref()
+                    .map(|n| n == &t.task_name)
+                    .unwrap_or(false);
+            if let Some(obj) = ext.as_object_mut() {
+                obj.insert("isFirstTaskNode".into(), Json::Bool(is_first));
+            }
+            if let Some(obj) = vo.as_object_mut() {
+                obj.insert("ext".into(), ext);
+            }
+            if doing {
+                active.push(vo.clone());
+            }
+            tasks_out.push(vo);
+        }
+
         Ok(json!({
-            "id": inst.instance_id, "process_define_id": inst.define_id,
-            "state": inst.state, "operator": inst.operator,
-            "business_no": inst.business_no, "create_time": inst.create_time,
-            "tasks": task_jsons,
+            "id": inst.instance_id,
+            "parent_id": inst.parent_id,
+            "process_define_id": inst.define_id,
+            "state": inst.state,
+            "parent_node_name": inst.parent_node_name,
+            "business_no": inst.business_no,
+            "operator": inst.operator,
+            "variables": flow_data_to_object(&inst.variables),
+            "form_data": form_data_of_flow(&inst.variables, FORM_DATA_PREFIX),
+            "create_time": inst.create_time,
+            "create_user": inst.create_user,
+            "display_name": def0.as_ref().map(|d| d.display_name.clone()),
+            "name": def0.as_ref().map(|d| d.name.clone()),
+            "version": def0.as_ref().map(|d| d.version),
+            "json_object": json_object,
+            "tasks": tasks_out,
+            "active_task_list": active,
         }))
     }
 
@@ -710,7 +1093,8 @@ impl JeeflowFacade {
     }
 
     fn process_instance_withdraw(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let mut inst = self.repo.find_instance_by_id(id)?
             .ok_or(JeeflowError::InstanceNotFound(id))?;
         inst.withdraw();
@@ -727,76 +1111,186 @@ impl JeeflowFacade {
     }
 
     fn process_instance_high_light(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let tasks = self.repo.find_history_tasks(id)?;
-        let finished: Vec<String> = tasks.iter()
-            .filter(|t| t.task_state == TaskState::Finished.code())
-            .map(|t| t.task_name.clone())
-            .collect();
-        let doing: Vec<String> = tasks.iter()
-            .filter(|t| t.task_state == TaskState::Doing.code())
-            .map(|t| t.task_name.clone())
-            .collect();
-        Ok(json!({"finishedNodes": finished, "currentNodes": doing}))
+        let id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let inst = self
+            .repo
+            .find_instance_by_id(id)?
+            .ok_or(JeeflowError::InstanceNotFound(id))?;
+
+        // 活跃节点 = 进行中任务
+        let doing = self.repo.find_doing_tasks(id, &[])?;
+        let mut active: Vec<String> = Vec::new();
+        for t in &doing {
+            if !active.contains(&t.task_name) {
+                active.push(t.task_name.clone());
+            }
+        }
+
+        // 历史节点 = 已产生任务（排除活跃）+ 模型路径补全
+        let history_tasks = self.repo.find_history_tasks(id)?;
+        let mut history: Vec<String> = Vec::new();
+        for t in &history_tasks {
+            if !active.contains(&t.task_name) && !history.contains(&t.task_name) {
+                history.push(t.task_name.clone());
+            }
+        }
+
+        let mut edges: Vec<String> = Vec::new();
+        let mut node_progress = json!({});
+        if let Some(def) = self.repo.find_define_by_id(inst.define_id)? {
+            if let Ok(model) = jeeflow_core::parser::ModelParser::parse(&def.content_str()) {
+                node_progress = build_node_progress(&model, &history_tasks);
+                if let Some(start) = model.get_start() {
+                    let mut visited = std::collections::HashSet::new();
+                    collect_high_light_path(
+                        &model,
+                        &start.id,
+                        &active,
+                        &mut history,
+                        &mut edges,
+                        &mut visited,
+                    );
+                }
+            }
+        }
+
+        // 已是 camelCase 契约键（transform 幂等）
+        Ok(json!({
+            "activeNodeNames": active,
+            "historyNodeNames": history,
+            "historyEdgeNames": edges,
+            "nodeProgress": node_progress,
+        }))
     }
 
     fn process_instance_approval_record(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let inst = self
+            .repo
+            .find_instance_by_id(id)?
+            .ok_or(JeeflowError::InstanceNotFound(id))?;
+        let instance_vars = flow_data_to_object(&inst.variables);
         let tasks = self.repo.find_history_tasks(id)?;
-        let records: Vec<Json> = tasks.iter().map(|t| json!({
-            "task_name": t.task_name, "display_name": t.display_name,
-            "task_state": t.task_state, "actor_id": t.actor_id,
-            "finish_time": t.finish_time, "create_time": t.create_time,
-        })).collect();
+        let records: Vec<Json> = tasks
+            .iter()
+            .map(|t| {
+                let task_vars = flow_data_to_object(&t.variables);
+                // 对齐 Go taskRowToMap：任务变量空时回退实例变量（UI 读 ext.u_realName）
+                let ext = if task_vars.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                    instance_vars.clone()
+                } else {
+                    task_vars.clone()
+                };
+                json!({
+                    "task_name": t.task_name,
+                    "display_name": t.display_name,
+                    "task_type": t.task_type,
+                    "perform_type": t.perform_type,
+                    "task_state": t.task_state,
+                    "operator": t.actor_id,
+                    "finish_time": t.finish_time,
+                    "variable": task_vars,
+                    "ext": ext,
+                })
+            })
+            .collect();
         Ok(json!(records))
     }
 
     fn process_instance_get_assignee_text_data(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let tasks = self.repo.find_history_tasks(id)?;
-        let data: Vec<Json> = tasks.iter().map(|t| json!({
-            "task_name": t.task_name, "actor_id": t.actor_id,
-        })).collect();
-        Ok(json!(data))
+        let id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let include_node_name = args
+            .get("includeNodeName")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let doing = self.repo.find_doing_tasks(id, &[])?;
+        let mut rows: Vec<Json> = Vec::new();
+        for t in &doing {
+            let actors = self.repo.find_task_actors(t.task_id)?;
+            for actor in actors {
+                let label = if include_node_name {
+                    format!("{}:{}", t.display_name, actor)
+                } else {
+                    actor.clone()
+                };
+                rows.push(json!({"value": actor, "label": label}));
+            }
+        }
+        Ok(json!(rows))
     }
 
     fn process_instance_biz_data(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let inst = self.repo.find_instance_by_id(id)?
+        let id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("processInstanceId 缺失".into()))?;
+        let inst = self
+            .repo
+            .find_instance_by_id(id)?
             .ok_or(JeeflowError::InstanceNotFound(id))?;
-        // Return instance variables as biz data
-        let vars: HashMap<String, Json> = inst.variables.iter()
-            .map(|(k, v)| (k.clone(), json_value_to_serde(v)))
-            .collect();
-        Ok(json!(vars))
+        let define = self
+            .repo
+            .find_define_by_id(inst.define_id)?
+            .ok_or(JeeflowError::DefineNotFound(inst.define_id))?;
+        let table_name = resolve_rel_table_name(&define.content_str())
+            .ok_or(JeeflowError::Business("流程定义未配置 relTableName".into()))?;
+        // MetaTableReader 由集成方注册（issues/23）；未注册明确报错，禁止把 vars 当成功返回
+        let reader = self
+            .engine
+            .context()
+            .find_by_name("metaTableReader")
+            .ok_or(JeeflowError::Business(
+                "业务数据读取器未注册（ServiceContext.put(\"metaTableReader\", new MetaTableReader(...))，需引入 jeeflow-persist）"
+                    .into(),
+            ))?;
+        // 尝试 downcast 到 jeeflow-persist MetaTableReader（InMemory / 自定义）
+        if let Some(mtr) = reader.downcast_ref::<jeeflow_persist::InMemoryMetaTableReader>() {
+            match mtr.read_by_id(&table_name, id)? {
+                Some(row) => {
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in row {
+                        map.insert(k, json_value_to_serde(&v));
+                    }
+                    return Ok(Json::Object(map));
+                }
+                None => return Ok(Json::Null),
+            }
+        }
+        Err(JeeflowError::Business(format!(
+            "业务数据读取失败: 已注册 metaTableReader 但无法按表 {} / 实例 {} 读取（需实现 MetaTableReader）",
+            table_name, id
+        )))
     }
 
     fn process_instance_create_cc(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let creator = arg_str_or(args, "operator", "flow.auto");
-        let actor_str = arg_str(args, "actorIds").unwrap_or_default();
-        let actors: Vec<String> = actor_str.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        self.repo.create_cc_instance(id, &creator, &actors)?;
-        Ok(json!({"id": id, "ccCount": actors.len()}))
+        let id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少processInstanceId参数".into()))?;
+        let operator = arg_str_or(args, "operator", "user1");
+        let actors = arg_actor_ids(args);
+        if actors.is_empty() {
+            return Err(JeeflowError::Business("actorIds 缺失".into()));
+        }
+        self.repo.create_cc_instance(id, &operator, &actors)?;
+        Ok(json!({}))
     }
 
     fn process_instance_update_cc_status(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let actor_id = arg_str_or(args, "actorId", "");
-        self.repo.update_cc_status(id, &actor_id)?;
-        Ok(json!({"id": id}))
+        let id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少processInstanceId参数".into()))?;
+        let operator = arg_str_or(args, "operator", "user1");
+        self.repo.update_cc_status(id, &operator)?;
+        Ok(json!({}))
     }
 
     fn process_instance_cc_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
         let filters = parse_m_params(args);
-        let query = PageQuery::new(page_num, page_size);
+        let mut query = PageQuery::new(page_num, page_size);
+        query.operator = arg_str(args, "operator");
         let page = self.repo.page_cc_instances(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(instance_row_to_json(r)).unwrap()).collect();
+        let mut rows: Vec<Json> = page.rows.iter().map(instance_row_to_json).collect();
         apply_filters_to_rows(&mut rows, &filters);
         let (page_rows, total) = re_paginate(rows, page_num, page_size);
         let result = PageResult::new(page_num, page_size, total, page_rows);
@@ -815,7 +1309,7 @@ impl JeeflowFacade {
         // UI 注入 operator；兼容 userId（curl/旧客户端）
         query.operator = arg_str(args, "operator").or_else(|| arg_str(args, "userId"));
         let page = self.repo.page_todo_tasks(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(task_row_to_json(r)).unwrap()).collect();
+        let mut rows: Vec<Json> = page.rows.iter().map(task_row_to_json).collect();
         apply_filters_to_rows(&mut rows, &filters);
         let (page_rows, total) = re_paginate(rows, page_num, page_size);
         let result = PageResult::new(page_num, page_size, total, page_rows);
@@ -829,7 +1323,7 @@ impl JeeflowFacade {
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
         let page = self.repo.page_done_tasks(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(|r| serde_json::to_value(task_row_to_json(r)).unwrap()).collect();
+        let mut rows: Vec<Json> = page.rows.iter().map(task_row_to_json).collect();
         apply_filters_to_rows(&mut rows, &filters);
         let (page_rows, total) = re_paginate(rows, page_num, page_size);
         let result = PageResult::new(page_num, page_size, total, page_rows);
@@ -841,7 +1335,7 @@ impl JeeflowFacade {
         let task_id = arg_i64(args, "processTaskId")?
             .or(arg_i64(args, "id")?)
             .ok_or(JeeflowError::Business("缺少processTaskId参数".into()))?;
-        let operator = arg_str_or(args, "operator", "flow.auto");
+        let operator = arg_str_or(args, "operator", "user1");
         let submit_type = arg_i64_or(args, "submitType", 1)?; // 默认同意
         let mut flow_data = args_to_flow_data(args);
         flow_data.insert_i64("submitType", submit_type);
@@ -895,76 +1389,214 @@ impl JeeflowFacade {
     }
 
     fn process_task_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let id = arg_id(args, &["processTaskId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let operator = arg_str_or(args, "operator", "user1");
         let task = self.repo.find_task_by_id(id)?
             .ok_or(JeeflowError::TaskNotFound(id))?;
         let actors = self.repo.find_task_actors(id)?;
-        Ok(json!({
-            "id": task.task_id, "process_instance_id": task.process_instance_id,
-            "task_name": task.task_name, "display_name": task.display_name,
-            "task_type": task.task_type, "perform_type": task.perform_type,
-            "task_state": task.task_state, "actor_id": task.actor_id,
-            "actor_ids": actors,
-            "finish_time": task.finish_time, "expire_time": task.expire_time,
-            "form_key": task.form_key, "create_time": task.create_time,
-        }))
+        let mut vo = task_vo(&task);
+        if let Some(obj) = vo.as_object_mut() {
+            // 仓储侧 actors 为准（与 Java findTaskActors 一致）
+            obj.insert("task_actor_id_list".into(), json!(actors));
+            obj.insert("executable".into(), Json::Bool(task.is_allowed(&operator)));
+        }
+
+        let doing = task.task_state == TaskState::Doing.code();
+        let mut t_ext = flow_data_to_object(&task.variables);
+        if let Some(obj) = t_ext.as_object_mut() {
+            obj.insert("isFirstTaskNode".into(), Json::Bool(false));
+        }
+
+        if let Some(inst) = self.repo.find_instance_by_id(task.process_instance_id)? {
+            if let Some(def) = self.repo.find_define_by_id(inst.define_id)? {
+                let json_object = parse_graph(&def.content_str());
+                if let Some(obj) = vo.as_object_mut() {
+                    obj.insert("json_object".into(), json_object.clone().unwrap_or(Json::Null));
+                }
+                let is_first = doing
+                    && json_object
+                        .as_ref()
+                        .and_then(first_task_node_id)
+                        .map(|n| n == task.task_name)
+                        .unwrap_or(false);
+                if let Some(obj) = t_ext.as_object_mut() {
+                    obj.insert("isFirstTaskNode".into(), Json::Bool(is_first));
+                }
+                // taskModel：对齐 Java（name/displayName/type/form/ext）
+                if let Ok(model) = jeeflow_core::parser::ModelParser::parse(&def.content_str()) {
+                    for node in model.get_nodes_by_type(jeeflow_core::parser::NodeType::Task) {
+                        if node.id == task.task_name {
+                            let ext_prop = node
+                                .properties
+                                .get("ext")
+                                .map(json_value_to_serde)
+                                .unwrap_or(Json::Null);
+                            let tm = json!({
+                                "name": node.id,
+                                "display_name": node.display_name,
+                                "type": "task",
+                                "form": node.form_key(),
+                                "ext": ext_prop,
+                            });
+                            if let Some(obj) = vo.as_object_mut() {
+                                obj.insert("task_model".into(), tm);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(obj) = vo.as_object_mut() {
+            obj.insert("ext".into(), t_ext);
+        }
+        Ok(vo)
     }
 
     fn process_task_jump_able_task_name_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let task = self.repo.find_task_by_id(id)?
-            .ok_or(JeeflowError::TaskNotFound(id))?;
-        let inst = self.repo.find_instance_by_id(task.process_instance_id)?
-            .ok_or(JeeflowError::InstanceNotFound(task.process_instance_id))?;
-        let define = self.repo.find_define_by_id(inst.define_id)?
-            .ok_or(JeeflowError::DefineNotFound(inst.define_id))?;
-        let model = jeeflow_core::parser::ModelParser::parse(&define.content_str())?;
-
-        // Return all task node names as jump targets
-        let task_nodes: Vec<String> = model.get_nodes_by_type(jeeflow_core::parser::NodeType::Task)
-            .iter().map(|n| n.id.clone()).collect();
-        Ok(json!(task_nodes))
+        let instance_id = arg_id(args, &["processInstanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少processInstanceId参数".into()))?;
+        let done = self.repo.find_done_tasks(instance_id, &[])?;
+        let mut rows: Vec<Json> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for t in &done {
+            // 跳过会签 perform_type==1
+            if t.perform_type == 1 {
+                continue;
+            }
+            if seen.insert(t.task_name.clone()) {
+                rows.push(json!({
+                    "label": t.display_name,
+                    "value": t.task_name,
+                }));
+            }
+        }
+        Ok(json!(rows))
     }
 
     fn process_task_candidate_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        // Simplified: return empty page (m_ filters parsed but no data to filter)
+        let task_id = arg_id(args, &["processTaskId", "id"])?
+            .ok_or(JeeflowError::Business("processTaskId 缺失".into()))?;
+        let task = self
+            .repo
+            .find_task_by_id(task_id)?
+            .ok_or(JeeflowError::TaskNotFound(task_id))?;
+        let inst = self
+            .repo
+            .find_instance_by_id(task.process_instance_id)?
+            .ok_or(JeeflowError::InstanceNotFound(task.process_instance_id))?;
+        let def = self
+            .repo
+            .find_define_by_id(inst.define_id)?
+            .ok_or(JeeflowError::DefineNotFound(inst.define_id))?;
+
         let page_num = arg_i64_or(args, "pageNum", 1)?;
-        let page_size = arg_i64_or(args, "pageSize", 20)?;
-        Ok(serde_json::to_value(page_to_json(&PageResult::<Json>::new(page_num, page_size, 0, vec![]))).unwrap())
+        let page_size = arg_i64_or(args, "pageSize", 10)?;
+
+        let mut static_actors: Vec<String> = Vec::new();
+        if let Ok(model) = jeeflow_core::parser::ModelParser::parse(&def.content_str()) {
+            static_actors = collect_static_candidate_actors(&model, &task.task_name);
+        }
+
+        if !static_actors.is_empty() {
+            let ctx = self.engine.context();
+            let mut rows: Vec<Json> = Vec::new();
+            for actor in &static_actors {
+                let mut real_name = actor.clone();
+                let mut extra: Option<Json> = None;
+                if let Some(usp) = &ctx.user_search_provider {
+                    if let Ok(Some(u)) = usp.find_by_id(actor) {
+                        let mut map = serde_json::Map::new();
+                        for (k, v) in &u {
+                            map.insert(k.clone(), json_value_to_serde(v));
+                        }
+                        if let Some(rn) = map.get("realName").or_else(|| map.get("real_name")) {
+                            if let Some(s) = rn.as_str() {
+                                real_name = s.to_string();
+                            }
+                        }
+                        extra = Some(Json::Object(map));
+                    }
+                }
+                if extra.is_none() {
+                    if let Some(up) = &ctx.user_provider {
+                        if let Ok(Some(info)) = up.get_user(actor) {
+                            real_name = info.real_name.clone();
+                            extra = Some(json!({
+                                "userId": info.user_id,
+                                "realName": info.real_name,
+                                "deptName": info.dept_name,
+                            }));
+                        }
+                    }
+                }
+                rows.push(candidate_row(actor, &real_name, extra.as_ref()));
+            }
+            let result = PageResult::new(1, 10, rows.len() as i64, rows);
+            return Ok(serde_json::to_value(page_to_json(&result)).unwrap());
+        }
+
+        // 无模型候选 → 用户分页搜索
+        let Some(usp) = &self.engine.context().user_search_provider else {
+            return Err(JeeflowError::Business(
+                "未配置 IUserSearchProvider（用户搜索钩子）".into(),
+            ));
+        };
+        let mut query = PageQuery::new(page_num, page_size);
+        query.operator = arg_str(args, "operator");
+        let page = usp.page(&query)?;
+        let rows: Vec<Json> = page
+            .rows
+            .iter()
+            .map(|u| {
+                let mut map = serde_json::Map::new();
+                for (k, v) in u {
+                    map.insert(k.clone(), json_value_to_serde(v));
+                }
+                let id = map
+                    .get("id")
+                    .or_else(|| map.get("userId"))
+                    .or_else(|| map.get("user_id"))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| {
+                        v.as_i64().map(|n| n.to_string())
+                    }))
+                    .unwrap_or_default();
+                let real = map
+                    .get("realName")
+                    .or_else(|| map.get("real_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(id.as_str())
+                    .to_string();
+                candidate_row(&id, &real, Some(&Json::Object(map)))
+            })
+            .collect();
+        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
+        Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
     fn process_task_surrogate(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let operator = arg_str_or(args, "operator", "");
-        let process_name = arg_str_or(args, "name", "");
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        if let Some(ext) = &self.ext_repo {
-            let sg = ext.get_surrogate(&operator, &process_name, &now)?;
-            if let Some(s) = sg {
-                return Ok(serde_json::to_value(surrogate_to_json(&s)).unwrap());
-            }
+        // Java: surrogate = addTaskActor(processTaskId, actorIds) — NOT lookup surrogate table
+        let task_id = arg_id(args, &["processTaskId", "id"])?
+            .ok_or(JeeflowError::Business("processTaskId/actorIds 缺失".into()))?;
+        let actors = arg_actor_ids(args);
+        if actors.is_empty() {
+            return Err(JeeflowError::Business("processTaskId/actorIds 缺失".into()));
         }
-        Ok(Json::Null)
+        self.repo.add_task_actor(task_id, &actors)?;
+        Ok(json!({}))
     }
 
     fn process_task_add_candidate(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let task_id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let actor_str = arg_str(args, "actorIds").unwrap_or_default();
-        let actors: Vec<String> = actor_str.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        self.repo.add_task_actor(task_id, &actors)?;
-        Ok(json!({"id": task_id, "added": actors.len()}))
+        self.process_task_surrogate(args)
     }
 
     fn process_task_latest(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let instance_id = arg_i64(args, "instanceId")?.ok_or(JeeflowError::Business("缺少instanceId参数".into()))?;
+        let instance_id = arg_id(args, &["processInstanceId", "instanceId", "id"])?
+            .ok_or(JeeflowError::Business("缺少processInstanceId参数".into()))?;
         let tasks = self.repo.find_doing_tasks(instance_id, &[])?;
         if let Some(task) = tasks.first() {
-            Ok(json!({
-                "id": task.task_id, "task_name": task.task_name,
-                "display_name": task.display_name, "task_state": task.task_state,
-            }))
+            Ok(task_vo(task))
         } else {
             Ok(Json::Null)
         }
@@ -981,7 +1613,7 @@ impl JeeflowFacade {
         let filters = parse_m_params(args);
         let query = PageQuery::new(page_num, page_size);
         let page = ext.page_designs(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(|d| serde_json::to_value(design_to_json(d)).unwrap()).collect();
+        let mut rows: Vec<Json> = page.rows.iter().map(design_to_json).collect();
         apply_filters_to_rows(&mut rows, &filters);
         let (page_rows, total) = re_paginate(rows, page_num, page_size);
         let result = PageResult::new(page_num, page_size, total, page_rows);
@@ -990,118 +1622,307 @@ impl JeeflowFacade {
 
     fn process_design_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let design = ext.find_design_by_id(id)?
-            .ok_or(JeeflowError::Business(format!("设计不存在: {}", id)))?;
-        Ok(serde_json::to_value(design_to_json(&design)).unwrap())
+        let id = arg_id(args, &["processDesignId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let design = ext
+            .find_design_by_id(id)?
+            .ok_or(JeeflowError::Business("流程设计不存在".into()))?;
+        let his_list = ext.list_design_his(id)?;
+        let mut json_object = his_list
+            .first()
+            .and_then(|h| parse_graph(&String::from_utf8_lossy(&h.content)))
+            .unwrap_or_else(|| json!({}));
+        if let Some(obj) = json_object.as_object_mut() {
+            obj.entry("name".to_string())
+                .or_insert(Json::String(design.name.clone()));
+            obj.entry("displayName".to_string())
+                .or_insert(Json::String(design.display_name.clone()));
+            obj.entry("type".to_string())
+                .or_insert(Json::String(design.design_type.clone()));
+            obj.entry("processDesignId".to_string())
+                .or_insert(json!(design.id));
+        }
+        let mut data = design_to_json(&design);
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("json_object".into(), json_object);
+            obj.insert(
+                "his".into(),
+                Json::Array(his_list.iter().map(design_his_to_json).collect()),
+            );
+        }
+        Ok(data)
     }
 
     fn process_design_save(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let mut design = ProcessDesign {
-            id: 0,
-            name: arg_str_or(args, "name", ""),
-            display_name: arg_str_or(args, "displayName", ""),
-            design_type: arg_str_or(args, "designType", "approval"),
-            icon: arg_str(args, "icon"),
-            is_deployed: 0,
-            remark: arg_str(args, "remark"),
-            create_time: None, create_user: arg_str(args, "createUser"),
-            update_time: None, update_user: None,
+        let operator = arg_str_or(args, "operator", "user1");
+        let id_opt = arg_id(args, &["processDesignId", "id"])?;
+        let design_type = arg_str(args, "type")
+            .or_else(|| arg_str(args, "designType"))
+            .unwrap_or_else(|| "approval".to_string());
+
+        let design = if let Some(id) = id_opt {
+            let mut design = ext
+                .find_design_by_id(id)?
+                .ok_or(JeeflowError::Business("流程设计不存在".into()))?;
+            if let Some(v) = arg_str(args, "displayName") {
+                design.display_name = v;
+            }
+            if args.contains_key("type") || args.contains_key("designType") {
+                design.design_type = design_type;
+            }
+            if let Some(v) = arg_str(args, "icon") {
+                design.icon = Some(v);
+            }
+            if let Some(v) = arg_str(args, "remark") {
+                design.remark = Some(v);
+            }
+            design.update_user = Some(operator.clone());
+            if content_bytes(args).is_some() {
+                design.is_deployed = 0;
+            }
+            ext.update_design(&design)?;
+            design
+        } else {
+            let mut design = ProcessDesign {
+                id: 0,
+                name: arg_str_or(args, "name", ""),
+                display_name: arg_str_or(args, "displayName", ""),
+                design_type,
+                icon: arg_str(args, "icon"),
+                is_deployed: 0,
+                remark: arg_str(args, "remark"),
+                create_time: None,
+                create_user: Some(operator.clone()),
+                update_time: None,
+                update_user: Some(operator.clone()),
+            };
+            ext.save_design(&mut design)?;
+            design
         };
-        ext.save_design(&mut design)?;
+
+        if let Some(bytes) = content_bytes(args) {
+            let mut his = ProcessDesignHis {
+                id: 0,
+                process_design_id: design.id,
+                content: bytes,
+                create_time: None,
+                create_user: Some(operator),
+            };
+            ext.save_design_his(&mut his)?;
+        }
         Ok(json!({"id": design.id}))
     }
 
     fn process_design_update(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let design = ext.find_design_by_id(id)?
-            .ok_or(JeeflowError::Business(format!("设计不存在: {}", id)))?;
-        let updated = ProcessDesign {
-            display_name: arg_str(args, "displayName").unwrap_or(design.display_name),
-            icon: arg_str(args, "icon").or(design.icon),
-            remark: arg_str(args, "remark").or(design.remark),
-            update_user: arg_str(args, "updateUser"),
-            ..design
-        };
-        ext.update_design(&updated)?;
-        Ok(json!({"id": id}))
+        let id = arg_id(args, &["processDesignId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let mut design = ext
+            .find_design_by_id(id)?
+            .ok_or(JeeflowError::Business("流程设计不存在".into()))?;
+        if let Some(v) = arg_str(args, "name") {
+            design.name = v;
+        }
+        if let Some(v) = arg_str(args, "displayName") {
+            design.display_name = v;
+        }
+        if let Some(v) = arg_str(args, "type").or_else(|| arg_str(args, "designType")) {
+            design.design_type = v;
+        }
+        if let Some(v) = arg_str(args, "icon") {
+            design.icon = Some(v);
+        }
+        if let Some(v) = arg_str(args, "remark") {
+            design.remark = Some(v);
+        }
+        design.update_user = Some(arg_str_or(args, "operator", "system"));
+        ext.update_design(&design)?;
+        Ok(json!({}))
     }
 
     fn process_design_update_define(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        // Verify design exists, then save history
-        let _design = ext.find_design_by_id(id)?
-            .ok_or(JeeflowError::Business(format!("设计不存在: {}", id)))?;
-        let content = arg_str(args, "content").unwrap_or_default();
-        let mut his = ProcessDesignHis {
-            id: 0,
-            process_design_id: id,
-            content: content.into_bytes(),
-            create_time: None,
-            create_user: arg_str(args, "createUser"),
-        };
-        ext.save_design_his(&mut his)?;
-        Ok(json!({"id": id, "hisId": his.id}))
+        let design_id = arg_id(args, &["processDesignId", "id"])?
+            .ok_or(JeeflowError::Business("缺少processDesignId参数".into()))?;
+        let mut design = ext
+            .find_design_by_id(design_id)?
+            .ok_or(JeeflowError::Business("流程设计不存在".into()))?;
+        let bytes = content_bytes(args).ok_or(JeeflowError::Business("content 缺失".into()))?;
+        let his_list = ext.list_design_his(design_id)?;
+        let same = his_list
+            .first()
+            .map(|h| h.content == bytes)
+            .unwrap_or(false);
+        if !same {
+            let mut his = ProcessDesignHis {
+                id: 0,
+                process_design_id: design_id,
+                content: bytes.clone(),
+                create_time: None,
+                create_user: Some(arg_str_or(args, "operator", "system")),
+            };
+            ext.save_design_his(&mut his)?;
+        }
+        if let Ok(model) = jeeflow_core::parser::ModelParser::parse(&String::from_utf8_lossy(&bytes))
+        {
+            design.name = model.name;
+            design.display_name = model.display_name;
+            design.design_type = model.model_type;
+        }
+        design.is_deployed = 0;
+        design.update_user = Some(arg_str_or(args, "operator", "system"));
+        ext.update_design(&design)?;
+        Ok(json!({}))
     }
 
     fn process_design_remove(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        ext.remove_design(id)?;
-        Ok(json!({"id": id}))
+        let ids = arg_ids(args)?;
+        let ids = if ids.is_empty() {
+            if let Some(id) = arg_id(args, &["processDesignId", "id"])? {
+                vec![id]
+            } else {
+                return Err(JeeflowError::Business("缺少id参数".into()));
+            }
+        } else {
+            ids
+        };
+        for id in ids {
+            ext.remove_design(id)?;
+        }
+        Ok(json!({}))
     }
 
     fn process_design_deploy(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        // Deploy: create a new define from design
-        let design = ext.find_design_by_id(id)?
-            .ok_or(JeeflowError::Business(format!("设计不存在: {}", id)))?;
-
-        // Get latest design history for content
+        let id = arg_id(args, &["processDesignId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let design = ext
+            .find_design_by_id(id)?
+            .ok_or(JeeflowError::Business("流程设计不存在".into()))?;
         let his_list = ext.list_design_his(id)?;
-        let content = his_list.last()
-            .map(|h| String::from_utf8_lossy(&h.content).to_string())
-            .unwrap_or_else(|| "{}".to_string());
-
-        let mut define = ProcessDefine {
-            id: 0,
-            name: design.name.clone(),
-            display_name: design.display_name.clone(),
-            define_type: design.design_type.clone(),
-            state: 1,
-            content: content.into_bytes(),
-            version: 1,
-            create_time: None, create_user: design.create_user.clone(),
-            update_time: None, update_user: None,
+        if his_list.is_empty() {
+            return Err(JeeflowError::Business("流程设计没有内容，无法发布".into()));
+        }
+        let bytes = his_list[0].content.clone(); // newest first
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let model = jeeflow_core::parser::ModelParser::parse(&content)?;
+        let operator = arg_str_or(args, "operator", "system");
+        let define_id = self.save_deployed_define(&model, &bytes, &operator)?;
+        let updated = ProcessDesign {
+            is_deployed: 1,
+            update_user: Some(operator),
+            ..design
         };
-        self.repo.save_define(&mut define)?;
-
-        // Mark design as deployed
-        let updated = ProcessDesign { is_deployed: 1, ..design };
         ext.update_design(&updated)?;
-
-        Ok(json!({"id": id, "defineId": define.id}))
+        Ok(json!({"process_define_id": define_id}))
     }
 
     fn process_design_redeploy(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        // Same as deploy but increments version
-        self.process_design_deploy(args)
+        let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
+        let id = arg_id(args, &["processDesignId", "id"])?
+            .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        let design = ext
+            .find_design_by_id(id)?
+            .ok_or(JeeflowError::Business("流程设计不存在".into()))?;
+        let his_list = ext.list_design_his(id)?;
+        if his_list.is_empty() {
+            return Err(JeeflowError::Business("流程设计没有内容，无法发布".into()));
+        }
+        let bytes = his_list[0].content.clone();
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let model = jeeflow_core::parser::ModelParser::parse(&content)?;
+        let operator = arg_str_or(args, "operator", "system");
+
+        let page = self.repo.page_defines(&PageQuery::new(1, i64::MAX / 4))?;
+        let last = page
+            .rows
+            .iter()
+            .filter(|r| r.name == model.name)
+            .max_by_key(|r| r.version);
+        let define_id = if let Some(last) = last {
+            let old = self.repo.find_define_by_id(last.id)?.unwrap_or_else(|| ProcessDefine {
+                id: last.id,
+                name: last.name.clone(),
+                display_name: last.display_name.clone(),
+                define_type: last.define_type.clone(),
+                state: last.state,
+                content: bytes.clone(),
+                version: last.version,
+                create_time: last.create_time.clone(),
+                create_user: last.create_user.clone(),
+                update_time: None,
+                update_user: None,
+            });
+            let updated = ProcessDefine {
+                name: model.name.clone(),
+                display_name: model.display_name.clone(),
+                define_type: model.model_type.clone(),
+                content: bytes,
+                update_user: Some(operator.clone()),
+                ..old
+            };
+            self.repo.update_define(&updated)?;
+            last.id
+        } else {
+            self.save_deployed_define(&model, &bytes, &operator)?
+        };
+
+        let updated = ProcessDesign {
+            is_deployed: 1,
+            update_user: Some(operator),
+            ..design
+        };
+        ext.update_design(&updated)?;
+        Ok(json!({"process_define_id": define_id}))
     }
 
     fn process_design_list_by_type(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let _design_type = arg_str_or(args, "designType", "approval");
-        let query = PageQuery::new(1, 1000);
-        let page = ext.page_designs(&query)?;
-        let rows: Vec<Json> = page.rows.iter()
-            .filter(|d| _design_type.is_empty() || d.design_type == _design_type)
-            .map(|d| serde_json::to_value(design_to_json(d)).unwrap())
-            .collect();
-        Ok(json!(rows))
+        // 不默认过滤 approval；仅当 UI 显式传 type/designType 时过滤
+        let type_filter = arg_str(args, "type").or_else(|| arg_str(args, "designType"));
+        let page = ext.page_designs(&PageQuery::new(1, i64::MAX / 4))?;
+        let def_page = self.repo.page_defines(&PageQuery::new(1, i64::MAX / 4))?;
+        let mut latest_by_name: HashMap<String, &DefineRow> = HashMap::new();
+        for row in &def_page.rows {
+            match latest_by_name.get(&row.name) {
+                Some(prev) if prev.version >= row.version => {}
+                _ => {
+                    latest_by_name.insert(row.name.clone(), row);
+                }
+            }
+        }
+
+        let mut groups: serde_json::Map<String, Json> = serde_json::Map::new();
+        for d in &page.rows {
+            if let Some(ref tf) = type_filter {
+                if &d.design_type != tf {
+                    continue;
+                }
+            }
+            let type_key = d.design_type.clone();
+            let latest = latest_by_name.get(&d.name);
+            let his = ext.list_design_his(d.id)?;
+            let json_object = his
+                .first()
+                .and_then(|h| parse_graph(&String::from_utf8_lossy(&h.content)));
+            let item = json!({
+                "process_design_id": d.id,
+                "name": d.name,
+                "display_name": d.display_name,
+                "icon": d.icon,
+                "remark": d.remark,
+                "process_define_id": latest.map(|r| r.id),
+                "process_define_state": latest.map(|r| r.state),
+                "json_object": json_object,
+            });
+            let entry = groups.entry(type_key).or_insert_with(|| Json::Array(vec![]));
+            if let Some(arr) = entry.as_array_mut() {
+                arr.push(item);
+            }
+        }
+        Ok(Json::Object(groups))
     }
 
     // ═══════════════════════════════════════════════════════
@@ -1112,7 +1933,7 @@ impl JeeflowFacade {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
         let query = PageQuery::new(arg_i64_or(args, "pageNum", 1)?, arg_i64_or(args, "pageSize", 20)?);
         let page = ext.page_surrogates(&query)?;
-        let rows: Vec<Json> = page.rows.iter().map(|s| serde_json::to_value(surrogate_to_json(s)).unwrap()).collect();
+        let rows: Vec<Json> = page.rows.iter().map(surrogate_to_json).collect();
         let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
@@ -1156,7 +1977,7 @@ impl JeeflowFacade {
         let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
         let sg = ext.find_surrogate_by_id(id)?
             .ok_or(JeeflowError::Business(format!("委托不存在: {}", id)))?;
-        Ok(serde_json::to_value(surrogate_to_json(&sg)).unwrap())
+        Ok(surrogate_to_json(&sg))
     }
 
     fn process_surrogate_remove(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -1194,6 +2015,138 @@ fn json_value_to_serde(v: &JsonValue) -> Json {
             Json::Object(map)
         }
     }
+}
+
+/// 对齐 Java collectPath：沿输出边补全 history / edges；遇活跃节点仍收集边，但停止深入。
+fn collect_high_light_path(
+    model: &jeeflow_core::parser::ProcessModel,
+    node_id: &str,
+    active: &[String],
+    history: &mut Vec<String>,
+    edges: &mut Vec<String>,
+    visited: &mut std::collections::HashSet<String>,
+) {
+    if visited.contains(node_id) {
+        return;
+    }
+    visited.insert(node_id.to_string());
+    for edge in model.get_output_edges(node_id) {
+        // 决策边带 expr 时：无表达式引擎则保守跳过（对齐 Java evaluator==null → false）
+        let src = model.nodes.iter().find(|n| n.id == node_id);
+        if src.map(|n| n.node_type == jeeflow_core::parser::NodeType::Decision).unwrap_or(false) {
+            if let Some(expr) = edge.expr() {
+                if !expr.is_empty() {
+                    continue;
+                }
+            }
+        }
+        if !edge.id.is_empty() && !edges.contains(&edge.id) {
+            edges.push(edge.id.clone());
+        }
+        let tid = &edge.target_node_id;
+        if tid.is_empty() {
+            continue;
+        }
+        if !active.contains(tid) && !history.contains(tid) {
+            history.push(tid.clone());
+        }
+        if active.contains(tid) {
+            continue;
+        }
+        collect_high_light_path(model, tid, active, history, edges, visited);
+    }
+}
+
+/// 对齐 Java/Go buildNodeProgress（会签成员进度；动态参与人无成员则跳过）
+fn build_node_progress(
+    model: &jeeflow_core::parser::ProcessModel,
+    tasks: &[ProcessTask],
+) -> Json {
+    let mut progress = serde_json::Map::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for t in tasks {
+        if seen.insert(t.task_name.clone()) {
+            names.push(t.task_name.clone());
+        }
+    }
+    for name in names {
+        let ts: Vec<&ProcessTask> = tasks.iter().filter(|t| t.task_name == name).collect();
+        if ts.is_empty() {
+            continue;
+        }
+        // operatorList_{node} 优先，否则 actor_ids 并集
+        let mut members: Vec<String> = Vec::new();
+        if let Some(list) = ts[0].variables.get_str(&format!("operatorList_{}", name)) {
+            members = list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if members.is_empty() {
+            let mut set = std::collections::HashSet::new();
+            for t in &ts {
+                for a in &t.actor_ids {
+                    if set.insert(a.clone()) {
+                        members.push(a.clone());
+                    }
+                }
+            }
+        }
+        if members.is_empty() {
+            continue;
+        }
+        let mut done_set = std::collections::HashSet::new();
+        for t in &ts {
+            if t.task_state == TaskState::Finished.code() {
+                for a in &t.actor_ids {
+                    done_set.insert(a.clone());
+                }
+            }
+        }
+        let active_actor = ts
+            .iter()
+            .find(|t| t.task_state == TaskState::Doing.code() && !t.actor_ids.is_empty())
+            .and_then(|t| t.actor_ids.first().cloned());
+
+        let node = model.nodes.iter().find(|n| n.id == name);
+        let cs_type = node.and_then(|n| n.prop_str("countersignType"));
+        let is_cs = cs_type.is_some()
+            || node
+                .map(|n| {
+                    let p = n.perform_type();
+                    p == 1
+                })
+                .unwrap_or(false);
+
+        let members_out: Vec<Json> = members
+            .iter()
+            .map(|uid| {
+                let mut m = json!({"id": uid, "name": ""});
+                if let Some(obj) = m.as_object_mut() {
+                    if done_set.contains(uid) {
+                        obj.insert("done".into(), Json::Bool(true));
+                    } else if active_actor.as_ref() == Some(uid) {
+                        obj.insert("active".into(), Json::Bool(true));
+                    }
+                }
+                m
+            })
+            .collect();
+
+        let mut item = json!({"members": members_out});
+        if is_cs {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert(
+                    "type".into(),
+                    Json::String(cs_type.unwrap_or_else(|| "PARALLEL".into())),
+                );
+            }
+        }
+        progress.insert(name, item);
+    }
+    Json::Object(progress)
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1303,6 +2256,33 @@ mod tests {
         assert_eq!(output["taskName"], "test");
     }
 
+    #[test]
+    fn test_to_camel_json_preserves_opaque_maps() {
+        let input = json!({
+            "process_instance_id": 1,
+            "ext": {"u_realName": "张三", "tf_approvalComment": "ok"},
+            "json_object": {
+                "nodes": [{
+                    "properties": {
+                        "field": {"PERMISSION_f_leaveType": 1, "PERMISSION_days": 2}
+                    }
+                }]
+            }
+        });
+        let output = to_camel_json(&input);
+        assert_eq!(output["processInstanceId"], 1);
+        assert_eq!(output["ext"]["u_realName"], "张三");
+        assert_eq!(output["ext"]["tf_approvalComment"], "ok");
+        assert_eq!(
+            output["jsonObject"]["nodes"][0]["properties"]["field"]["PERMISSION_f_leaveType"],
+            1
+        );
+        assert_eq!(
+            output["jsonObject"]["nodes"][0]["properties"]["field"]["PERMISSION_days"],
+            2
+        );
+    }
+
     // ─── ID stringification tests ───
 
     #[test]
@@ -1344,15 +2324,27 @@ mod tests {
         let resp = facade.flow("processDefine/detail", &args).await;
         assert_eq!(resp["code"], 0);
         assert_eq!(resp["data"]["name"], "test-flow");
+        assert!(resp["data"]["type"].is_string(), "契约字段 type，不能是 defineType");
+        assert!(resp["data"].get("defineType").is_none());
+        assert!(resp["data"]["jsonObject"].is_object(), "契约字段 jsonObject（解析后的图）");
+        assert!(resp["data"].get("content").is_none());
     }
 
     #[tokio::test]
     async fn test_process_define_deploy() {
-        let (facade, id) = make_facade_with_define();
+        let facade = make_facade();
         let mut args = HashMap::new();
-        args.insert("id".to_string(), json!(id));
+        args.insert(
+            "content".to_string(),
+            json!(r#"{"name":"deploy-flow","displayName":"DF","type":"approval","nodes":[{"id":"start","type":"snaker:start","text":{"value":"S"}},{"id":"apply","type":"snaker:task","text":{"value":"A"},"properties":{"assignee":"applicant"}},{"id":"end","type":"snaker:end","text":{"value":"E"}}],"edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},{"id":"e2","sourceNodeId":"apply","targetNodeId":"end"}]}"#),
+        );
         let resp = facade.flow("processDefine/deploy", &args).await;
-        assert_eq!(resp["code"], 0);
+        assert_eq!(resp["code"], 0, "{:?}", resp);
+        assert!(
+            resp["data"]["processDefineId"].is_string(),
+            "deploy must return processDefineId: {:?}",
+            resp
+        );
     }
 
     #[tokio::test]
@@ -1530,11 +2522,12 @@ mod tests {
         let (facade, id) = make_facade_with_define();
         let id_str = id.to_string();
 
-        // processDefine/deploy with string id
+        // processDefine/upAndDown with string id
         let mut args = HashMap::new();
         args.insert("id".to_string(), json!(&id_str));
-        let resp = facade.flow("processDefine/deploy", &args).await;
-        assert_eq!(resp["code"], 0, "deploy with string id should work");
+        args.insert("state".to_string(), json!(0));
+        let resp = facade.flow("processDefine/upAndDown", &args).await;
+        assert_eq!(resp["code"], 0, "upAndDown with string id should work");
 
         // processDefine/remove with string id
         let resp = facade.flow("processDefine/remove", &args).await;
@@ -1619,7 +2612,8 @@ mod tests {
     async fn test_process_task_latest() {
         let facade = make_facade();
         let resp = facade.flow("processTask/latest", &HashMap::new()).await;
-        assert!(resp.get("code").is_some());
+        // missing processInstanceId → business error
+        assert_eq!(resp["code"], 99999999);
     }
 
     #[tokio::test]
@@ -1636,10 +2630,22 @@ mod tests {
     #[tokio::test]
     async fn test_process_design_list_by_type() {
         let facade = make_facade();
-        let mut args = HashMap::new();
-        args.insert("designType".to_string(), json!("approval"));
-        let resp = facade.flow("processDesign/listByType", &args).await;
-        assert_eq!(resp["code"], 0);
+        // save one design so groups is non-empty object map
+        let mut save = HashMap::new();
+        save.insert("name".to_string(), json!("list-type-flow"));
+        save.insert("displayName".to_string(), json!("LT"));
+        save.insert("type".to_string(), json!("approval"));
+        let saved = facade.flow("processDesign/save", &save).await;
+        assert_eq!(saved["code"], 0);
+
+        let resp = facade.flow("processDesign/listByType", &HashMap::new()).await;
+        assert_eq!(resp["code"], 0, "{:?}", resp);
+        assert!(resp["data"].is_object(), "listByType must return grouped map, got {:?}", resp["data"]);
+        assert!(
+            resp["data"].get("approval").is_some(),
+            "expected approval group: {:?}",
+            resp["data"]
+        );
     }
 
     #[tokio::test]
@@ -1866,6 +2872,246 @@ mod tests {
         args5.insert("submitType".to_string(), json!(1));
         let resp5 = facade.flow("processTask/execute", &args5).await;
         assert_eq!(resp5["code"], 0, "execute failed: {:?}", resp5);
+    }
+
+    #[tokio::test]
+    async fn test_high_light_contract_fields() {
+        let facade = make_facade_with_user_provider();
+        let mut define = ProcessDefine {
+            id: 0,
+            name: "hl-flow".into(),
+            display_name: "HL".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: r#"{
+                "name":"hl-flow","displayName":"HL","type":"approval",
+                "nodes":[
+                    {"id":"start","type":"snaker:start","text":{"value":"S"}},
+                    {"id":"apply","type":"snaker:task","text":{"value":"A"},
+                     "properties":{"assignee":"applicant"}},
+                    {"id":"approve","type":"snaker:task","text":{"value":"B"},
+                     "properties":{"assignee":"user2"}},
+                    {"id":"end","type":"snaker:end","text":{"value":"E"}}
+                ],
+                "edges":[
+                    {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                    {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                    {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+                ]
+            }"#
+            .as_bytes()
+            .to_vec(),
+            version: 1,
+            create_time: None,
+            create_user: None,
+            update_time: None,
+            update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+
+        let mut args = HashMap::new();
+        args.insert("processDefineId".to_string(), json!(define.id));
+        args.insert("operator".to_string(), json!("user1"));
+        let start = facade.flow("processDefine/startAndExecute", &args).await;
+        assert_eq!(start["code"], 0, "{:?}", start);
+        let iid = start["data"]["processInstanceId"].as_str().unwrap();
+
+        let mut hl_args = HashMap::new();
+        hl_args.insert("id".to_string(), json!(iid));
+        let hl = facade.flow("processInstance/highLight", &hl_args).await;
+        assert_eq!(hl["code"], 0, "{:?}", hl);
+        let data = &hl["data"];
+        assert!(data.get("finishedNodes").is_none());
+        assert!(data.get("currentNodes").is_none());
+        let active = data["activeNodeNames"].as_array().expect("activeNodeNames");
+        let history = data["historyNodeNames"].as_array().expect("historyNodeNames");
+        let edges = data["historyEdgeNames"].as_array().expect("historyEdgeNames");
+        assert!(data["nodeProgress"].is_object());
+        assert!(
+            active.iter().any(|v| v.as_str() == Some("approve")),
+            "active should contain approve: {:?}",
+            active
+        );
+        assert!(
+            history.iter().any(|v| v.as_str() == Some("apply"))
+                || history.iter().any(|v| v.as_str() == Some("start")),
+            "history should contain apply/start: {:?}",
+            history
+        );
+        assert!(!edges.is_empty(), "historyEdgeNames should not be empty: {:?}", edges);
+    }
+
+    #[tokio::test]
+    async fn test_get_assignee_text_data_shape() {
+        let facade = make_facade_with_user_provider();
+        let mut define = ProcessDefine {
+            id: 0,
+            name: "assignee-flow".into(),
+            display_name: "AF".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: r#"{
+                "name":"assignee-flow","displayName":"AF","type":"approval",
+                "nodes":[
+                    {"id":"start","type":"snaker:start","text":{"value":"S"}},
+                    {"id":"apply","type":"snaker:task","text":{"value":"申请"},
+                     "properties":{"assignee":"applicant"}},
+                    {"id":"approve","type":"snaker:task","text":{"value":"审批"},
+                     "properties":{"assignee":"user2"}},
+                    {"id":"end","type":"snaker:end","text":{"value":"E"}}
+                ],
+                "edges":[
+                    {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                    {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                    {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+                ]
+            }"#
+            .as_bytes()
+            .to_vec(),
+            version: 1,
+            create_time: None,
+            create_user: None,
+            update_time: None,
+            update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+        let mut args = HashMap::new();
+        args.insert("processDefineId".to_string(), json!(define.id));
+        args.insert("operator".to_string(), json!("user1"));
+        let start = facade.flow("processDefine/startAndExecute", &args).await;
+        assert_eq!(start["code"], 0, "{:?}", start);
+        let iid = start["data"]["processInstanceId"].as_str().unwrap();
+
+        let mut a_args = HashMap::new();
+        a_args.insert("processInstanceId".to_string(), json!(iid));
+        let resp = facade.flow("processInstance/getAssigneeTextData", &a_args).await;
+        assert_eq!(resp["code"], 0, "{:?}", resp);
+        let rows = resp["data"].as_array().expect("array");
+        assert!(!rows.is_empty());
+        assert!(rows[0].get("value").is_some());
+        assert!(rows[0].get("label").is_some());
+        let label = rows[0]["label"].as_str().unwrap();
+        assert!(label.contains(':'), "includeNodeName default true → displayName:actor, got {}", label);
+    }
+
+    #[tokio::test]
+    async fn test_jump_able_task_name_list_shape() {
+        let facade = make_facade_with_user_provider();
+        let mut define = ProcessDefine {
+            id: 0,
+            name: "jump-flow".into(),
+            display_name: "JF".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: r#"{
+                "name":"jump-flow","displayName":"JF","type":"approval",
+                "nodes":[
+                    {"id":"start","type":"snaker:start","text":{"value":"S"}},
+                    {"id":"apply","type":"snaker:task","text":{"value":"申请"},
+                     "properties":{"assignee":"applicant"}},
+                    {"id":"approve","type":"snaker:task","text":{"value":"审批"},
+                     "properties":{"assignee":"user2"}},
+                    {"id":"end","type":"snaker:end","text":{"value":"E"}}
+                ],
+                "edges":[
+                    {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                    {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                    {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+                ]
+            }"#
+            .as_bytes()
+            .to_vec(),
+            version: 1,
+            create_time: None,
+            create_user: None,
+            update_time: None,
+            update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+        let mut args = HashMap::new();
+        args.insert("processDefineId".to_string(), json!(define.id));
+        args.insert("operator".to_string(), json!("user1"));
+        let start = facade.flow("processDefine/startAndExecute", &args).await;
+        assert_eq!(start["code"], 0, "{:?}", start);
+        let iid = start["data"]["processInstanceId"].as_str().unwrap();
+
+        let mut j_args = HashMap::new();
+        j_args.insert("processInstanceId".to_string(), json!(iid));
+        let resp = facade.flow("processTask/jumpAbleTaskNameList", &j_args).await;
+        assert_eq!(resp["code"], 0, "{:?}", resp);
+        let rows = resp["data"].as_array().expect("array of {label,value}");
+        assert!(!rows.is_empty());
+        assert!(rows[0].get("label").is_some());
+        assert!(rows[0].get("value").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_task_surrogate_adds_actors() {
+        let facade = make_facade_with_user_provider();
+        let mut define = ProcessDefine {
+            id: 0,
+            name: "sg-flow".into(),
+            display_name: "SG".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: r#"{
+                "name":"sg-flow","displayName":"SG","type":"approval",
+                "nodes":[
+                    {"id":"start","type":"snaker:start","text":{"value":"S"}},
+                    {"id":"apply","type":"snaker:task","text":{"value":"申请"},
+                     "properties":{"assignee":"applicant"}},
+                    {"id":"approve","type":"snaker:task","text":{"value":"审批"},
+                     "properties":{"assignee":"user2"}},
+                    {"id":"end","type":"snaker:end","text":{"value":"E"}}
+                ],
+                "edges":[
+                    {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                    {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                    {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+                ]
+            }"#
+            .as_bytes()
+            .to_vec(),
+            version: 1,
+            create_time: None,
+            create_user: None,
+            update_time: None,
+            update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+        let mut args = HashMap::new();
+        args.insert("processDefineId".to_string(), json!(define.id));
+        args.insert("operator".to_string(), json!("user1"));
+        let start = facade.flow("processDefine/startAndExecute", &args).await;
+        assert_eq!(start["code"], 0, "{:?}", start);
+        let iid: i64 = start["data"]["processInstanceId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let doing = facade.repo().find_doing_tasks(iid, &[]).unwrap();
+        assert!(!doing.is_empty());
+        let task_id = doing[0].task_id;
+
+        let mut s_args = HashMap::new();
+        s_args.insert("processTaskId".to_string(), json!(task_id));
+        s_args.insert("actorIds".to_string(), json!(["user9", "user8"]));
+        let resp = facade.flow("processTask/surrogate", &s_args).await;
+        assert_eq!(resp["code"], 0, "{:?}", resp);
+        let actors = facade.repo().find_task_actors(task_id).unwrap();
+        assert!(actors.contains(&"user9".to_string()), "{:?}", actors);
+        assert!(actors.contains(&"user8".to_string()), "{:?}", actors);
+    }
+
+    #[tokio::test]
+    async fn test_biz_data_requires_meta_table_reader() {
+        let (facade, _) = make_facade_with_define();
+        let mut args = HashMap::new();
+        args.insert("processInstanceId".to_string(), json!(1));
+        let resp = facade.flow("processInstance/bizData", &args).await;
+        assert_eq!(resp["code"], 99999999);
+        // either instance not found or reader not registered — must NOT succeed with vars dump
+        assert!(resp.get("data").is_none() || resp["data"].is_null());
     }
 
     // ─── Action count test ───

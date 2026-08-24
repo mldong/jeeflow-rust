@@ -1,17 +1,19 @@
 # jeeflow-rust demo Docker 镜像（多阶段构建）
-# 构建上下文：jeeflow-rust 仓库根目录
-# Rust demo 使用 MemoryRepository，不依赖共享 flows / MySQL
+# 构建上下文：同时包含 jeeflow-rust/ 与 jeeflow-java/（共享 flows），见 .github/workflows/demo-deploy.yml
+#
+#   docker build -f jeeflow-rust/Dockerfile.demo -t jeeflow-rust-demo:latest .
+#
 FROM rust:1.97-slim AS builder
 
 WORKDIR /build
 
 # 先复制 workspace 配置 + 各 crate Cargo.toml（利用 Docker 层缓存）
-COPY Cargo.toml Cargo.lock ./
-COPY jeeflow-core/Cargo.toml jeeflow-core/Cargo.toml
-COPY jeeflow-repository-sqlx/Cargo.toml jeeflow-repository-sqlx/Cargo.toml
-COPY jeeflow-persist/Cargo.toml jeeflow-persist/Cargo.toml
-COPY jeeflow-facade/Cargo.toml jeeflow-facade/Cargo.toml
-COPY jeeflow-demo-salvo/Cargo.toml jeeflow-demo-salvo/Cargo.toml
+COPY jeeflow-rust/Cargo.toml jeeflow-rust/Cargo.lock ./
+COPY jeeflow-rust/jeeflow-core/Cargo.toml jeeflow-core/Cargo.toml
+COPY jeeflow-rust/jeeflow-repository-sqlx/Cargo.toml jeeflow-repository-sqlx/Cargo.toml
+COPY jeeflow-rust/jeeflow-persist/Cargo.toml jeeflow-persist/Cargo.toml
+COPY jeeflow-rust/jeeflow-facade/Cargo.toml jeeflow-facade/Cargo.toml
+COPY jeeflow-rust/jeeflow-demo-salvo/Cargo.toml jeeflow-demo-salvo/Cargo.toml
 
 # 创建 dummy src 以通过编译缓存
 RUN mkdir -p jeeflow-core/src && echo "pub fn dummy(){}" > jeeflow-core/src/lib.rs && \
@@ -24,15 +26,16 @@ RUN mkdir -p jeeflow-core/src && echo "pub fn dummy(){}" > jeeflow-core/src/lib.
 RUN cargo build --release -p jeeflow-demo-salvo 2>/dev/null || true
 
 # 复制真实源码
-COPY jeeflow-core/src jeeflow-core/src
-COPY jeeflow-repository-sqlx/src jeeflow-repository-sqlx/src
-COPY jeeflow-persist/src jeeflow-persist/src
-COPY jeeflow-facade/src jeeflow-facade/src
-COPY jeeflow-demo-salvo/src jeeflow-demo-salvo/src
+COPY jeeflow-rust/jeeflow-core/src jeeflow-core/src
+COPY jeeflow-rust/jeeflow-repository-sqlx/src jeeflow-repository-sqlx/src
+COPY jeeflow-rust/jeeflow-persist/src jeeflow-persist/src
+COPY jeeflow-rust/jeeflow-facade/src jeeflow-facade/src
+COPY jeeflow-rust/jeeflow-demo-salvo/src jeeflow-demo-salvo/src
 
 # 编译 release binary
 RUN cargo build --release -p jeeflow-demo-salvo && \
-    cp target/release/jeeflow-demo-salvo /build/jeeflow-demo-salvo
+    cp target/release/jeeflow-demo-salvo /build/jeeflow-demo-salvo && \
+    chmod +x /build/jeeflow-demo-salvo
 
 # ─── runtime ───
 FROM debian:bookworm-slim
@@ -41,7 +44,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /build/jeeflow-demo-salvo ./jeeflow-demo-salvo
+# 部分 Docker/OCI 运行时 COPY 会丢可执行位 → permission denied
+COPY --from=builder /build/jeeflow-demo-salvo /app/jeeflow-demo-salvo
+RUN chmod +x /app/jeeflow-demo-salvo
 
+# 共享 LogicFlow JSON（与五语言 demo 同源）
+COPY jeeflow-java/jeeflow-core/src/test/resources/flows /app/flows
+
+ENV JEFFLOW_FLOWS_DIR=/app/flows
 EXPOSE 8091
-CMD ["./jeeflow-demo-salvo"]
+CMD ["/app/jeeflow-demo-salvo"]

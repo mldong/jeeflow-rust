@@ -223,6 +223,127 @@ fn get_opt_datetime(r: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
     r.try_get::<Option<String>, _>(col).ok().flatten()
 }
 
+
+fn page_bounds(query: &PageQuery) -> (i64, i64, i64) {
+    let page_num = if query.page_num < 1 { 1 } else { query.page_num };
+    let page_size = if query.page_size < 1 { 20 } else { query.page_size };
+    let offset = (page_num - 1) * page_size;
+    (page_num, page_size, offset)
+}
+
+fn get_opt_string(r: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
+    r.try_get::<Option<String>, _>(col).ok().flatten()
+}
+
+fn get_opt_i64(r: &sqlx::mysql::MySqlRow, col: &str) -> Option<i64> {
+    r.try_get::<Option<i64>, _>(col).ok().flatten()
+}
+
+fn get_opt_i32(r: &sqlx::mysql::MySqlRow, col: &str) -> Option<i32> {
+    r.try_get::<Option<i32>, _>(col).ok().flatten()
+}
+
+fn map_task_row(r: &sqlx::mysql::MySqlRow) -> TaskRow {
+    TaskRow {
+        id: r.get("id"),
+        process_instance_id: r.get("process_instance_id"),
+        task_name: r.get("task_name"),
+        display_name: r.try_get::<Option<String>, _>("display_name").ok().flatten().unwrap_or_default(),
+        task_type: r.try_get::<Option<i32>, _>("task_type").ok().flatten().unwrap_or(0),
+        perform_type: r.try_get::<Option<i32>, _>("perform_type").ok().flatten().unwrap_or(0),
+        task_state: r.get("task_state"),
+        operator: get_opt_string(r, "operator"),
+        actor_id: get_opt_string(r, "actor_id"),
+        finish_time: get_opt_datetime(r, "finish_time"),
+        expire_time: get_opt_datetime(r, "expire_time"),
+        form_key: get_opt_string(r, "form_key"),
+        task_parent_id: get_opt_i64(r, "task_parent_id"),
+        variable: get_opt_string(r, "variable"),
+        create_time: get_opt_datetime(r, "create_time"),
+        create_user: get_opt_string(r, "create_user"),
+        update_time: get_opt_datetime(r, "update_time"),
+        update_user: get_opt_string(r, "update_user"),
+        process_define_id: get_opt_i64(r, "process_define_id"),
+        instance_state: get_opt_i32(r, "instance_state"),
+        instance_operator: get_opt_string(r, "instance_operator"),
+        business_no: get_opt_string(r, "business_no"),
+        instance_variable: get_opt_string(r, "instance_variable"),
+        instance_create_time: get_opt_datetime(r, "instance_create_time"),
+        define_name: get_opt_string(r, "define_name"),
+        define_display_name: get_opt_string(r, "define_display_name"),
+        define_version: get_opt_i32(r, "define_version"),
+    }
+}
+
+fn map_instance_row(r: &sqlx::mysql::MySqlRow) -> InstanceRow {
+    InstanceRow {
+        id: r.get("id"),
+        parent_id: get_opt_i64(r, "parent_id"),
+        process_define_id: r.get("process_define_id"),
+        state: r.get("state"),
+        parent_node_name: get_opt_string(r, "parent_node_name"),
+        business_no: get_opt_string(r, "business_no"),
+        operator: r.try_get::<Option<String>, _>("operator").ok().flatten().unwrap_or_default(),
+        expire_time: get_opt_datetime(r, "expire_time"),
+        variable: get_opt_string(r, "variable"),
+        create_time: get_opt_datetime(r, "create_time"),
+        create_user: get_opt_string(r, "create_user"),
+        update_time: get_opt_datetime(r, "update_time"),
+        update_user: get_opt_string(r, "update_user"),
+        define_name: get_opt_string(r, "define_name"),
+        define_display_name: get_opt_string(r, "define_display_name"),
+        define_version: get_opt_i32(r, "define_version"),
+    }
+}
+
+fn map_define_row(r: &sqlx::mysql::MySqlRow) -> DefineRow {
+    DefineRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        display_name: r.try_get::<Option<String>, _>("display_name").ok().flatten().unwrap_or_default(),
+        define_type: r.try_get::<Option<String>, _>("define_type").ok().flatten().unwrap_or_else(|| "approval".into()),
+        state: r.get("state"),
+        version: r.try_get::<Option<i32>, _>("version").ok().flatten().unwrap_or(1),
+        create_time: get_opt_datetime(r, "create_time"),
+        create_user: get_opt_string(r, "create_user"),
+        update_time: get_opt_datetime(r, "update_time"),
+        update_user: get_opt_string(r, "update_user"),
+    }
+}
+
+fn map_design(r: &sqlx::mysql::MySqlRow) -> ProcessDesign {
+    ProcessDesign {
+        id: r.get("id"),
+        name: r.get("name"),
+        display_name: r.try_get::<Option<String>, _>("display_name").ok().flatten().unwrap_or_default(),
+        design_type: r.try_get::<Option<String>, _>("design_type").ok().flatten().unwrap_or_else(|| "approval".into()),
+        icon: get_opt_string(r, "icon"),
+        is_deployed: r.try_get::<Option<i32>, _>("is_deployed").ok().flatten().unwrap_or(0),
+        remark: get_opt_string(r, "remark"),
+        create_time: get_opt_datetime(r, "create_time"),
+        create_user: get_opt_string(r, "create_user"),
+        update_time: get_opt_datetime(r, "update_time"),
+        update_user: get_opt_string(r, "update_user"),
+    }
+}
+
+fn map_surrogate(r: &sqlx::mysql::MySqlRow) -> ProcessSurrogate {
+    ProcessSurrogate {
+        id: r.get("id"),
+        process_name: r.get("process_name"),
+        operator: r.get("operator"),
+        surrogate: r.get("surrogate"),
+        start_time: get_opt_datetime(r, "start_time"),
+        end_time: get_opt_datetime(r, "end_time"),
+        enabled: r.try_get::<Option<i32>, _>("enabled").ok().flatten().unwrap_or(1),
+        create_time: get_opt_datetime(r, "create_time"),
+        create_user: get_opt_string(r, "create_user"),
+        update_time: get_opt_datetime(r, "update_time"),
+        update_user: get_opt_string(r, "update_user"),
+    }
+}
+
+
 impl ProcessRepository for SqlxRepository {
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>> {
         self.block_on(async {
@@ -692,11 +813,205 @@ impl ProcessRepository for SqlxRepository {
         })
     }
 
-    fn page_todo_tasks(&self, _query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> { Ok(PageResult::empty()) }
-    fn page_done_tasks(&self, _query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> { Ok(PageResult::empty()) }
-    fn page_instances(&self, _query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> { Ok(PageResult::empty()) }
-    fn page_cc_instances(&self, _query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> { Ok(PageResult::empty()) }
-    fn page_defines(&self, _query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>> { Ok(PageResult::empty()) }
+
+    fn page_todo_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
+        self.block_on(async {
+            let (page_num, page_size, offset) = page_bounds(query);
+            let op = query.operator.clone();
+            let count_row = sqlx::query(
+                "SELECT COUNT(DISTINCT t.id) AS cnt \
+                 FROM wf_process_task t \
+                 INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id \
+                 INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
+                 LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
+                 WHERE t.state = 10 AND (? IS NULL OR ta.actor_id = ?)"
+            )
+            .bind(op.clone())
+            .bind(op.clone())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let total: i64 = count_row.get("cnt");
+
+            let rows = sqlx::query(
+                "SELECT DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, \
+                        t.task_type, t.perform_type, t.state AS task_state, \
+                        t.actor_id AS operator, ta.actor_id AS actor_id, \
+                        t.finish_time, t.expire_time, t.form_key, t.parent_task_id AS task_parent_id, \
+                        t.variable, t.create_time, t.create_user, t.update_time, t.update_user, \
+                        pi.process_define_id, pi.state AS instance_state, pi.operator AS instance_operator, \
+                        pi.business_no, pi.variable AS instance_variable, pi.create_time AS instance_create_time, \
+                        pd.name AS define_name, pd.display_name AS define_display_name, pd.version AS define_version \
+                 FROM wf_process_task t \
+                 INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id \
+                 INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
+                 LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
+                 WHERE t.state = 10 AND (? IS NULL OR ta.actor_id = ?) \
+                 ORDER BY t.id DESC LIMIT ? OFFSET ?"
+            )
+            .bind(op.clone())
+            .bind(op)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+
+            Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_task_row).collect()))
+        })
+    }
+
+    fn page_done_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
+        self.block_on(async {
+            let (page_num, page_size, offset) = page_bounds(query);
+            let op = query.operator.clone();
+            let count_row = sqlx::query(
+                "SELECT COUNT(*) AS cnt \
+                 FROM wf_process_task t \
+                 INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
+                 LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
+                 WHERE t.state = 20 AND (? IS NULL OR t.actor_id = ? OR t.create_user = ?)"
+            )
+            .bind(op.clone())
+            .bind(op.clone())
+            .bind(op.clone())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let total: i64 = count_row.get("cnt");
+
+            let rows = sqlx::query(
+                "SELECT t.id, t.process_instance_id, t.task_name, t.display_name, \
+                        t.task_type, t.perform_type, t.state AS task_state, \
+                        t.actor_id AS operator, t.actor_id AS actor_id, \
+                        t.finish_time, t.expire_time, t.form_key, t.parent_task_id AS task_parent_id, \
+                        t.variable, t.create_time, t.create_user, t.update_time, t.update_user, \
+                        pi.process_define_id, pi.state AS instance_state, pi.operator AS instance_operator, \
+                        pi.business_no, pi.variable AS instance_variable, pi.create_time AS instance_create_time, \
+                        pd.name AS define_name, pd.display_name AS define_display_name, pd.version AS define_version \
+                 FROM wf_process_task t \
+                 INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
+                 LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
+                 WHERE t.state = 20 AND (? IS NULL OR t.actor_id = ? OR t.create_user = ?) \
+                 ORDER BY t.id DESC LIMIT ? OFFSET ?"
+            )
+            .bind(op.clone())
+            .bind(op.clone())
+            .bind(op)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+
+            Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_task_row).collect()))
+        })
+    }
+
+    fn page_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
+        self.block_on(async {
+            let (page_num, page_size, offset) = page_bounds(query);
+            let op = query.operator.clone();
+            let count_row = sqlx::query(
+                "SELECT COUNT(*) AS cnt \
+                 FROM wf_process_instance pi \
+                 LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
+                 WHERE (? IS NULL OR pi.operator = ?)"
+            )
+            .bind(op.clone())
+            .bind(op.clone())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let total: i64 = count_row.get("cnt");
+
+            let rows = sqlx::query(
+                "SELECT pi.id, pi.parent_id, pi.process_define_id, pi.state, pi.parent_node_name, \
+                        pi.business_no, pi.operator, pi.expire_time, pi.variable, \
+                        pi.create_time, pi.create_user, pi.update_time, pi.update_user, \
+                        pd.name AS define_name, pd.display_name AS define_display_name, pd.version AS define_version \
+                 FROM wf_process_instance pi \
+                 LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
+                 WHERE (? IS NULL OR pi.operator = ?) \
+                 ORDER BY pi.id DESC LIMIT ? OFFSET ?"
+            )
+            .bind(op.clone())
+            .bind(op)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+
+            Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_instance_row).collect()))
+        })
+    }
+
+    fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
+        self.block_on(async {
+            let (page_num, page_size, offset) = page_bounds(query);
+            let op = query.operator.clone();
+            let count_row = sqlx::query(
+                "SELECT COUNT(DISTINCT pi.id) AS cnt \
+                 FROM wf_cc_instance cc \
+                 INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
+                 LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
+                 WHERE (? IS NULL OR cc.actor_id = ?)"
+            )
+            .bind(op.clone())
+            .bind(op.clone())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let total: i64 = count_row.get("cnt");
+
+            let rows = sqlx::query(
+                "SELECT DISTINCT pi.id, pi.parent_id, pi.process_define_id, pi.state, pi.parent_node_name, \
+                        pi.business_no, pi.operator, pi.expire_time, pi.variable, \
+                        pi.create_time, pi.create_user, pi.update_time, pi.update_user, \
+                        pd.name AS define_name, pd.display_name AS define_display_name, pd.version AS define_version \
+                 FROM wf_cc_instance cc \
+                 INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
+                 LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
+                 WHERE (? IS NULL OR cc.actor_id = ?) \
+                 ORDER BY pi.id DESC LIMIT ? OFFSET ?"
+            )
+            .bind(op.clone())
+            .bind(op)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+
+            Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_instance_row).collect()))
+        })
+    }
+
+    fn page_defines(&self, query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>> {
+        self.block_on(async {
+            let (page_num, page_size, offset) = page_bounds(query);
+            let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM wf_process_define")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let total: i64 = count_row.get("cnt");
+
+            let rows = sqlx::query(
+                "SELECT id, name, display_name, define_type, state, version, \
+                        create_time, create_user, update_time, update_user \
+                 FROM wf_process_define ORDER BY id DESC LIMIT ? OFFSET ?"
+            )
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+
+            Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_define_row).collect()))
+        })
+    }
+
 
     fn count_todo_tasks(&self, user_id: &str) -> JeeflowResult<i64> {
         self.block_on(async {
@@ -712,12 +1027,366 @@ impl ProcessRepository for SqlxRepository {
     }
 }
 
+impl ProcessExtRepository for SqlxRepository {
+    fn find_design_by_id(&self, design_id: i64) -> JeeflowResult<Option<ProcessDesign>> {
+        self.block_on(async {
+            let row = sqlx::query(
+                "SELECT id, name, display_name, design_type, icon, is_deployed, remark, \
+                        create_time, create_user, update_time, update_user \
+                 FROM wf_process_design WHERE id = ?"
+            )
+            .bind(design_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(row.map(|r| map_design(&r)))
+        })
+    }
+
+    fn save_design(&self, design: &mut ProcessDesign) -> JeeflowResult<()> {
+        self.block_on(async {
+            let result = if design.id > 0 {
+                sqlx::query(
+                    "INSERT INTO wf_process_design (id, name, display_name, design_type, icon, is_deployed, remark, create_user) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(design.id)
+                .bind(&design.name)
+                .bind(&design.display_name)
+                .bind(&design.design_type)
+                .bind(&design.icon)
+                .bind(design.is_deployed)
+                .bind(&design.remark)
+                .bind(&design.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            } else {
+                sqlx::query(
+                    "INSERT INTO wf_process_design (name, display_name, design_type, icon, is_deployed, remark, create_user) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(&design.name)
+                .bind(&design.display_name)
+                .bind(&design.design_type)
+                .bind(&design.icon)
+                .bind(design.is_deployed)
+                .bind(&design.remark)
+                .bind(&design.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            };
+            if design.id == 0 {
+                design.id = result.last_insert_id() as i64;
+            }
+            Ok(())
+        })
+    }
+
+    fn update_design(&self, design: &ProcessDesign) -> JeeflowResult<()> {
+        self.block_on(async {
+            sqlx::query(
+                "UPDATE wf_process_design SET name=?, display_name=?, design_type=?, icon=?, \
+                 is_deployed=?, remark=?, update_user=? WHERE id=?"
+            )
+            .bind(&design.name)
+            .bind(&design.display_name)
+            .bind(&design.design_type)
+            .bind(&design.icon)
+            .bind(design.is_deployed)
+            .bind(&design.remark)
+            .bind(&design.update_user)
+            .bind(design.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn remove_design(&self, design_id: i64) -> JeeflowResult<()> {
+        self.block_on(async {
+            sqlx::query("DELETE FROM wf_process_design_his WHERE process_design_id=?")
+                .bind(design_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            sqlx::query("DELETE FROM wf_process_design WHERE id=?")
+                .bind(design_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn page_designs(&self, query: &PageQuery) -> JeeflowResult<PageResult<ProcessDesign>> {
+        self.block_on(async {
+            let (page_num, page_size, offset) = page_bounds(query);
+            let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM wf_process_design")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let total: i64 = count_row.get("cnt");
+            let rows = sqlx::query(
+                "SELECT id, name, display_name, design_type, icon, is_deployed, remark, \
+                        create_time, create_user, update_time, update_user \
+                 FROM wf_process_design ORDER BY id DESC LIMIT ? OFFSET ?"
+            )
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_design).collect()))
+        })
+    }
+
+    fn save_design_his(&self, his: &mut ProcessDesignHis) -> JeeflowResult<()> {
+        self.block_on(async {
+            let content_str = String::from_utf8_lossy(&his.content).to_string();
+            let result = if his.id > 0 {
+                sqlx::query(
+                    "INSERT INTO wf_process_design_his (id, process_design_id, content, create_user) VALUES (?, ?, ?, ?)"
+                )
+                .bind(his.id)
+                .bind(his.process_design_id)
+                .bind(&content_str)
+                .bind(&his.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            } else {
+                sqlx::query(
+                    "INSERT INTO wf_process_design_his (process_design_id, content, create_user) VALUES (?, ?, ?)"
+                )
+                .bind(his.process_design_id)
+                .bind(&content_str)
+                .bind(&his.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            };
+            if his.id == 0 {
+                his.id = result.last_insert_id() as i64;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_design_his(&self, design_id: i64) -> JeeflowResult<Vec<ProcessDesignHis>> {
+        self.block_on(async {
+            let rows = sqlx::query(
+                "SELECT id, process_design_id, content, create_time, create_user \
+                 FROM wf_process_design_his WHERE process_design_id = ? ORDER BY id DESC"
+            )
+            .bind(design_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(rows.into_iter().map(|r| {
+                let content: Option<String> = r.try_get("content").ok().flatten();
+                ProcessDesignHis {
+                    id: r.get("id"),
+                    process_design_id: r.get("process_design_id"),
+                    content: content.unwrap_or_default().into_bytes(),
+                    create_time: get_opt_datetime(&r, "create_time"),
+                    create_user: get_opt_string(&r, "create_user"),
+                }
+            }).collect())
+        })
+    }
+
+    fn find_surrogate_by_id(&self, surrogate_id: i64) -> JeeflowResult<Option<ProcessSurrogate>> {
+        self.block_on(async {
+            let row = sqlx::query(
+                "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
+                        create_time, create_user, update_time, update_user \
+                 FROM wf_process_surrogate WHERE id = ?"
+            )
+            .bind(surrogate_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(row.map(|r| map_surrogate(&r)))
+        })
+    }
+
+    fn save_surrogate(&self, surrogate: &mut ProcessSurrogate) -> JeeflowResult<()> {
+        self.block_on(async {
+            let result = if surrogate.id > 0 {
+                sqlx::query(
+                    "INSERT INTO wf_process_surrogate (id, process_name, operator, surrogate, start_time, end_time, enabled, create_user) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(surrogate.id)
+                .bind(&surrogate.process_name)
+                .bind(&surrogate.operator)
+                .bind(&surrogate.surrogate)
+                .bind(&surrogate.start_time)
+                .bind(&surrogate.end_time)
+                .bind(surrogate.enabled)
+                .bind(&surrogate.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            } else {
+                sqlx::query(
+                    "INSERT INTO wf_process_surrogate (process_name, operator, surrogate, start_time, end_time, enabled, create_user) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)"
+                )
+                .bind(&surrogate.process_name)
+                .bind(&surrogate.operator)
+                .bind(&surrogate.surrogate)
+                .bind(&surrogate.start_time)
+                .bind(&surrogate.end_time)
+                .bind(surrogate.enabled)
+                .bind(&surrogate.create_user)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            };
+            if surrogate.id == 0 {
+                surrogate.id = result.last_insert_id() as i64;
+            }
+            Ok(())
+        })
+    }
+
+    fn update_surrogate(&self, surrogate: &ProcessSurrogate) -> JeeflowResult<()> {
+        self.block_on(async {
+            sqlx::query(
+                "UPDATE wf_process_surrogate SET process_name=?, operator=?, surrogate=?, start_time=?, \
+                 end_time=?, enabled=?, update_user=? WHERE id=?"
+            )
+            .bind(&surrogate.process_name)
+            .bind(&surrogate.operator)
+            .bind(&surrogate.surrogate)
+            .bind(&surrogate.start_time)
+            .bind(&surrogate.end_time)
+            .bind(surrogate.enabled)
+            .bind(&surrogate.update_user)
+            .bind(surrogate.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn remove_surrogate(&self, surrogate_id: i64) -> JeeflowResult<()> {
+        self.block_on(async {
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id=?")
+                .bind(surrogate_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn page_surrogates(&self, query: &PageQuery) -> JeeflowResult<PageResult<ProcessSurrogate>> {
+        self.block_on(async {
+            let (page_num, page_size, offset) = page_bounds(query);
+            let op = query.operator.clone();
+            let count_row = sqlx::query(
+                "SELECT COUNT(*) AS cnt FROM wf_process_surrogate WHERE (? IS NULL OR operator = ?)"
+            )
+            .bind(op.clone())
+            .bind(op.clone())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let total: i64 = count_row.get("cnt");
+            let rows = sqlx::query(
+                "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
+                        create_time, create_user, update_time, update_user \
+                 FROM wf_process_surrogate \
+                 WHERE (? IS NULL OR operator = ?) \
+                 ORDER BY id DESC LIMIT ? OFFSET ?"
+            )
+            .bind(op.clone())
+            .bind(op)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_surrogate).collect()))
+        })
+    }
+
+    fn get_surrogate(&self, operator: &str, process_name: &str, time: &str) -> JeeflowResult<Option<ProcessSurrogate>> {
+        self.block_on(async {
+            let row = if time.is_empty() {
+                sqlx::query(
+                    "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
+                            create_time, create_user, update_time, update_user \
+                     FROM wf_process_surrogate \
+                     WHERE operator = ? AND process_name = ? AND enabled = 1 \
+                     ORDER BY id DESC LIMIT 1"
+                )
+                .bind(operator)
+                .bind(process_name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            } else {
+                sqlx::query(
+                    "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
+                            create_time, create_user, update_time, update_user \
+                     FROM wf_process_surrogate \
+                     WHERE operator = ? AND process_name = ? AND enabled = 1 \
+                       AND (start_time IS NULL OR start_time <= ?) \
+                       AND (end_time IS NULL OR end_time >= ?) \
+                     ORDER BY id DESC LIMIT 1"
+                )
+                .bind(operator)
+                .bind(process_name)
+                .bind(time)
+                .bind(time)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?
+            };
+            Ok(row.map(|r| map_surrogate(&r)))
+        })
+    }
+}
+
+
+
 // ═══════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_page_bounds_defaults() {
+        let q = PageQuery::new(0, 0);
+        let (n, s, o) = page_bounds(&q);
+        assert_eq!(n, 1);
+        assert_eq!(s, 20);
+        assert_eq!(o, 0);
+    }
+
+    #[test]
+    fn test_page_bounds_offset() {
+        let q = PageQuery::new(3, 10);
+        let (n, s, o) = page_bounds(&q);
+        assert_eq!((n, s, o), (3, 10, 20));
+    }
+
+    #[test]
+    fn test_task_row_instance_fields_default() {
+        let row = TaskRow::default();
+        assert!(row.instance_variable.is_none());
+        assert!(row.instance_create_time.is_none());
+    }
+
+
     use super::*;
 
     #[test]

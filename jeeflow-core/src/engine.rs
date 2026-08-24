@@ -127,7 +127,7 @@ impl JeeflowEngineImpl {
     /// Generate autoGenTitle: "{realName}的{displayName}-{time}"
     fn gen_auto_title(args: &FlowData, display_name: &str) -> String {
         let real_name = args.get_str("u_realName").unwrap_or("未知");
-        let now = "NOW"; // simplified; facade layer provides real time
+        let now = crate::model::current_time_str();
         format!("{}的{}-{}", real_name, display_name, now)
     }
 

@@ -147,11 +147,17 @@ fn flows_dir() -> PathBuf {
     if let Ok(d) = std::env::var("JEFFLOW_FLOWS_DIR") {
         return PathBuf::from(d);
     }
+    // Docker 镜像约定挂载/打包路径
+    let docker = PathBuf::from("/app/flows");
+    if docker.is_dir() {
+        return docker;
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../jeeflow-java/jeeflow-core/src/test/resources/flows")
 }
 
 /// 加载共享 LogicFlow JSON（id=1..N 文件名排序），与其他语言 demo 对齐。
+/// 同时写入 define + design/his，使 listByType 与发起页契约完整。
 fn load_seed(repo: &MemoryRepository) {
     let dir = flows_dir();
     let mut files: Vec<_> = match std::fs::read_dir(&dir) {
@@ -190,22 +196,51 @@ fn load_seed(repo: &MemoryRepository) {
             .and_then(|v| v.as_str())
             .unwrap_or("approval")
             .to_string();
+        let now = jeeflow_core::model::current_time_str();
         let mut define = ProcessDefine {
             id: (i + 1) as i64,
-            name,
+            name: name.clone(),
             display_name: display_name.clone(),
-            define_type,
+            define_type: define_type.clone(),
             state: 1,
-            content,
+            content: content.clone(),
             version: 1,
-            create_time: None,
-            create_user: None,
+            create_time: Some(now.clone()),
+            create_user: Some("system".into()),
             update_time: None,
             update_user: None,
         };
         if let Err(e) = repo.save_define(&mut define) {
-            eprintln!("[seed] save {}: {}", define.display_name, e);
+            eprintln!("[seed] save define {}: {}", display_name, e);
             continue;
+        }
+        // design + his（listByType / 设计器回显）
+        let mut design = ProcessDesign {
+            id: 0,
+            name: name.clone(),
+            display_name: display_name.clone(),
+            design_type: define_type,
+            icon: Some("doc".into()),
+            is_deployed: 1,
+            remark: Some(format!("v{}", define.version)),
+            create_time: Some(now.clone()),
+            create_user: Some("system".into()),
+            update_time: None,
+            update_user: None,
+        };
+        if let Err(e) = repo.save_design(&mut design) {
+            eprintln!("[seed] save design {}: {}", display_name, e);
+        } else {
+            let mut his = ProcessDesignHis {
+                id: 0,
+                process_design_id: design.id,
+                content: content.clone(),
+                create_time: Some(now.clone()),
+                create_user: Some("system".into()),
+            };
+            if let Err(e) = repo.save_design_his(&mut his) {
+                eprintln!("[seed] save design his {}: {}", display_name, e);
+            }
         }
         println!("  loaded: {} {}", define.id, display_name);
     }
@@ -286,12 +321,20 @@ async fn api_stats(req: &mut Request, res: &mut Response) {
         .unwrap_or_else(|| "user1".into());
     let state = STATE.lock().unwrap();
     let todo_count = state.facade.repo().count_todo_tasks(&operator).unwrap_or(0);
+    let mut q = jeeflow_core::model::PageQuery::new(1, 1);
+    q.operator = Some(operator.clone());
+    let instance_count = state
+        .facade
+        .repo()
+        .page_instances(&q)
+        .map(|p| p.record_count)
+        .unwrap_or(0);
     res.render(salvo::prelude::Json(json!({
         "code": 0,
         "msg": "成功",
         "data": {
             "todoCount": todo_count,
-            "instanceCount": 0
+            "instanceCount": instance_count
         }
     })));
 }

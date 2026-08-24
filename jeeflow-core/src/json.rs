@@ -176,6 +176,21 @@ struct JsonParser<'a> {
     pos: usize,
 }
 
+/// UTF-8 首字节 → 码点字节宽度（非法首字节按 1 处理，后续 from_utf8 会报错）
+fn utf8_char_width(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
 impl<'a> JsonParser<'a> {
     fn new(input: &'a str) -> Self {
         JsonParser {
@@ -266,7 +281,26 @@ impl<'a> JsonParser<'a> {
                         _ => return Err("Invalid escape".to_string()),
                     }
                 }
-                Some(c) => s.push(c as char),
+                // UTF-8 多字节：按首字节长度一次读完整码点（禁止 `c as char`，否则中文乱码）
+                Some(c) => {
+                    let width = utf8_char_width(c);
+                    if width == 1 {
+                        s.push(c as char);
+                    } else {
+                        let start = self.pos - 1;
+                        let end = start + width;
+                        if end > self.chars.len() {
+                            return Err("Invalid UTF-8: truncated multi-byte sequence".into());
+                        }
+                        let ch = std::str::from_utf8(&self.chars[start..end])
+                            .map_err(|_| "Invalid UTF-8 in string".to_string())?
+                            .chars()
+                            .next()
+                            .ok_or_else(|| "Invalid UTF-8 in string".to_string())?;
+                        s.push(ch);
+                        self.pos = end;
+                    }
+                }
             }
         }
     }
@@ -566,6 +600,19 @@ mod tests {
         map.insert("k".to_string(), JsonValue::Str("v".to_string()));
         let fd = FlowData::from_map(map);
         assert_eq!(fd.get_str("k"), Some("v"));
+    }
+
+    #[test]
+    fn test_parse_utf8_chinese_string() {
+        // 回归：按字节 `c as char` 会把「上级审批」打成 latin1 乱码
+        let val = parse_json(r#"{"value":"上级审批"}"#).unwrap();
+        assert_eq!(val.get_str("value"), Some("上级审批"));
+        let val2 = parse_json(r#"{"displayName":"简单审批流程","text":{"value":"发起申请"}}"#).unwrap();
+        assert_eq!(val2.get_str("displayName"), Some("简单审批流程"));
+        assert_eq!(
+            val2.get("text").and_then(|t| t.get_str("value")),
+            Some("发起申请")
+        );
     }
 
     #[test]

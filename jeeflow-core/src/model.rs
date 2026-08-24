@@ -226,7 +226,7 @@ impl ProcessInstance {
             expire_time: None,
             variables,
             tasks: Vec::new(),
-            create_time: None,
+            create_time: Some(current_time_str()),
             create_user: Some(operator.to_string()),
             update_time: None,
             update_user: None,
@@ -361,7 +361,7 @@ impl ProcessInstance {
             form_key,
             parent_task_id,
             variables: FlowData::new(),
-            create_time: None,
+            create_time: Some(current_time_str()),
             create_user: Some(operator.to_string()),
             update_time: None,
             update_user: None,
@@ -712,6 +712,10 @@ pub struct TaskRow {
     pub instance_state: Option<i32>,
     pub instance_operator: Option<String>,
     pub business_no: Option<String>,
+    /// Instance variable JSON (pi.variable) — Java TaskRow.instanceVariable parity
+    pub instance_variable: Option<String>,
+    /// Instance create_time (pi.create_time) — Java TaskRow.instanceCreateTime parity
+    pub instance_create_time: Option<String>,
     // Joined from define
     pub define_name: Option<String>,
     pub define_display_name: Option<String>,
@@ -770,12 +774,35 @@ pub struct UserInfo {
 // Utility
 // ═══════════════════════════════════════════════════════
 
-/// Current time as string (yyyy-MM-dd HH:mm:ss).
+/// Current time as string (yyyy-MM-dd HH:mm:ss, UTC).
+/// Core stays chrono-free; UTC is enough for demo/契约展示（与占位符 NOW() 不同，UI 可解析）。
 pub fn current_time_str() -> String {
-    // Core has no chrono dependency; use a placeholder.
-    // The facade/repository layer provides real timestamps.
-    // For engine core, we use a simple approach.
-    "NOW()".to_string()
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format_unix_utc(secs)
+}
+
+/// Format unix seconds (UTC) as `yyyy-MM-dd HH:mm:ss`.
+fn format_unix_utc(secs: i64) -> String {
+    // civil_from_days (Howard Hinnant) — days since 1970-01-01
+    let z = secs.div_euclid(86400) + 719468;
+    let era = if z >= 0 { z } else { z - 146096 }.div_euclid(146097);
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let tod = secs.rem_euclid(86400) as u32;
+    let hh = tod / 3600;
+    let mm = (tod % 3600) / 60;
+    let ss = tod % 60;
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, hh, mm, ss)
 }
 
 /// Format time to spec format (yyyy-MM-dd HH:mm:ss).
@@ -884,6 +911,19 @@ mod tests {
         assert_eq!(to_camel_case("process_instance_id"), "processInstanceId");
         assert_eq!(to_camel_case("task_name"), "taskName");
         assert_eq!(to_camel_case("id"), "id");
+    }
+
+    #[test]
+    fn test_current_time_str_format() {
+        let t = current_time_str();
+        assert_eq!(t.len(), 19, "expected yyyy-MM-dd HH:mm:ss, got {t}");
+        assert_eq!(&t[4..5], "-");
+        assert_eq!(&t[7..8], "-");
+        assert_eq!(&t[10..11], " ");
+        assert_eq!(&t[13..14], ":");
+        assert_eq!(&t[16..17], ":");
+        assert_eq!(format_unix_utc(0), "1970-01-01 00:00:00");
+        assert_eq!(format_unix_utc(1_704_067_200), "2024-01-01 00:00:00");
     }
 
     #[test]
@@ -1030,6 +1070,7 @@ mod tests {
     fn test_current_time_str() {
         let t = current_time_str();
         assert!(!t.is_empty());
-        assert_eq!(t, "NOW()");
+        assert_ne!(t, "NOW()");
+        assert_eq!(t.len(), 19);
     }
 }
