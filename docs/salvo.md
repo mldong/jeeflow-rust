@@ -62,8 +62,7 @@ login-only 下拉 / 字典 / 菜单接口对齐 goframe `IgnoreAuthList`：
 ## 部署与验收
 
 - 一键部署：`mldong-website/public/deploy/mldong-salvo-jeeflow/`（:28080 前端 / :28100 API /
-  :28406 MySQL / :28579 Redis；compose 后端 image 参数化 `${BACKEND_IMAGE:-ACR 生产 tag}`，
-  需 `seccomp:unconfined`——160 老 runc 拦新 glibc 系统调用）
-- 镜像构建：160 容器内 cargo 编译（base `mldong/rust:1.97.1`，引擎走 crates.io，
-  镜像与发布产物严格一致），通道 B `bash scripts/build-jeeflow-image.sh salvo`
-- 验收（2026-08-25，镜像 #12）：L0–L2 契约 19/19 + L3 端到端 14 过 / 1 固定 skip（S12）/ 0 败
+  :28406 MySQL / :28579 Redis；compose 含 `seccomp:unconfined`——较旧 Docker/runc 的默认
+  seccomp 策略会拦新版 glibc 系统调用）
+- 镜像构建：容器内 cargo 编译（base `mldong/rust:1.97.1`，引擎走 crates.io，镜像与发布产物严格一致）
+- 验收（2026-08-25）：L0–L2 契约 19/19 + L3 端到端 14 过 / 1 固定 skip（S12）/ 0 败

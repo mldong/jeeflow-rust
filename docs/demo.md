@@ -26,10 +26,10 @@ cargo run -p jeeflow-demo-salvo
 
 ## 线上演示
 
-- **开源演示站** [jeeflow-demo.mldong.com](https://jeeflow-demo.mldong.com) 右上角可切换 Rust
-  后端（端口 16085 → 容器内 8091，`seccomp:unconfined`）
-- tag `v*.*.*` 触发 `demo-deploy.yml`：构建 `jeeflow-rust-demo` 镜像 → SSH 部署演示站
-  （`DEPLOY_HOST` secret），与引擎发版（`release.yml` 推 crates.io）分离
+- **开源演示站** [jeeflow-demo.mldong.com](https://jeeflow-demo.mldong.com) 右上角可切换
+  Rust 后端（六语言后端常驻：Java / Go / Python / Node.js / PHP / Rust）
+- tag `v*.*.*` 触发 `demo-deploy.yml`：构建 `jeeflow-rust-demo` 镜像 → 部署演示站，
+  与引擎发版（`release.yml` 推 crates.io）分离
 
 ## 快速验证
 
