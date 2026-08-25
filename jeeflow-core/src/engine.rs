@@ -197,6 +197,9 @@ impl JeeflowEngineImpl {
                 }
             }
             NodeType::Task | NodeType::Custom => {
+                // 任务创建不触发节点拦截器（对齐 Java CreateTaskHandler / Go executeNode：
+                // 创建任务 ≠ 节点执行完成）；persist 等 post 拦截器在任务**被执行**时
+                // 由 execute_task_async 显式触发（1.8.0 SYNC 同步演进）
                 self.create_task_with_assignment(exec, node)?;
             }
             NodeType::Decision => {
@@ -480,12 +483,15 @@ impl JeeflowEngineImpl {
 
     /// Fire pre-interceptors.
     fn fire_pre_interceptors(&self, _exec: &mut Execution) -> JeeflowResult<()> {
-        // Interceptors are called in order
+        // Pre-interceptors reserved; PersistPostInterceptor runs on post only.
         Ok(())
     }
 
-    /// Fire post-interceptors.
-    fn fire_post_interceptors(&self, _exec: &mut Execution) -> JeeflowResult<()> {
+    /// Fire post-interceptors (sorted by order).
+    fn fire_post_interceptors(&self, exec: &mut Execution) -> JeeflowResult<()> {
+        for interceptor in &self.ctx.interceptors {
+            interceptor.intercept(exec)?;
+        }
         Ok(())
     }
 
@@ -604,15 +610,12 @@ impl JeeflowEngineImpl {
         // 7. Save instance (sync)
         self.repo().save_instance(&mut instance)?;
 
-        // 8. Handle CC actors (sync)
-        if let Some(cc_actors) = full_args.get_str("f_ccActors") {
-            let actors: Vec<String> = cc_actors.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !actors.is_empty() {
-                self.repo().create_cc_instance(instance.instance_id, operator, &actors)?;
-            }
+        // 8. Handle CC actors (sync) — 对齐 Go facade.go:203（issues/56 E28）：
+        // vben 发起页"抄送给"是多选 ApiSelect，提交 JSON 数组；也兼容逗号分隔字符串。
+        // 旧版仅 get_str+split，数组走 get_str=None → cc 实例从不创建（L3 S6）。
+        let cc_actors = parse_cc_actors(full_args.inner().get("f_ccActors"));
+        if !cc_actors.is_empty() {
+            self.repo().create_cc_instance(instance.instance_id, operator, &cc_actors)?;
         }
 
         // 9. Execute from start node
@@ -658,7 +661,10 @@ impl JeeflowEngineImpl {
         let model = ModelParser::parse(&define.content_str())?;
 
         // 4. Build args + user info (sync)
-        let mut full_args = FlowData::new();
+        // resume 语义对齐 Go mergeVars(args, inst.Variables)：以实例已持久化变量为底、
+        // 本次提交覆盖。否则发起时的 f_* 表单字段（如指定审批人 f_approver）在 resume 后
+        // 丢失，FormFieldAssigneeHandler 等下游读 exec.args 拿不到（L3 S11-B）。
+        let mut full_args = instance.variables.clone();
         full_args.merge(args);
         self.add_user_info(&mut full_args, operator);
 
@@ -697,6 +703,14 @@ impl JeeflowEngineImpl {
         // 9. Build execution
         let mut exec = Execution::new(instance, model, define, operator, full_args);
         exec.process_task = Some(task.clone());
+
+        // 9.5. 任务完成节点自身的后置拦截器（对齐 Go ExecuteProcessTask 1.8.0 SYNC 同步演进）：
+        // 此时 exec.args 携带本次提交的 f_/tf_ 字段（已并入 instance.variables），
+        // persist 按被完成任务的节点判定字段权限/状态字段。
+        if let Some(ref cur) = node {
+            exec.current_node = Some(cur.clone());
+            self.fire_post_interceptors(&mut exec)?;
+        }
 
         // 10. Countersign gate check (issues/94)
         let is_countersign = node.as_ref().map(|n| n.is_countersign()).unwrap_or(false);
@@ -849,7 +863,9 @@ impl JeeflowEngineImpl {
             .ok_or(JeeflowError::DefineNotFound(instance.define_id))?;
         let model = ModelParser::parse(&define.content_str())?;
 
-        let mut full_args = FlowData::new();
+        // resume 语义对齐 Go mergeVars(args, inst.Variables)：实例已持久化变量为底、
+        // 本次提交覆盖（详见 execute_task_async 注释，L3 S11-B）。
+        let mut full_args = instance.variables.clone();
         full_args.merge(args);
         self.add_user_info(&mut full_args, operator);
 
@@ -912,7 +928,8 @@ impl JeeflowEngineImpl {
         let _define = self.repo().find_define_by_id(instance.define_id)?
             .ok_or(JeeflowError::DefineNotFound(instance.define_id))?;
 
-        let mut full_args = FlowData::new();
+        // resume 语义对齐 Go mergeVars（同 execute_task_async，三路径保持一致）。
+        let mut full_args = instance.variables.clone();
         full_args.merge(args);
         self.add_user_info(&mut full_args, operator);
 
@@ -961,6 +978,35 @@ impl JeeflowEngineImpl {
         -> JeeflowResult<Vec<ProcessTask>> {
         self.execute_and_jump_async(task_id, operator, args, None).await
     }
+}
+
+/// 解析发起时抄送人（对齐 Go facade.go:203 issues/56 E28）：
+/// 支持 JSON 数组（vben 多选 ApiSelect 提交）与逗号分隔字符串两种形态。
+fn parse_cc_actors(v: Option<&JsonValue>) -> Vec<String> {
+    let Some(v) = v else { return Vec::new(); };
+    let mut out: Vec<String> = match v {
+        // 数组：逐项取原始标量（对齐 Go fmt.Sprintf("%v", a)，兼容字符串/数字 id）。
+        // 注意不能用 JsonValue 的 Display——它走 to_json_string 会给字符串加引号。
+        JsonValue::Array(items) => items
+            .iter()
+            .filter(|it| !it.is_null())
+            .filter_map(|it| match it {
+                JsonValue::Str(s) => Some(s.clone()),
+                JsonValue::Number(n) => Some(format!("{}", *n as i64)),
+                JsonValue::Bool(b) => Some(b.to_string()),
+                _ => None,
+            })
+            .collect(),
+        // 逗号分隔字符串
+        JsonValue::Str(s) => s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    out.retain(|s| !s.is_empty());
+    out
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1725,5 +1771,85 @@ mod tests {
         let userA_done = all_tasks.iter().find(|t| t.task_id == userA_task.task_id).unwrap();
         assert_eq!(userA_done.variables.get_str("countersignDisagreeFlag").unwrap(), "1",
             "c29: flag should be on task variables");
+    }
+
+    /// c30: 发起时抄送解析 parse_cc_actors（L3 S6）——三形态：
+    /// JSON 数组（vben 多选 ApiSelect）、逗号分隔字符串、空/缺失。
+    #[test]
+    fn test_parse_cc_actors() {
+        use crate::json::JsonValue;
+        // ① 正向：JSON 数组（vben 多选提交）
+        let arr = JsonValue::Array(vec![
+            JsonValue::Str("2086772715431137280".into()),
+            JsonValue::Str("1686404946814533633".into()),
+        ]);
+        assert_eq!(
+            parse_cc_actors(Some(&arr)),
+            vec!["2086772715431137280".to_string(), "1686404946814533633".to_string()]
+        );
+        // ② 兼容：逗号分隔字符串（含空格/空段）
+        let s = JsonValue::Str(" u1 , u2 ,, ".into());
+        assert_eq!(parse_cc_actors(Some(&s)), vec!["u1".to_string(), "u2".to_string()]);
+        // ③ 负向：null / 缺失 / 空数组 → 空
+        assert!(parse_cc_actors(None).is_empty());
+        assert!(parse_cc_actors(Some(&JsonValue::Null)).is_empty());
+        assert!(parse_cc_actors(Some(&JsonValue::Array(vec![]))).is_empty());
+        assert!(parse_cc_actors(Some(&JsonValue::Str("  ".into()))).is_empty());
+    }
+
+    /// c31: resume 时 FormFieldAssignee 从发起时 f_* 变量取人（L3 S11-B 回归）。
+    /// 流程 start → apply(applicant) → approver(FormFieldAssignee) → end。
+    /// 发起时带 f_approver=u0011；apply 审批后 resume，approver 节点须按
+    /// exec.args 里的 f_approver 建任务给 u0011。修复前 resume 的 exec.args
+    /// 不含 f_approver（未 merge instance.variables）→ 节点被跳过 → 无任务。
+    #[tokio::test]
+    async fn test_c31_form_field_assignee_on_resume() {
+        use crate::interceptor::register_builtin_assignment_handlers;
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_user_provider(Arc::new(ComplianceUserProvider))
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        register_builtin_assignment_handlers(&mut ctx);
+        let engine = JeeflowEngineImpl::new(ctx);
+
+        let flow = r#"{
+            "name": "s11b", "displayName": "S11B", "type": "approval",
+            "nodes": [
+                {"id": "start", "type": "snaker:start", "text": {"value": "Start"}},
+                {"id": "apply", "type": "snaker:task", "text": {"value": "Apply"},
+                 "properties": {"assignee": "applicant"}},
+                {"id": "approver", "type": "snaker:task", "text": {"value": "Approver"},
+                 "properties": {"assignmentHandler": "com.mldong.jeeflow.interceptor.impl.FormFieldAssigneeHandler"}},
+                {"id": "end", "type": "snaker:end", "text": {"value": "End"}}
+            ],
+            "edges": [
+                {"id": "e1", "sourceNodeId": "start", "targetNodeId": "apply"},
+                {"id": "e2", "sourceNodeId": "apply", "targetNodeId": "approver"},
+                {"id": "e3", "sourceNodeId": "approver", "targetNodeId": "end"}
+            ]
+        }"#.to_string();
+        let did = save_define(&repo, "s11b", &flow);
+
+        // 发起带 f_approver
+        let mut args = FlowData::new();
+        args.insert_str("f_approver", "u0011");
+        let inst = engine.start_async(did, "applicant", &args).await.unwrap();
+
+        // apply 节点 doing（applicant）→ 审批
+        let tasks = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
+        let apply = tasks
+            .iter()
+            .find(|t| t.actor_ids.contains(&"applicant".to_string()))
+            .expect("c31: apply task for applicant");
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+
+        // resume 后 approver 节点须按 f_approver 建任务给 u0011
+        let after = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
+        assert!(
+            after.iter().any(|t| t.actor_ids.iter().any(|a| a == "u0011")),
+            "c31: approver task should be created for u0011 from f_approver on resume; doing={:?}",
+            after.iter().map(|t| (t.task_name.clone(), t.actor_ids.clone())).collect::<Vec<_>>()
+        );
     }
 }

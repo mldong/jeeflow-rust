@@ -9,7 +9,6 @@ use jeeflow_core::error::{JeeflowError, JeeflowResult};
 use jeeflow_core::json::{FlowData, JsonValue};
 use jeeflow_core::model::*;
 use jeeflow_core::spi::*;
-use jeeflow_persist::MetaTableReader;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -716,10 +715,38 @@ fn args_to_flow_data(args: &HashMap<String, Json>) -> FlowData {
             Json::Number(n) => { fd.insert_i64(k, n.as_i64().unwrap_or(0)); }
             Json::Bool(b) => { fd.insert(k.clone(), JsonValue::Bool(*b)); }
             Json::Null => {}
-            _ => { fd.insert_str(k, &v.to_string()); }
+            // 数组/对象原样透传（对齐 Go map[string]interface{}）：
+            // vben 多选 ApiSelect 提交 JSON 数组（如发起抄送 f_ccActors），
+            // 旧版落兜底分支被 v.to_string() 字符串化成 `"[...]"`，
+            // 引擎抄送人变成字面量 `["<id>"]`（L3 S6）。
+            Json::Array(items) => {
+                fd.insert(k.clone(), JsonValue::Array(items.iter().map(json_to_value).collect()));
+            }
+            Json::Object(obj) => {
+                fd.insert(
+                    k.clone(),
+                    JsonValue::Object(
+                        obj.iter().map(|(a, b)| (a.clone(), json_to_value(b))).collect(),
+                    ),
+                );
+            }
         }
     }
     fd
+}
+
+/// serde_json::Value → 引擎 JsonValue（递归，保留嵌套结构）。
+fn json_to_value(v: &Json) -> JsonValue {
+    match v {
+        Json::String(s) => JsonValue::Str(s.clone()),
+        Json::Number(n) => JsonValue::Number(n.as_f64().unwrap_or(0.0)),
+        Json::Bool(b) => JsonValue::Bool(*b),
+        Json::Null => JsonValue::Null,
+        Json::Array(items) => JsonValue::Array(items.iter().map(json_to_value).collect()),
+        Json::Object(obj) => JsonValue::Object(
+            obj.iter().map(|(a, b)| (a.clone(), json_to_value(b))).collect(),
+        ),
+    }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1235,32 +1262,26 @@ impl JeeflowFacade {
             .ok_or(JeeflowError::DefineNotFound(inst.define_id))?;
         let table_name = resolve_rel_table_name(&define.content_str())
             .ok_or(JeeflowError::Business("流程定义未配置 relTableName".into()))?;
-        // MetaTableReader 由集成方注册（issues/23）；未注册明确报错，禁止把 vars 当成功返回
+        // BizDataReader 由集成方注册（issues/30）；未注册明确报错，禁止把 vars 当成功返回
         let reader = self
             .engine
             .context()
-            .find_by_name("metaTableReader")
+            .biz_data_reader
+            .as_ref()
             .ok_or(JeeflowError::Business(
-                "业务数据读取器未注册（ServiceContext.put(\"metaTableReader\", new MetaTableReader(...))，需引入 jeeflow-persist）"
+                "业务数据读取器未注册（ServiceContext.with_biz_data_reader(...)，需集成层注入 SqlxBizDataReader）"
                     .into(),
             ))?;
-        // 尝试 downcast 到 jeeflow-persist MetaTableReader（InMemory / 自定义）
-        if let Some(mtr) = reader.downcast_ref::<jeeflow_persist::InMemoryMetaTableReader>() {
-            match mtr.read_by_id(&table_name, id)? {
-                Some(row) => {
-                    let mut map = serde_json::Map::new();
-                    for (k, v) in row {
-                        map.insert(k, json_value_to_serde(&v));
-                    }
-                    return Ok(Json::Object(map));
+        match reader.read_by_process_instance(&table_name, id)? {
+            Some(row) => {
+                let mut map = serde_json::Map::new();
+                for (k, v) in row {
+                    map.insert(k, json_value_to_serde(&v));
                 }
-                None => return Ok(Json::Null),
+                Ok(Json::Object(map))
             }
+            None => Ok(Json::Null),
         }
-        Err(JeeflowError::Business(format!(
-            "业务数据读取失败: 已注册 metaTableReader 但无法按表 {} / 实例 {} 读取（需实现 MetaTableReader）",
-            table_name, id
-        )))
     }
 
     fn process_instance_create_cc(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -3253,5 +3274,33 @@ mod tests {
         assert_eq!(camel_to_snake("displayName"), "display_name");
         assert_eq!(camel_to_snake("name"), "name");
         assert_eq!(camel_to_snake("processInstanceId"), "process_instance_id");
+    }
+
+    /// c9: args_to_flow_data 数组/对象原样透传（L3 S6 回归）。
+    /// vben 多选 ApiSelect 提交 JSON 数组 f_ccActors=["<id>"]；旧版兜底分支
+    /// 用 v.to_string() 字符串化成 `"[...]"`，抄送人变成字面量。
+    #[test]
+    fn test_c9_args_array_passthrough() {
+        let mut args = HashMap::new();
+        args.insert(
+            "f_ccActors".to_string(),
+            json!(["1711661958608584706", "1686404946814533633"]),
+        );
+        args.insert("nested".to_string(), json!({"a": 1, "b": "x"}));
+        args.insert("reason".to_string(), json!("hello"));
+        let fd = args_to_flow_data(&args);
+        // 数组 → JsonValue::Array（不是字符串 `"[...]"`）
+        match fd.inner().get("f_ccActors") {
+            Some(JsonValue::Array(items)) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].as_str(), Some("1711661958608584706"));
+                assert_eq!(items[1].as_str(), Some("1686404946814533633"));
+            }
+            other => panic!("c9: f_ccActors should be Array, got {:?}", other.is_some()),
+        }
+        // 对象 → JsonValue::Object
+        assert!(matches!(fd.inner().get("nested"), Some(JsonValue::Object(_))));
+        // 标量不受影响
+        assert_eq!(fd.get_str("reason"), Some("hello"));
     }
 }

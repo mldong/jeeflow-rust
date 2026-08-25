@@ -7,6 +7,7 @@ use jeeflow_core::model::*;
 use jeeflow_core::spi::*;
 use sqlx::mysql::MySqlPool;
 use sqlx::Row;
+use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════
 // MySQL DDL — 8 tables (spec/08)
@@ -17,155 +18,185 @@ pub fn schema_mysql() -> &'static str {
     MYSQL_SCHEMA
 }
 
+// 注意：列名与表名必须与 mldong-plus 规范 schema 完全一致（mldong 框架 DB 镜像 /
+// Java 参考实现 schema-mysql.sql）：wf_process_task 用 task_state/operator/task_parent_id，
+// wf_process_define/design 用 type，抄送表叫 wf_process_cc_instance。
+// init_schema 仅用于全新库 bootstrap；既有规范表因 IF NOT EXISTS 直接跳过，
+// 严禁用 ALTER ADD 补列的方式"对齐"（历史坑：曾污染共享 3306 测试库导致引擎自测假通过）。
 pub const MYSQL_SCHEMA: &str = r#"
 -- 1. 流程定义表
 CREATE TABLE IF NOT EXISTS wf_process_define (
-    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
-    name VARCHAR(100) NOT NULL COMMENT '流程名称（英文，唯一标识）',
-    display_name VARCHAR(200) NOT NULL COMMENT '显示名称',
-    define_type VARCHAR(50) DEFAULT 'approval' COMMENT '流程类型',
-    state INT NOT NULL DEFAULT 1 COMMENT '状态: 0=禁用, 1=启用',
-    content LONGTEXT COMMENT '流程模型JSON（LogicFlow格式）',
-    version INT NOT NULL DEFAULT 1 COMMENT '版本号',
-    create_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    create_user VARCHAR(50) COMMENT '创建人',
-    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    update_user VARCHAR(50) COMMENT '更新人',
+    id BIGINT NOT NULL COMMENT '主键',
+    name VARCHAR(64) NOT NULL COMMENT '唯一编码',
+    display_name VARCHAR(100) NOT NULL COMMENT '显示名称',
+    type VARCHAR(32) NULL COMMENT '流程类型',
+    state INT NULL COMMENT '流程是否可用(1可用、0不可用)',
+    content BLOB NULL COMMENT '流程模型定义',
+    version INT NULL COMMENT '版本',
+    create_time DATETIME(3) NULL COMMENT '创建时间',
+    create_user VARCHAR(64) NULL COMMENT '创建用户',
+    update_time DATETIME(3) NULL COMMENT '更新时间',
+    update_user VARCHAR(64) NULL COMMENT '更新用户',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_name_version (name, version)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程定义表';
+    KEY idx_process_define_name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程定义';
 
 -- 2. 流程实例表
 CREATE TABLE IF NOT EXISTS wf_process_instance (
-    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
-    parent_id BIGINT DEFAULT NULL COMMENT '父流程实例ID（子流程）',
-    process_define_id BIGINT NOT NULL COMMENT '流程定义ID',
-    state INT NOT NULL DEFAULT 10 COMMENT '状态: 10=进行中, 20=已完成, 30=已撤回, 40=终止, 45=拒绝, 50=挂起, 99=废弃',
-    parent_node_name VARCHAR(100) DEFAULT NULL COMMENT '父流程节点名称',
-    business_no VARCHAR(100) DEFAULT NULL COMMENT '业务编号',
-    operator VARCHAR(50) NOT NULL COMMENT '发起人',
-    expire_time DATETIME DEFAULT NULL COMMENT '过期时间',
-    variable TEXT COMMENT '流程变量（JSON）',
-    create_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    create_user VARCHAR(50) COMMENT '创建人',
-    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    update_user VARCHAR(50) COMMENT '更新人',
+    id BIGINT NOT NULL COMMENT '主键',
+    parent_id BIGINT NULL COMMENT '父流程实例ID(子流程)',
+    process_define_id BIGINT NULL COMMENT '流程定义ID',
+    state INT NULL COMMENT '实例状态(10进行中、20已完成、45已驳回、99废弃)',
+    parent_node_name VARCHAR(100) NULL COMMENT '父流程依赖的节点名称',
+    business_no VARCHAR(64) NULL COMMENT '业务编号',
+    operator VARCHAR(64) NULL COMMENT '流程发起人',
+    expire_time DATETIME(3) NULL COMMENT '期望完成时间',
+    variable TEXT NULL COMMENT '附属变量json存储',
+    create_time DATETIME(3) NULL COMMENT '创建时间',
+    create_user VARCHAR(64) NULL COMMENT '创建用户',
+    update_time DATETIME(3) NULL COMMENT '更新时间',
+    update_user VARCHAR(64) NULL COMMENT '更新用户',
     PRIMARY KEY (id),
-    KEY idx_define_id (process_define_id),
-    KEY idx_operator (operator),
-    KEY idx_state (state)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程实例表';
+    KEY idx_process_instance_pfid (process_define_id),
+    KEY idx_process_instance_operator (operator)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程实例';
 
 -- 3. 流程任务表
 CREATE TABLE IF NOT EXISTS wf_process_task (
-    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+    id BIGINT NOT NULL COMMENT '主键',
     process_instance_id BIGINT NOT NULL COMMENT '流程实例ID',
-    task_name VARCHAR(100) NOT NULL COMMENT '任务名称（节点ID）',
-    display_name VARCHAR(200) COMMENT '显示名称',
-    task_type INT DEFAULT 0 COMMENT '任务类型: 0=主办, 1=协办, 2=记录',
-    perform_type INT DEFAULT 0 COMMENT '参与类型: 0=普通, 1=会签',
-    state INT NOT NULL DEFAULT 10 COMMENT '状态: 10=进行中, 20=已完成, 30=已撤回, 40=终止, 50=挂起, 99=废弃',
-    actor_id VARCHAR(50) DEFAULT NULL COMMENT '实际处理人',
-    finish_time DATETIME DEFAULT NULL COMMENT '完成时间',
-    expire_time DATETIME DEFAULT NULL COMMENT '过期时间',
-    form_key VARCHAR(100) DEFAULT NULL COMMENT '表单key',
-    parent_task_id BIGINT DEFAULT NULL COMMENT '父任务ID',
-    variable TEXT COMMENT '任务变量（JSON）',
-    create_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    create_user VARCHAR(50) COMMENT '创建人',
-    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    update_user VARCHAR(50) COMMENT '更新人',
+    task_name VARCHAR(100) NOT NULL COMMENT '任务名称编码',
+    display_name VARCHAR(100) NOT NULL COMMENT '任务显示名称',
+    task_type INT NULL COMMENT '任务类型(0主办、1协办)',
+    perform_type INT NULL COMMENT '参与类型(0普通、1会签)',
+    task_state INT NULL COMMENT '任务状态(10进行中、20已完成、99废弃)',
+    operator VARCHAR(64) NULL COMMENT '任务处理人',
+    finish_time DATETIME(3) NULL COMMENT '任务完成时间',
+    expire_time DATETIME(3) NULL COMMENT '任务期待完成时间',
+    form_key VARCHAR(100) NULL COMMENT '任务处理表单KEY',
+    task_parent_id BIGINT NULL COMMENT '父任务ID',
+    variable TEXT NULL COMMENT '附属变量json存储',
+    create_time DATETIME(3) NULL COMMENT '创建时间',
+    create_user VARCHAR(64) NULL COMMENT '创建用户',
+    update_time DATETIME(3) NULL COMMENT '更新时间',
+    update_user VARCHAR(64) NULL COMMENT '更新用户',
     PRIMARY KEY (id),
-    KEY idx_instance_id (process_instance_id),
-    KEY idx_actor_id (actor_id),
-    KEY idx_state (state)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程任务表';
+    KEY idx_process_task_piid (process_instance_id),
+    KEY idx_process_task_name (task_name),
+    KEY idx_process_task_operator (operator)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程任务';
 
 -- 4. 任务参与者表
 CREATE TABLE IF NOT EXISTS wf_process_task_actor (
-    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+    id BIGINT NOT NULL COMMENT '主键',
     process_task_id BIGINT NOT NULL COMMENT '任务ID',
-    actor_id VARCHAR(50) NOT NULL COMMENT '参与者ID',
-    create_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    create_user VARCHAR(50) COMMENT '创建人',
+    actor_id VARCHAR(64) NOT NULL COMMENT '参与者ID',
+    create_time DATETIME(3) NULL COMMENT '创建时间',
+    create_user VARCHAR(64) NULL COMMENT '创建用户',
     PRIMARY KEY (id),
-    KEY idx_task_id (process_task_id),
-    KEY idx_actor_id (actor_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='任务参与者表';
+    KEY idx_process_task_actor_ptid (process_task_id),
+    KEY idx_process_task_actor_aid (actor_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='任务参与人关系';
 
 -- 5. 抄送实例表
-CREATE TABLE IF NOT EXISTS wf_cc_instance (
-    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+CREATE TABLE IF NOT EXISTS wf_process_cc_instance (
+    id BIGINT NOT NULL COMMENT '主键',
     process_instance_id BIGINT NOT NULL COMMENT '流程实例ID',
-    actor_id VARCHAR(50) NOT NULL COMMENT '抄送人',
-    state INT DEFAULT 0 COMMENT '状态: 0=未读, 1=已读',
-    create_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    create_user VARCHAR(50) COMMENT '创建人',
-    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    update_user VARCHAR(50) COMMENT '更新人',
+    actor_id VARCHAR(64) NOT NULL COMMENT '被抄送人ID',
+    state INT NULL DEFAULT 0 COMMENT '抄送状态(1已读、0未读)',
+    create_time DATETIME(3) NULL COMMENT '创建时间',
+    create_user VARCHAR(64) NULL COMMENT '创建用户',
+    update_time DATETIME(3) NULL COMMENT '更新时间',
+    update_user VARCHAR(64) NULL COMMENT '更新用户',
     PRIMARY KEY (id),
-    KEY idx_instance_id (process_instance_id),
-    KEY idx_actor_id (actor_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='抄送实例表';
+    KEY idx_process_cc_instance_piid (process_instance_id),
+    KEY idx_process_cc_instance_aid (actor_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程抄送实例';
 
 -- 6. 流程设计表
 CREATE TABLE IF NOT EXISTS wf_process_design (
-    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
-    name VARCHAR(100) NOT NULL COMMENT '流程名称',
-    display_name VARCHAR(200) COMMENT '显示名称',
-    design_type VARCHAR(50) DEFAULT 'approval' COMMENT '设计类型',
-    icon VARCHAR(200) DEFAULT NULL COMMENT '图标',
-    is_deployed INT DEFAULT 0 COMMENT '是否已部署: 0=未部署, 1=已部署',
-    remark VARCHAR(500) DEFAULT NULL COMMENT '备注',
-    create_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    create_user VARCHAR(50) COMMENT '创建人',
-    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    update_user VARCHAR(50) COMMENT '更新人',
-    PRIMARY KEY (id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程设计表';
+    id BIGINT NOT NULL COMMENT '主键',
+    name VARCHAR(100) NOT NULL COMMENT '流程编码(唯一)',
+    display_name VARCHAR(200) NOT NULL COMMENT '流程显示名称',
+    type VARCHAR(50) NULL DEFAULT 'approval' COMMENT '流程类型',
+    icon VARCHAR(200) NULL COMMENT '图标',
+    is_deployed INT NULL DEFAULT 0 COMMENT '是否已部署(0否、1是)',
+    remark TEXT NULL COMMENT '备注',
+    create_time DATETIME(3) NULL COMMENT '创建时间',
+    create_user VARCHAR(64) NULL COMMENT '创建用户',
+    update_time DATETIME(3) NULL COMMENT '更新时间',
+    update_user VARCHAR(64) NULL COMMENT '更新用户',
+    PRIMARY KEY (id),
+    KEY idx_process_design_name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程设计';
 
 -- 7. 流程设计历史表
 CREATE TABLE IF NOT EXISTS wf_process_design_his (
-    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
+    id BIGINT NOT NULL COMMENT '主键',
     process_design_id BIGINT NOT NULL COMMENT '流程设计ID',
-    content LONGTEXT COMMENT '设计内容JSON',
-    create_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    create_user VARCHAR(50) COMMENT '创建人',
+    content BLOB NULL COMMENT '流程模型定义',
+    create_time DATETIME(3) NULL COMMENT '创建时间',
+    create_user VARCHAR(64) NULL COMMENT '创建用户',
     PRIMARY KEY (id),
-    KEY idx_design_id (process_design_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程设计历史表';
+    KEY idx_process_design_his_pdid (process_design_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程设计历史';
 
 -- 8. 委托代理表
 CREATE TABLE IF NOT EXISTS wf_process_surrogate (
-    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键',
-    process_name VARCHAR(100) NOT NULL COMMENT '流程名称',
-    operator VARCHAR(50) NOT NULL COMMENT '委托人',
-    surrogate VARCHAR(50) NOT NULL COMMENT '代理人',
-    start_time DATETIME DEFAULT NULL COMMENT '开始时间',
-    end_time DATETIME DEFAULT NULL COMMENT '结束时间',
-    enabled INT DEFAULT 1 COMMENT '是否启用: 0=禁用, 1=启用',
-    create_time DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    create_user VARCHAR(50) COMMENT '创建人',
-    update_time DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    update_user VARCHAR(50) COMMENT '更新人',
+    id BIGINT NOT NULL COMMENT '主键',
+    process_name VARCHAR(100) NULL COMMENT '流程编码(空=全部流程)',
+    operator VARCHAR(64) NOT NULL COMMENT '授权人',
+    surrogate VARCHAR(64) NOT NULL COMMENT '代理人',
+    start_time DATETIME(3) NULL COMMENT '授权开始时间',
+    end_time DATETIME(3) NULL COMMENT '授权结束时间',
+    enabled INT NULL DEFAULT 1 COMMENT '是否启用(1启用、0停用)',
+    create_time DATETIME(3) NULL COMMENT '创建时间',
+    create_user VARCHAR(64) NULL COMMENT '创建用户',
+    update_time DATETIME(3) NULL COMMENT '更新时间',
+    update_user VARCHAR(64) NULL COMMENT '更新用户',
     PRIMARY KEY (id),
-    KEY idx_operator (operator)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='委托代理表';
+    KEY idx_process_surrogate_op (operator)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程委托代理';
 "#;
 
 // ═══════════════════════════════════════════════════════
 // SqlxRepository
 // ═══════════════════════════════════════════════════════
 
+/// 默认雪花 id 生成器（进程内单例）：规范表无 AUTO_INCREMENT，
+/// 主键由应用层生成（spec §7，对齐 Java 参考实现 repository 内 nextId()）。
+fn default_id_gen() -> Arc<dyn Fn() -> i64 + Send + Sync> {
+    static GEN: std::sync::OnceLock<jeeflow_core::id_gen::DefaultIdGenerator> =
+        std::sync::OnceLock::new();
+    Arc::new(move || {
+        GEN.get_or_init(|| jeeflow_core::id_gen::DefaultIdGenerator::new(1))
+            .next_id()
+    })
+}
+
 /// SQLx-based repository wrapping a MySqlPool.
 /// Implements ProcessRepository + ProcessExtRepository using sync-over-async.
 pub struct SqlxRepository {
     pool: MySqlPool,
+    id_gen: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl SqlxRepository {
     pub fn new(pool: MySqlPool) -> Self {
-        SqlxRepository { pool }
+        SqlxRepository {
+            pool,
+            id_gen: default_id_gen(),
+        }
+    }
+
+    /// 注入集成方 ID 生成器（如 salvo 雪花 id），保持全库 id 口径一致。
+    pub fn with_id_gen(mut self, id_gen: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
+        self.id_gen = id_gen;
+        self
+    }
+
+    fn next_id(&self) -> i64 {
+        (self.id_gen)()
     }
 
     pub fn pool(&self) -> &MySqlPool {
@@ -173,8 +204,17 @@ impl SqlxRepository {
     }
 
     /// Block on an async future using the current tokio runtime handle.
+    ///
+    /// 必须用 `block_in_place` 包裹：本结构体的同步 SPI 方法会被引擎 facade 从
+    /// Web 框架（salvo）的 multi_thread 工作线程直接调用。该线程的 runtime 上下文
+    /// 已是 Entered，裸 `Handle::block_on` 会在 `enter_runtime` 触发
+    /// "Cannot start a runtime from within a runtime" panic（单测用 spawn_blocking /
+    /// plain 线程，上下文 NotEntered，故测不出来）。
+    /// `block_in_place` 在多工作线程运行时会先把 worker core 挪给别的线程再阻塞（合法），
+    /// 在 plain / blocking 线程则退化为就地执行——对所有调用上下文都安全，
+    /// 且与集成层 `wf_db::block_on` 口径一致。
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
-        tokio::runtime::Handle::current().block_on(f)
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
     }
 
     /// Initialize the schema by executing the DDL.
@@ -243,6 +283,64 @@ fn get_opt_i32(r: &sqlx::mysql::MySqlRow, col: &str) -> Option<i32> {
     r.try_get::<Option<i32>, _>(col).ok().flatten()
 }
 
+/// 批量把任务行映射为 ProcessTask（对齐 Java mapTask/mapTasks：解析 variable + setActorIds）。
+/// 参与者按 task_id 批量水合——权限判定 is_allowed 依赖 actor_ids，漏查会把真实处理人
+/// 全部判为"无权限"。sqlx MySQL 驱动不支持 IN(?) 直接绑 Vec：手动展开占位符逐个 bind。
+async fn tasks_from_rows(
+    pool: &MySqlPool,
+    rows: Vec<sqlx::mysql::MySqlRow>,
+) -> JeeflowResult<Vec<ProcessTask>> {
+    let task_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let mut actors_by_task: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    if !task_ids.is_empty() {
+        let placeholders = vec!["?"; task_ids.len()].join(",");
+        let sql = format!(
+            "SELECT process_task_id, actor_id FROM wf_process_task_actor WHERE process_task_id IN ({})",
+            placeholders
+        );
+        let mut q = sqlx::query(&sql);
+        for id in &task_ids {
+            q = q.bind(*id);
+        }
+        let actor_rows = q
+            .fetch_all(pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+        for a in actor_rows {
+            let ptid: i64 = a.get("process_task_id");
+            let aid: String = a.get("actor_id");
+            actors_by_task.entry(ptid).or_default().push(aid);
+        }
+    }
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let id: i64 = r.get("id");
+            ProcessTask {
+                task_id: id,
+                process_instance_id: r.get("process_instance_id"),
+                task_name: r.get("task_name"),
+                display_name: r.get("display_name"),
+                task_type: r.get("task_type"),
+                perform_type: r.get("perform_type"),
+                task_state: r.get("task_state"),
+                actor_id: get_opt_string(&r, "operator"),
+                actor_ids: actors_by_task.remove(&id).unwrap_or_default(),
+                finish_time: get_opt_datetime(&r, "finish_time"),
+                expire_time: get_opt_datetime(&r, "expire_time"),
+                form_key: r.get("form_key"),
+                parent_task_id: get_opt_i64(&r, "task_parent_id"),
+                variables: parse_flow_data(&r.get("variable")),
+                create_time: get_opt_datetime(&r, "create_time"),
+                create_user: r.get("create_user"),
+                update_time: get_opt_datetime(&r, "update_time"),
+                update_user: r.get("update_user"),
+            }
+        })
+        .collect())
+}
+
 fn map_task_row(r: &sqlx::mysql::MySqlRow) -> TaskRow {
     TaskRow {
         id: r.get("id"),
@@ -301,7 +399,7 @@ fn map_define_row(r: &sqlx::mysql::MySqlRow) -> DefineRow {
         id: r.get("id"),
         name: r.get("name"),
         display_name: r.try_get::<Option<String>, _>("display_name").ok().flatten().unwrap_or_default(),
-        define_type: r.try_get::<Option<String>, _>("define_type").ok().flatten().unwrap_or_else(|| "approval".into()),
+        define_type: r.try_get::<Option<String>, _>("type").ok().flatten().unwrap_or_else(|| "approval".into()),
         state: r.get("state"),
         version: r.try_get::<Option<i32>, _>("version").ok().flatten().unwrap_or(1),
         create_time: get_opt_datetime(r, "create_time"),
@@ -316,7 +414,7 @@ fn map_design(r: &sqlx::mysql::MySqlRow) -> ProcessDesign {
         id: r.get("id"),
         name: r.get("name"),
         display_name: r.try_get::<Option<String>, _>("display_name").ok().flatten().unwrap_or_default(),
-        design_type: r.try_get::<Option<String>, _>("design_type").ok().flatten().unwrap_or_else(|| "approval".into()),
+        design_type: r.try_get::<Option<String>, _>("type").ok().flatten().unwrap_or_else(|| "approval".into()),
         icon: get_opt_string(r, "icon"),
         is_deployed: r.try_get::<Option<i32>, _>("is_deployed").ok().flatten().unwrap_or(0),
         remark: get_opt_string(r, "remark"),
@@ -348,7 +446,7 @@ impl ProcessRepository for SqlxRepository {
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>> {
         self.block_on(async {
             let row = sqlx::query(
-                "SELECT id, name, display_name, define_type, state, content, version, create_time, create_user, update_time, update_user FROM wf_process_define WHERE id = ?"
+                "SELECT id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user FROM wf_process_define WHERE id = ?"
             )
             .bind(define_id)
             .fetch_optional(&self.pool)
@@ -359,7 +457,7 @@ impl ProcessRepository for SqlxRepository {
                 id: r.get("id"),
                 name: r.get("name"),
                 display_name: r.get("display_name"),
-                define_type: r.get("define_type"),
+                define_type: r.get("type"),
                 state: r.get("state"),
                 content: r.get::<Vec<u8>, _>("content"),
                 version: r.get("version"),
@@ -374,41 +472,30 @@ impl ProcessRepository for SqlxRepository {
     fn save_define(&self, define: &mut ProcessDefine) -> JeeflowResult<()> {
         self.block_on(async {
             let content_str = String::from_utf8_lossy(&define.content).to_string();
-            let result = if define.id > 0 {
-                // Manual ID (snowflake / test-assigned)
-                sqlx::query(
-                    "INSERT INTO wf_process_define (id, name, display_name, define_type, state, content, version, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(define.id)
-                .bind(&define.name)
-                .bind(&define.display_name)
-                .bind(&define.define_type)
-                .bind(define.state)
-                .bind(&content_str)
-                .bind(define.version)
-                .bind(&define.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            } else {
-                // AUTO_INCREMENT
-                sqlx::query(
-                    "INSERT INTO wf_process_define (name, display_name, define_type, state, content, version, create_user) VALUES (?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(&define.name)
-                .bind(&define.display_name)
-                .bind(&define.define_type)
-                .bind(define.state)
-                .bind(&content_str)
-                .bind(define.version)
-                .bind(&define.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            };
+            // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if define.id == 0 {
-                define.id = result.last_insert_id() as i64;
+                define.id = self.next_id();
             }
+            // create_time 落库（对齐 Go/Java/Node INSERT 带审计列；PHP 待办排序走 create_time，
+            // 漏写会让新数据 create_time=NULL 排到最旧）
+            if define.create_time.is_none() {
+                define.create_time = Some(current_time_str());
+            }
+            sqlx::query(
+                "INSERT INTO wf_process_define (id, name, display_name, type, state, content, version, create_time, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(define.id)
+            .bind(&define.name)
+            .bind(&define.display_name)
+            .bind(&define.define_type)
+            .bind(define.state)
+            .bind(&content_str)
+            .bind(define.version)
+            .bind(&define.create_time)
+            .bind(&define.create_user)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -416,7 +503,7 @@ impl ProcessRepository for SqlxRepository {
     fn update_define(&self, define: &ProcessDefine) -> JeeflowResult<()> {
         self.block_on(async {
             sqlx::query(
-                "UPDATE wf_process_define SET display_name=?, define_type=?, state=?, content=?, version=?, update_user=? WHERE id=?"
+                "UPDATE wf_process_define SET display_name=?, type=?, state=?, content=?, version=?, update_user=? WHERE id=?"
             )
             .bind(&define.display_name)
             .bind(&define.define_type)
@@ -488,43 +575,30 @@ impl ProcessRepository for SqlxRepository {
     fn save_instance(&self, instance: &mut ProcessInstance) -> JeeflowResult<()> {
         self.block_on(async {
             let var_json = flow_data_to_json(&instance.variables);
-            let result = if instance.instance_id > 0 {
-                sqlx::query(
-                    "INSERT INTO wf_process_instance (id, parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(instance.instance_id)
-                .bind(instance.parent_id)
-                .bind(instance.define_id)
-                .bind(instance.state)
-                .bind(&instance.parent_node_name)
-                .bind(&instance.business_no)
-                .bind(&instance.operator)
-                .bind(&instance.expire_time)
-                .bind(&var_json)
-                .bind(&instance.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            } else {
-                sqlx::query(
-                    "INSERT INTO wf_process_instance (parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(instance.parent_id)
-                .bind(instance.define_id)
-                .bind(instance.state)
-                .bind(&instance.parent_node_name)
-                .bind(&instance.business_no)
-                .bind(&instance.operator)
-                .bind(&instance.expire_time)
-                .bind(&var_json)
-                .bind(&instance.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            };
+            // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if instance.instance_id == 0 {
-                instance.instance_id = result.last_insert_id() as i64;
+                instance.instance_id = self.next_id();
             }
+            if instance.create_time.is_none() {
+                instance.create_time = Some(current_time_str());
+            }
+            sqlx::query(
+                "INSERT INTO wf_process_instance (id, parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_time, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(instance.instance_id)
+            .bind(instance.parent_id)
+            .bind(instance.define_id)
+            .bind(instance.state)
+            .bind(&instance.parent_node_name)
+            .bind(&instance.business_no)
+            .bind(&instance.operator)
+            .bind(&instance.expire_time)
+            .bind(&var_json)
+            .bind(&instance.create_time)
+            .bind(&instance.create_user)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -546,27 +620,40 @@ impl ProcessRepository for SqlxRepository {
     fn find_task_by_id(&self, task_id: i64) -> JeeflowResult<Option<ProcessTask>> {
         self.block_on(async {
             let row = sqlx::query(
-                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, finish_time, expire_time, form_key, parent_task_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE id = ?"
+                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE id = ?"
             )
             .bind(task_id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
-            Ok(row.map(|r| ProcessTask {
+            let Some(r) = row else { return Ok(None) };
+            // 参与者从 wf_process_task_actor 水合（对齐 Java findTaskById 的 setActorIds）：
+            // 权限判定 is_allowed 依赖 actor_ids，漏查会把真实处理人全部判为"无权限"。
+            let actor_rows = sqlx::query("SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ?")
+                .bind(task_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let actor_ids: Vec<String> = actor_rows
+                .into_iter()
+                .map(|a| a.get::<String, _>("actor_id"))
+                .collect();
+
+            Ok(Some(ProcessTask {
                 task_id: r.get("id"),
                 process_instance_id: r.get("process_instance_id"),
                 task_name: r.get("task_name"),
                 display_name: r.get("display_name"),
                 task_type: r.get("task_type"),
                 perform_type: r.get("perform_type"),
-                task_state: r.get("state"),
-                actor_id: r.get("actor_id"),
-                actor_ids: vec![],
+                task_state: r.get("task_state"),
+                actor_id: get_opt_string(&r, "operator"),
+                actor_ids,
                 finish_time: get_opt_datetime(&r, "finish_time"),
                 expire_time: get_opt_datetime(&r, "expire_time"),
                 form_key: r.get("form_key"),
-                parent_task_id: r.get("parent_task_id"),
+                parent_task_id: get_opt_i64(&r, "task_parent_id"),
                 variables: parse_flow_data(&r.get("variable")),
                 create_time: get_opt_datetime(&r, "create_time"),
                 create_user: r.get("create_user"),
@@ -579,49 +666,33 @@ impl ProcessRepository for SqlxRepository {
     fn save_task(&self, task: &mut ProcessTask) -> JeeflowResult<()> {
         self.block_on(async {
             let var_json = flow_data_to_json(&task.variables);
-            let result = if task.task_id > 0 {
-                sqlx::query(
-                    "INSERT INTO wf_process_task (id, process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, expire_time, form_key, parent_task_id, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(task.task_id)
-                .bind(task.process_instance_id)
-                .bind(&task.task_name)
-                .bind(&task.display_name)
-                .bind(task.task_type)
-                .bind(task.perform_type)
-                .bind(task.task_state)
-                .bind(&task.actor_id)
-                .bind(&task.expire_time)
-                .bind(&task.form_key)
-                .bind(task.parent_task_id)
-                .bind(&var_json)
-                .bind(&task.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            } else {
-                sqlx::query(
-                    "INSERT INTO wf_process_task (process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, expire_time, form_key, parent_task_id, variable, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(task.process_instance_id)
-                .bind(&task.task_name)
-                .bind(&task.display_name)
-                .bind(task.task_type)
-                .bind(task.perform_type)
-                .bind(task.task_state)
-                .bind(&task.actor_id)
-                .bind(&task.expire_time)
-                .bind(&task.form_key)
-                .bind(task.parent_task_id)
-                .bind(&var_json)
-                .bind(&task.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            };
+            // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if task.task_id == 0 {
-                task.task_id = result.last_insert_id() as i64;
+                task.task_id = self.next_id();
             }
+            if task.create_time.is_none() {
+                task.create_time = Some(current_time_str());
+            }
+            sqlx::query(
+                "INSERT INTO wf_process_task (id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, expire_time, form_key, task_parent_id, variable, create_time, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(task.task_id)
+            .bind(task.process_instance_id)
+            .bind(&task.task_name)
+            .bind(&task.display_name)
+            .bind(task.task_type)
+            .bind(task.perform_type)
+            .bind(task.task_state)
+            .bind(&task.actor_id)
+            .bind(&task.expire_time)
+            .bind(&task.form_key)
+            .bind(task.parent_task_id)
+            .bind(&var_json)
+            .bind(&task.create_time)
+            .bind(&task.create_user)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -630,7 +701,7 @@ impl ProcessRepository for SqlxRepository {
         self.block_on(async {
             let var_json = flow_data_to_json(&task.variables);
             sqlx::query(
-                "UPDATE wf_process_task SET state=?, actor_id=?, finish_time=?, variable=?, update_time=NOW() WHERE id=?"
+                "UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, variable=?, update_time=NOW() WHERE id=?"
             )
             .bind(task.task_state)
             .bind(&task.actor_id)
@@ -647,34 +718,14 @@ impl ProcessRepository for SqlxRepository {
     fn find_doing_tasks(&self, instance_id: i64, task_names: &[String]) -> JeeflowResult<Vec<ProcessTask>> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, finish_time, expire_time, form_key, parent_task_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ? AND state = 10"
+                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ? AND task_state = 10"
             )
             .bind(instance_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
-            let tasks: Vec<ProcessTask> = rows.into_iter().map(|r| ProcessTask {
-                task_id: r.get("id"),
-                process_instance_id: r.get("process_instance_id"),
-                task_name: r.get("task_name"),
-                display_name: r.get("display_name"),
-                task_type: r.get("task_type"),
-                perform_type: r.get("perform_type"),
-                task_state: r.get("state"),
-                actor_id: r.get("actor_id"),
-                actor_ids: vec![],
-                finish_time: get_opt_datetime(&r, "finish_time"),
-                expire_time: get_opt_datetime(&r, "expire_time"),
-                form_key: r.get("form_key"),
-                parent_task_id: r.get("parent_task_id"),
-                variables: jeeflow_core::json::FlowData::new(),
-                create_time: get_opt_datetime(&r, "create_time"),
-                create_user: r.get("create_user"),
-                update_time: get_opt_datetime(&r, "update_time"),
-                update_user: r.get("update_user"),
-            }).collect();
-
+            let tasks = tasks_from_rows(&self.pool, rows).await?;
             Ok(if task_names.is_empty() { tasks } else { tasks.into_iter().filter(|t| task_names.contains(&t.task_name)).collect() })
         })
     }
@@ -682,34 +733,14 @@ impl ProcessRepository for SqlxRepository {
     fn find_done_tasks(&self, instance_id: i64, task_names: &[String]) -> JeeflowResult<Vec<ProcessTask>> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, finish_time, expire_time, form_key, parent_task_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ? AND state = 20"
+                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ? AND task_state = 20"
             )
             .bind(instance_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
-            let tasks: Vec<ProcessTask> = rows.into_iter().map(|r| ProcessTask {
-                task_id: r.get("id"),
-                process_instance_id: r.get("process_instance_id"),
-                task_name: r.get("task_name"),
-                display_name: r.get("display_name"),
-                task_type: r.get("task_type"),
-                perform_type: r.get("perform_type"),
-                task_state: r.get("state"),
-                actor_id: r.get("actor_id"),
-                actor_ids: vec![],
-                finish_time: get_opt_datetime(&r, "finish_time"),
-                expire_time: get_opt_datetime(&r, "expire_time"),
-                form_key: r.get("form_key"),
-                parent_task_id: r.get("parent_task_id"),
-                variables: jeeflow_core::json::FlowData::new(),
-                create_time: get_opt_datetime(&r, "create_time"),
-                create_user: r.get("create_user"),
-                update_time: get_opt_datetime(&r, "update_time"),
-                update_user: r.get("update_user"),
-            }).collect();
-
+            let tasks = tasks_from_rows(&self.pool, rows).await?;
             Ok(if task_names.is_empty() { tasks } else { tasks.into_iter().filter(|t| task_names.contains(&t.task_name)).collect() })
         })
     }
@@ -717,33 +748,15 @@ impl ProcessRepository for SqlxRepository {
     fn find_history_tasks(&self, instance_id: i64) -> JeeflowResult<Vec<ProcessTask>> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, state, actor_id, finish_time, expire_time, form_key, parent_task_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ?"
+                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ?"
             )
             .bind(instance_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
-            Ok(rows.into_iter().map(|r| ProcessTask {
-                task_id: r.get("id"),
-                process_instance_id: r.get("process_instance_id"),
-                task_name: r.get("task_name"),
-                display_name: r.get("display_name"),
-                task_type: r.get("task_type"),
-                perform_type: r.get("perform_type"),
-                task_state: r.get("state"),
-                actor_id: r.get("actor_id"),
-                actor_ids: vec![],
-                finish_time: get_opt_datetime(&r, "finish_time"),
-                expire_time: get_opt_datetime(&r, "expire_time"),
-                form_key: r.get("form_key"),
-                parent_task_id: r.get("parent_task_id"),
-                variables: jeeflow_core::json::FlowData::new(),
-                create_time: get_opt_datetime(&r, "create_time"),
-                create_user: r.get("create_user"),
-                update_time: get_opt_datetime(&r, "update_time"),
-                update_user: r.get("update_user"),
-            }).collect())
+            // 对齐 Java findInstanceById→findTasksByInstanceId→mapTasks（setActorIds + 解析 variable）
+            tasks_from_rows(&self.pool, rows).await
         })
     }
 
@@ -761,9 +774,14 @@ impl ProcessRepository for SqlxRepository {
     fn add_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()> {
         self.block_on(async {
             for actor in actors {
-                sqlx::query("INSERT INTO wf_process_task_actor (process_task_id, actor_id) VALUES (?, ?)")
+                // 规范表 wf_process_task_actor.id NOT NULL 无默认值：由应用层雪花生成
+                // （对齐 Java insertTaskActors 的 nextId()；漏 id 会 1364，startAndExecute 全挂）。
+                let actor_row_id = self.next_id();
+                sqlx::query("INSERT INTO wf_process_task_actor (id, process_task_id, actor_id, create_time) VALUES (?, ?, ?, ?)")
+                    .bind(actor_row_id)
                     .bind(task_id)
                     .bind(actor)
+                    .bind(&current_time_str())
                     .execute(&self.pool)
                     .await
                     .map_err(|e| JeeflowError::Internal(e.to_string()))?;
@@ -789,9 +807,13 @@ impl ProcessRepository for SqlxRepository {
     fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()> {
         self.block_on(async {
             for actor in actor_ids {
-                sqlx::query("INSERT INTO wf_cc_instance (process_instance_id, actor_id, state, create_user) VALUES (?, ?, 0, ?)")
+                // 规范表无 AUTO_INCREMENT：抄送行 id 由应用层雪花生成
+                let cc_id = self.next_id();
+                sqlx::query("INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state, create_time, create_user) VALUES (?, ?, ?, 0, ?, ?)")
+                    .bind(cc_id)
                     .bind(instance_id)
                     .bind(actor)
+                    .bind(&current_time_str())
                     .bind(creator)
                     .execute(&self.pool)
                     .await
@@ -803,7 +825,7 @@ impl ProcessRepository for SqlxRepository {
 
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()> {
         self.block_on(async {
-            sqlx::query("UPDATE wf_cc_instance SET state=1 WHERE process_instance_id=? AND actor_id=?")
+            sqlx::query("UPDATE wf_process_cc_instance SET state=1 WHERE process_instance_id=? AND actor_id=?")
                 .bind(instance_id)
                 .bind(actor_id)
                 .execute(&self.pool)
@@ -824,7 +846,7 @@ impl ProcessRepository for SqlxRepository {
                  INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.state = 10 AND (? IS NULL OR ta.actor_id = ?)"
+                 WHERE t.task_state = 10 AND (? IS NULL OR ta.actor_id = ?)"
             )
             .bind(op.clone())
             .bind(op.clone())
@@ -835,9 +857,9 @@ impl ProcessRepository for SqlxRepository {
 
             let rows = sqlx::query(
                 "SELECT DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, \
-                        t.task_type, t.perform_type, t.state AS task_state, \
-                        t.actor_id AS operator, ta.actor_id AS actor_id, \
-                        t.finish_time, t.expire_time, t.form_key, t.parent_task_id AS task_parent_id, \
+                        t.task_type, t.perform_type, t.task_state, \
+                        t.operator, ta.actor_id AS actor_id, \
+                        t.finish_time, t.expire_time, t.form_key, t.task_parent_id, \
                         t.variable, t.create_time, t.create_user, t.update_time, t.update_user, \
                         pi.process_define_id, pi.state AS instance_state, pi.operator AS instance_operator, \
                         pi.business_no, pi.variable AS instance_variable, pi.create_time AS instance_create_time, \
@@ -846,7 +868,7 @@ impl ProcessRepository for SqlxRepository {
                  INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.state = 10 AND (? IS NULL OR ta.actor_id = ?) \
+                 WHERE t.task_state = 10 AND (? IS NULL OR ta.actor_id = ?) \
                  ORDER BY t.id DESC LIMIT ? OFFSET ?"
             )
             .bind(op.clone())
@@ -870,7 +892,7 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_task t \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.state = 20 AND (? IS NULL OR t.actor_id = ? OR t.create_user = ?)"
+                 WHERE t.task_state = 20 AND (? IS NULL OR t.operator = ? OR t.create_user = ?)"
             )
             .bind(op.clone())
             .bind(op.clone())
@@ -882,9 +904,9 @@ impl ProcessRepository for SqlxRepository {
 
             let rows = sqlx::query(
                 "SELECT t.id, t.process_instance_id, t.task_name, t.display_name, \
-                        t.task_type, t.perform_type, t.state AS task_state, \
-                        t.actor_id AS operator, t.actor_id AS actor_id, \
-                        t.finish_time, t.expire_time, t.form_key, t.parent_task_id AS task_parent_id, \
+                        t.task_type, t.perform_type, t.task_state, \
+                        t.operator, t.operator AS actor_id, \
+                        t.finish_time, t.expire_time, t.form_key, t.task_parent_id, \
                         t.variable, t.create_time, t.create_user, t.update_time, t.update_user, \
                         pi.process_define_id, pi.state AS instance_state, pi.operator AS instance_operator, \
                         pi.business_no, pi.variable AS instance_variable, pi.create_time AS instance_create_time, \
@@ -892,7 +914,7 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_task t \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.state = 20 AND (? IS NULL OR t.actor_id = ? OR t.create_user = ?) \
+                 WHERE t.task_state = 20 AND (? IS NULL OR t.operator = ? OR t.create_user = ?) \
                  ORDER BY t.id DESC LIMIT ? OFFSET ?"
             )
             .bind(op.clone())
@@ -953,7 +975,7 @@ impl ProcessRepository for SqlxRepository {
             let op = query.operator.clone();
             let count_row = sqlx::query(
                 "SELECT COUNT(DISTINCT pi.id) AS cnt \
-                 FROM wf_cc_instance cc \
+                 FROM wf_process_cc_instance cc \
                  INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
                  WHERE (? IS NULL OR cc.actor_id = ?)"
@@ -970,7 +992,7 @@ impl ProcessRepository for SqlxRepository {
                         pi.business_no, pi.operator, pi.expire_time, pi.variable, \
                         pi.create_time, pi.create_user, pi.update_time, pi.update_user, \
                         pd.name AS define_name, pd.display_name AS define_display_name, pd.version AS define_version \
-                 FROM wf_cc_instance cc \
+                 FROM wf_process_cc_instance cc \
                  INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
                  WHERE (? IS NULL OR cc.actor_id = ?) \
@@ -998,7 +1020,7 @@ impl ProcessRepository for SqlxRepository {
             let total: i64 = count_row.get("cnt");
 
             let rows = sqlx::query(
-                "SELECT id, name, display_name, define_type, state, version, \
+                "SELECT id, name, display_name, type, state, version, \
                         create_time, create_user, update_time, update_user \
                  FROM wf_process_define ORDER BY id DESC LIMIT ? OFFSET ?"
             )
@@ -1016,7 +1038,7 @@ impl ProcessRepository for SqlxRepository {
     fn count_todo_tasks(&self, user_id: &str) -> JeeflowResult<i64> {
         self.block_on(async {
             let row = sqlx::query(
-                "SELECT COUNT(DISTINCT t.id) as cnt FROM wf_process_task t INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id WHERE ta.actor_id = ? AND t.state = 10"
+                "SELECT COUNT(DISTINCT t.id) as cnt FROM wf_process_task t INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id WHERE ta.actor_id = ? AND t.task_state = 10"
             )
             .bind(user_id)
             .fetch_one(&self.pool)
@@ -1031,7 +1053,7 @@ impl ProcessExtRepository for SqlxRepository {
     fn find_design_by_id(&self, design_id: i64) -> JeeflowResult<Option<ProcessDesign>> {
         self.block_on(async {
             let row = sqlx::query(
-                "SELECT id, name, display_name, design_type, icon, is_deployed, remark, \
+                "SELECT id, name, display_name, type, icon, is_deployed, remark, \
                         create_time, create_user, update_time, update_user \
                  FROM wf_process_design WHERE id = ?"
             )
@@ -1045,41 +1067,29 @@ impl ProcessExtRepository for SqlxRepository {
 
     fn save_design(&self, design: &mut ProcessDesign) -> JeeflowResult<()> {
         self.block_on(async {
-            let result = if design.id > 0 {
-                sqlx::query(
-                    "INSERT INTO wf_process_design (id, name, display_name, design_type, icon, is_deployed, remark, create_user) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(design.id)
-                .bind(&design.name)
-                .bind(&design.display_name)
-                .bind(&design.design_type)
-                .bind(&design.icon)
-                .bind(design.is_deployed)
-                .bind(&design.remark)
-                .bind(&design.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            } else {
-                sqlx::query(
-                    "INSERT INTO wf_process_design (name, display_name, design_type, icon, is_deployed, remark, create_user) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(&design.name)
-                .bind(&design.display_name)
-                .bind(&design.design_type)
-                .bind(&design.icon)
-                .bind(design.is_deployed)
-                .bind(&design.remark)
-                .bind(&design.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            };
+            // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if design.id == 0 {
-                design.id = result.last_insert_id() as i64;
+                design.id = self.next_id();
             }
+            if design.create_time.is_none() {
+                design.create_time = Some(current_time_str());
+            }
+            sqlx::query(
+                "INSERT INTO wf_process_design (id, name, display_name, type, icon, is_deployed, remark, create_time, create_user) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(design.id)
+            .bind(&design.name)
+            .bind(&design.display_name)
+            .bind(&design.design_type)
+            .bind(&design.icon)
+            .bind(design.is_deployed)
+            .bind(&design.remark)
+            .bind(&design.create_time)
+            .bind(&design.create_user)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -1087,7 +1097,7 @@ impl ProcessExtRepository for SqlxRepository {
     fn update_design(&self, design: &ProcessDesign) -> JeeflowResult<()> {
         self.block_on(async {
             sqlx::query(
-                "UPDATE wf_process_design SET name=?, display_name=?, design_type=?, icon=?, \
+                "UPDATE wf_process_design SET name=?, display_name=?, type=?, icon=?, \
                  is_deployed=?, remark=?, update_user=? WHERE id=?"
             )
             .bind(&design.name)
@@ -1130,7 +1140,7 @@ impl ProcessExtRepository for SqlxRepository {
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
             let rows = sqlx::query(
-                "SELECT id, name, display_name, design_type, icon, is_deployed, remark, \
+                "SELECT id, name, display_name, type, icon, is_deployed, remark, \
                         create_time, create_user, update_time, update_user \
                  FROM wf_process_design ORDER BY id DESC LIMIT ? OFFSET ?"
             )
@@ -1146,31 +1156,24 @@ impl ProcessExtRepository for SqlxRepository {
     fn save_design_his(&self, his: &mut ProcessDesignHis) -> JeeflowResult<()> {
         self.block_on(async {
             let content_str = String::from_utf8_lossy(&his.content).to_string();
-            let result = if his.id > 0 {
-                sqlx::query(
-                    "INSERT INTO wf_process_design_his (id, process_design_id, content, create_user) VALUES (?, ?, ?, ?)"
-                )
-                .bind(his.id)
-                .bind(his.process_design_id)
-                .bind(&content_str)
-                .bind(&his.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            } else {
-                sqlx::query(
-                    "INSERT INTO wf_process_design_his (process_design_id, content, create_user) VALUES (?, ?, ?)"
-                )
-                .bind(his.process_design_id)
-                .bind(&content_str)
-                .bind(&his.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            };
+            // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if his.id == 0 {
-                his.id = result.last_insert_id() as i64;
+                his.id = self.next_id();
             }
+            if his.create_time.is_none() {
+                his.create_time = Some(current_time_str());
+            }
+            sqlx::query(
+                "INSERT INTO wf_process_design_his (id, process_design_id, content, create_time, create_user) VALUES (?, ?, ?, ?, ?)"
+            )
+            .bind(his.id)
+            .bind(his.process_design_id)
+            .bind(&content_str)
+            .bind(&his.create_time)
+            .bind(&his.create_user)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -1186,11 +1189,16 @@ impl ProcessExtRepository for SqlxRepository {
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(rows.into_iter().map(|r| {
-                let content: Option<String> = r.try_get("content").ok().flatten();
+                // content 是 BLOB：sqlx MySQL 解码为 Vec<u8>（对齐 define 读取），
+                // 读成 String 会类型不匹配静默返回 None → content 恒空（deploy 拿到空模型）。
+                let content: Vec<u8> = r.try_get::<Option<Vec<u8>>, _>("content")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 ProcessDesignHis {
                     id: r.get("id"),
                     process_design_id: r.get("process_design_id"),
-                    content: content.unwrap_or_default().into_bytes(),
+                    content,
                     create_time: get_opt_datetime(&r, "create_time"),
                     create_user: get_opt_string(&r, "create_user"),
                 }
@@ -1215,41 +1223,29 @@ impl ProcessExtRepository for SqlxRepository {
 
     fn save_surrogate(&self, surrogate: &mut ProcessSurrogate) -> JeeflowResult<()> {
         self.block_on(async {
-            let result = if surrogate.id > 0 {
-                sqlx::query(
-                    "INSERT INTO wf_process_surrogate (id, process_name, operator, surrogate, start_time, end_time, enabled, create_user) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(surrogate.id)
-                .bind(&surrogate.process_name)
-                .bind(&surrogate.operator)
-                .bind(&surrogate.surrogate)
-                .bind(&surrogate.start_time)
-                .bind(&surrogate.end_time)
-                .bind(surrogate.enabled)
-                .bind(&surrogate.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            } else {
-                sqlx::query(
-                    "INSERT INTO wf_process_surrogate (process_name, operator, surrogate, start_time, end_time, enabled, create_user) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(&surrogate.process_name)
-                .bind(&surrogate.operator)
-                .bind(&surrogate.surrogate)
-                .bind(&surrogate.start_time)
-                .bind(&surrogate.end_time)
-                .bind(surrogate.enabled)
-                .bind(&surrogate.create_user)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            };
+            // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if surrogate.id == 0 {
-                surrogate.id = result.last_insert_id() as i64;
+                surrogate.id = self.next_id();
             }
+            if surrogate.create_time.is_none() {
+                surrogate.create_time = Some(current_time_str());
+            }
+            sqlx::query(
+                "INSERT INTO wf_process_surrogate (id, process_name, operator, surrogate, start_time, end_time, enabled, create_time, create_user) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(surrogate.id)
+            .bind(&surrogate.process_name)
+            .bind(&surrogate.operator)
+            .bind(&surrogate.surrogate)
+            .bind(&surrogate.start_time)
+            .bind(&surrogate.end_time)
+            .bind(surrogate.enabled)
+            .bind(&surrogate.create_time)
+            .bind(&surrogate.create_user)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -1405,9 +1401,10 @@ mod tests {
     #[test]
     fn test_schema_table_names() {
         let schema = schema_mysql();
+        // 表名必须与 mldong-plus 规范 schema（DB 镜像 / Java 参考实现）完全一致
         let expected_tables = [
             "wf_process_define", "wf_process_instance", "wf_process_task",
-            "wf_process_task_actor", "wf_cc_instance", "wf_process_design",
+            "wf_process_task_actor", "wf_process_cc_instance", "wf_process_design",
             "wf_process_design_his", "wf_process_surrogate",
         ];
         for table in &expected_tables {
@@ -1433,10 +1430,10 @@ mod tests {
     #[test]
     fn test_schema_indexes() {
         let schema = schema_mysql();
-        assert!(schema.contains("idx_define_id"), "Should have idx_define_id");
-        assert!(schema.contains("idx_instance_id"), "Should have idx_instance_id");
-        assert!(schema.contains("idx_actor_id"), "Should have idx_actor_id");
-        assert!(schema.contains("idx_operator"), "Should have idx_operator");
+        assert!(schema.contains("idx_process_define_name"), "Should have idx_process_define_name");
+        assert!(schema.contains("idx_process_instance_pfid"), "Should have idx_process_instance_pfid");
+        assert!(schema.contains("idx_process_task_piid"), "Should have idx_process_task_piid");
+        assert!(schema.contains("idx_process_cc_instance_aid"), "Should have idx_process_cc_instance_aid");
     }
 
     #[test]
@@ -1489,11 +1486,16 @@ mod tests {
     #[test]
     fn test_schema_define_table_columns() {
         let schema = schema_mysql();
-        // Check key columns in wf_process_define
+        // Check key columns in wf_process_define（规范：type 列 + BLOB content）
         assert!(schema.contains("id BIGINT"));
         assert!(schema.contains("name VARCHAR"));
         assert!(schema.contains("display_name VARCHAR"));
-        assert!(schema.contains("content LONGTEXT"));
+        assert!(schema.contains("type VARCHAR"));
+        assert!(schema.contains("content BLOB"));
+        // 历史错名（define_type/design_type/wf_cc_instance）绝不允许再出现
+        assert!(!schema.contains("define_type"));
+        assert!(!schema.contains("design_type"));
+        assert!(!schema.contains("wf_cc_instance"));
     }
 
     #[test]
@@ -1508,8 +1510,9 @@ mod tests {
     fn test_schema_task_table_columns() {
         let schema = schema_mysql();
         assert!(schema.contains("task_name VARCHAR"));
-        // The column is named "state" not "task_state"
-        assert!(schema.contains("state INT"));
+        // 规范：wf_process_task 用 task_state/operator/task_parent_id（对齐 mldong-plus DB 镜像）
+        assert!(schema.contains("task_state INT"));
+        assert!(schema.contains("task_parent_id BIGINT"));
         assert!(schema.contains("perform_type INT"));
     }
 
@@ -1537,38 +1540,13 @@ mod tests {
         tokio::task::spawn_blocking(f).await.unwrap()
     }
 
-    /// Ensure columns that may be missing from existing (Java-created) tables.
-    /// ALTER TABLE ADD COLUMN, ignoring "Duplicate column name" errors.
-    async fn ensure_columns(pool: &MySqlPool) {
-        let alter_stmts = vec![
-            "ALTER TABLE wf_process_define ADD COLUMN define_type VARCHAR(50) DEFAULT 'approval' COMMENT '流程类型'",
-            "ALTER TABLE wf_process_design ADD COLUMN design_type VARCHAR(50) DEFAULT 'approval' COMMENT '设计类型'",
-            // wf_process_task: ensure all columns from Rust DDL exist
-            "ALTER TABLE wf_process_task ADD COLUMN state INT NOT NULL DEFAULT 10 COMMENT '任务状态'",
-            "ALTER TABLE wf_process_task ADD COLUMN actor_id VARCHAR(50) DEFAULT NULL COMMENT '实际处理人'",
-            "ALTER TABLE wf_process_task ADD COLUMN finish_time DATETIME DEFAULT NULL COMMENT '完成时间'",
-            "ALTER TABLE wf_process_task ADD COLUMN expire_time DATETIME DEFAULT NULL COMMENT '过期时间'",
-            "ALTER TABLE wf_process_task ADD COLUMN form_key VARCHAR(100) DEFAULT NULL COMMENT '表单key'",
-            "ALTER TABLE wf_process_task ADD COLUMN parent_task_id BIGINT DEFAULT NULL COMMENT '父任务ID'",
-            "ALTER TABLE wf_process_task ADD COLUMN variable TEXT COMMENT '任务变量（JSON）'",
-            "ALTER TABLE wf_process_task ADD COLUMN perform_type INT DEFAULT 0 COMMENT '参与类型'",
-        ];
-        for stmt in alter_stmts {
-            let result = sqlx::query(stmt).execute(pool).await;
-            if let Err(e) = result {
-                let msg = e.to_string();
-                // Ignore "Duplicate column name" — column already exists
-                if !msg.contains("Duplicate column") {
-                    panic!("ensure_columns failed: {} — {}", stmt, msg);
-                }
-            }
-        }
-    }
-
-    /// Combined schema setup: init_schema + ensure missing columns.
+    /// 测试库 schema 准备：仅跑 init_schema（IF NOT EXISTS）。
+    /// 历史坑（2026-08）：曾用 ALTER TABLE ADD COLUMN 往共享 3306 测试库补
+    /// define_type/design_type/state/actor_id/parent_task_id 等"错名"列，
+    /// 掩盖了 DDL 与 mldong-plus 规范 schema 不一致的 bug（生产栈 L2 全挂）。
+    /// 测试库规范表由 DB 镜像 / Java 参考 schema 提供，这里绝不再 ALTER 补列。
     async fn setup_schema(pool: &MySqlPool) {
         SqlxRepository::init_schema(pool).await.unwrap();
-        ensure_columns(pool).await;
     }
 
     /// M1: Page 五键 — page query returns {pageNum, pageSize, recordCount, totalPage, list}
@@ -1818,5 +1796,173 @@ mod tests {
         sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900401 AND 900499").execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900401 AND 900499").execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900401 AND 900499").execute(&pool).await.unwrap();
+    }
+
+    /// C9: design_his content 是 BLOB，读回必须非空且字节一致。
+    /// 历史坑（2026-08）：list_design_his 曾把 BLOB 读成 String（sqlx MySQL 解码 BLOB 为
+    /// Vec<u8>，try_get::<String> 静默失败）→ content 恒空 → deploy 拿到空模型存成
+    /// name='unknown' 的空 define → getLastByName 查不到（160 salvo L2-01 全挂）。
+    /// 本测试对旧代码必失败（content 为空），修复后必通过。
+    #[tokio::test]
+    async fn test_c9_design_his_content_blob_roundtrip() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        // Pre-cleanup
+        sqlx::query("DELETE FROM wf_process_design WHERE id BETWEEN 900501 AND 900599").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_design_his WHERE process_design_id BETWEEN 900501 AND 900599").execute(&pool).await.unwrap();
+
+        let payload = br#"{"name":"c9_blob_test","nodes":[{"id":"start","type":"snaker:start"}]}"#;
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut design = ProcessDesign {
+                id: 900501, name: "c9_blob_test".into(), display_name: "C9 Blob".into(),
+                design_type: "approval".into(), icon: None, is_deployed: 0,
+                remark: Some("c9".into()), create_time: None, create_user: Some("test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_design(&mut design).unwrap();
+            let mut his = ProcessDesignHis {
+                id: 0,
+                process_design_id: design.id,
+                content: payload.to_vec(),
+                create_time: None,
+                create_user: Some("test".into()),
+            };
+            repo.save_design_his(&mut his).unwrap();
+
+            let list = repo.list_design_his(design.id).unwrap();
+            assert_eq!(list.len(), 1, "C9: exactly one his row");
+            assert_eq!(
+                list[0].content, payload,
+                "C9: his content BLOB must round-trip byte-equal (got {} bytes)",
+                list[0].content.len(),
+            );
+            assert!(!list[0].content.is_empty(), "C9: his content must not be empty");
+        }).await;
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_design_his WHERE process_design_id BETWEEN 900501 AND 900599").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_design WHERE id BETWEEN 900501 AND 900599").execute(&pool).await.unwrap();
+    }
+
+    /// C10: task_actor 行 id 由应用层雪花生成（规范表 id NOT NULL 无默认值）。
+    /// 历史坑（2026-08）：add_task_actor 曾漏绑 id 列 → 1364 Field 'id' doesn't have
+    /// a default value → startAndExecute 创建任务参与者时全挂（160 salvo L2-02 全挂）。
+    /// 本测试对旧代码必失败（1364），修复后必通过（参与者可写可读回）。
+    #[tokio::test]
+    async fn test_c10_task_actor_id_generated() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        let task_id: i64 = 900601;
+        // Pre-cleanup
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ?").bind(task_id).execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.add_task_actor(task_id, &["actor_a".into(), "actor_b".into()]).unwrap();
+            let actors = repo.find_task_actors(task_id).unwrap();
+            assert_eq!(actors, vec!["actor_a".to_string(), "actor_b".to_string()],
+                "C10: task actors must round-trip (got {:?})", actors);
+        }).await;
+
+        // 确认确实生成了非空 id（规范表不允许 0/NULL）
+        let ids = sqlx::query("SELECT id FROM wf_process_task_actor WHERE process_task_id = ?")
+            .bind(task_id).fetch_all(&pool).await.unwrap();
+        assert_eq!(ids.len(), 2, "C10: two actor rows");
+        for r in &ids {
+            let id: i64 = r.get("id");
+            assert_ne!(id, 0, "C10: task_actor id must be a generated snowflake, not 0");
+        }
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ?").bind(task_id).execute(&pool).await.unwrap();
+    }
+
+    /// C11: find_task_by_id 必须从 wf_process_task_actor 水合 actor_ids。
+    /// 历史坑（2026-08）：find_task_by_id 曾硬编码 actor_ids: vec![] → 权限判定
+    /// is_allowed（依赖 actor_ids.contains(operator)）把真实处理人全部判为"无权限"
+    /// → execute_task_async 报 "Operator X not allowed on task Y"（160 salvo L2-02 全挂）。
+    /// Memory 仓储在内存里保留 actor_ids 故内存测试绿，只有连库才暴露。
+    /// 本测试对旧代码必失败（actor_ids 空 / is_allowed 假），修复后必通过。
+    #[tokio::test]
+    async fn test_c11_find_task_by_id_hydrates_actors() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        let define_id: i64 = 900700;
+        let instance_id: i64 = 900702;
+        let task_id: i64 = 900701;
+        let handler = "the_handler";
+        // Pre-cleanup（各表按各自真实 id 清理，保证可重复跑）
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: define_id, name: "c11_perm_test".into(), display_name: "C11".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let mut instance = ProcessInstance {
+                instance_id, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: None, operator: handler.into(),
+                expire_time: None, variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some(handler.into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut instance).unwrap();
+            let mut task = ProcessTask {
+                task_id, process_instance_id: instance.instance_id,
+                task_name: "apply".into(), display_name: "Apply".into(),
+                task_type: 0, perform_type: 0, task_state: 10, // DOING
+                actor_id: None, actor_ids: vec![handler.to_string()],
+                finish_time: None, expire_time: None, form_key: None,
+                parent_task_id: None, variables: jeeflow_core::json::FlowData::new(),
+                create_time: None, create_user: Some(handler.into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_task(&mut task).unwrap();
+            // 参与者关系表独立存（save_task 不写 task_actor）
+            repo.add_task_actor(task_id, &[handler.to_string()]).unwrap();
+
+            // 关键断言：find_task_by_id 水合 actor_ids，is_allowed 放行真实处理人
+            let loaded = repo.find_task_by_id(task_id).unwrap()
+                .expect("C11: task should load from MySQL");
+            assert!(loaded.actor_ids.contains(&handler.to_string()),
+                "C11: actor_ids must be hydrated from wf_process_task_actor (got {:?})",
+                loaded.actor_ids);
+            assert!(loaded.is_allowed(handler),
+                "C11: real handler must pass is_allowed (actor_ids={:?})", loaded.actor_ids);
+            assert!(!loaded.is_allowed("someone_else"),
+                "C11: non-actor must be denied");
+
+            // find_history_tasks（instance.tasks 水合，complete_task→is_allowed 依赖）同样必须带 actor_ids
+            let hist = repo.find_history_tasks(instance.instance_id).unwrap();
+            assert_eq!(hist.len(), 1, "C11: one history task");
+            assert!(hist[0].actor_ids.contains(&handler.to_string()),
+                "C11: find_history_tasks must also hydrate actor_ids (got {:?})",
+                hist[0].actor_ids);
+            assert!(hist[0].is_allowed(handler),
+                "C11: history task must allow real handler via is_allowed");
+        }).await;
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
     }
 }

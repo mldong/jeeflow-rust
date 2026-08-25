@@ -167,6 +167,19 @@ pub trait FlowInterceptor: Send + Sync {
 }
 
 // ═══════════════════════════════════════════════════════
+// BizDataReader — processInstance/bizData 读侧（issues/30）
+// ═══════════════════════════════════════════════════════
+
+/// 按 relTableName + process_instance_id 回显业务表单条。
+pub trait BizDataReader: Send + Sync {
+    fn read_by_process_instance(
+        &self,
+        table_name: &str,
+        process_instance_id: i64,
+    ) -> JeeflowResult<Option<HashMap<String, JsonValue>>>;
+}
+
+// ═══════════════════════════════════════════════════════
 // AssignmentHandler — guides/07
 // ═══════════════════════════════════════════════════════
 

@@ -23,6 +23,7 @@ pub struct ServiceContext {
     pub transaction_template: Option<Arc<dyn TransactionTemplate>>,
     pub id_generator: Option<Arc<dyn IdGenerator>>,
     pub action_permission_provider: Option<Arc<dyn ActionPermissionProvider>>,
+    pub biz_data_reader: Option<Arc<dyn BizDataReader>>,
     /// Assignment handlers by registration name (Java FQCN).
     pub assignment_handlers: HashMap<String, Arc<dyn AssignmentHandler>>,
     /// Decision handlers by name.
@@ -47,6 +48,7 @@ impl ServiceContext {
             transaction_template: None,
             id_generator: None,
             action_permission_provider: None,
+            biz_data_reader: None,
             assignment_handlers: HashMap::new(),
             decision_handlers: HashMap::new(),
             interceptors: Vec::new(),
@@ -96,6 +98,11 @@ impl ServiceContext {
 
     pub fn with_action_permission_provider(mut self, app: Arc<dyn ActionPermissionProvider>) -> Self {
         self.action_permission_provider = Some(app);
+        self
+    }
+
+    pub fn with_biz_data_reader(mut self, reader: Arc<dyn BizDataReader>) -> Self {
+        self.biz_data_reader = Some(reader);
         self
     }
 

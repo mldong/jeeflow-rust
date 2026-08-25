@@ -5,7 +5,7 @@ use crate::context::ServiceContext;
 use crate::engine::Execution;
 use crate::error::JeeflowResult;
 use crate::json::FlowData;
-use crate::spi::AssignmentHandler;
+use crate::spi::{AssignmentHandler, OrgUserProvider, UserProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -22,41 +22,95 @@ impl AssignmentHandler for OperatorAssignmentHandler {
     }
 }
 
+// 组织维度 handler 公共依赖（对齐 Go orgBase / Java OrgUserAssignmentHandlers：
+// 注册时捕获 provider，assign() 同步调用——引擎执行链在 tokio worker 线程上，
+// 与 add_user_info 的 user_provider 同步调用同路径）。
+#[derive(Clone)]
+struct OrgAssignBase {
+    user: Option<Arc<dyn UserProvider>>,
+    org: Option<Arc<dyn OrgUserProvider>>,
+}
+
+impl OrgAssignBase {
+    /// userId 的部门 id（查不到/出错 → 空串，对齐 Java/Go 返回 null → 节点跳过）。
+    fn dept_id_of(&self, user_id: &str) -> String {
+        if user_id.is_empty() {
+            return String::new();
+        }
+        let Some(up) = &self.user else {
+            return String::new();
+        };
+        match up.get_user(user_id) {
+            Ok(Some(u)) => u.dept_id,
+            _ => String::new(),
+        }
+    }
+
+    /// 部门领导（main=true 分管领导）id 逗号串；查不到 → 空串。
+    fn by_dept(&self, dept_id: &str, main: bool) -> String {
+        if dept_id.is_empty() {
+            return String::new();
+        }
+        let Some(org) = &self.org else {
+            return String::new();
+        };
+        let ids = if main {
+            org.find_dept_main_leaders(dept_id)
+        } else {
+            org.find_dept_leaders(dept_id)
+        };
+        match ids {
+            Ok(v) if !v.is_empty() => v.join(","),
+            _ => String::new(),
+        }
+    }
+}
+
 /// 2. ApplicantDeptLeaderAssignmentHandler — initiator's department leader.
-pub struct ApplicantDeptLeaderAssignmentHandler;
+pub struct ApplicantDeptLeaderAssignmentHandler {
+    base: OrgAssignBase,
+}
 
 impl AssignmentHandler for ApplicantDeptLeaderAssignmentHandler {
-    fn assign(&self, _exec: &Execution) -> JeeflowResult<String> {
-        // Needs OrgUserProvider — resolved at runtime via context
-        // Returns empty if no org provider registered
-        Ok(String::new())
+    fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
+        let dept_id = self.base.dept_id_of(&exec.process_instance.operator);
+        Ok(self.base.by_dept(&dept_id, false))
     }
 }
 
 /// 3. ApplicantDeptMainLeaderAssignmentHandler — initiator's department main leader.
-pub struct ApplicantDeptMainLeaderAssignmentHandler;
+pub struct ApplicantDeptMainLeaderAssignmentHandler {
+    base: OrgAssignBase,
+}
 
 impl AssignmentHandler for ApplicantDeptMainLeaderAssignmentHandler {
-    fn assign(&self, _exec: &Execution) -> JeeflowResult<String> {
-        Ok(String::new())
+    fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
+        let dept_id = self.base.dept_id_of(&exec.process_instance.operator);
+        Ok(self.base.by_dept(&dept_id, true))
     }
 }
 
 /// 4. DeptLeaderAssignmentHandler — current operator's department leader.
-pub struct DeptLeaderAssignmentHandler;
+pub struct DeptLeaderAssignmentHandler {
+    base: OrgAssignBase,
+}
 
 impl AssignmentHandler for DeptLeaderAssignmentHandler {
-    fn assign(&self, _exec: &Execution) -> JeeflowResult<String> {
-        Ok(String::new())
+    fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
+        let dept_id = self.base.dept_id_of(&exec.operator);
+        Ok(self.base.by_dept(&dept_id, false))
     }
 }
 
 /// 5. DeptMainLeaderAssignmentHandler — current operator's department main leader.
-pub struct DeptMainLeaderAssignmentHandler;
+pub struct DeptMainLeaderAssignmentHandler {
+    base: OrgAssignBase,
+}
 
 impl AssignmentHandler for DeptMainLeaderAssignmentHandler {
-    fn assign(&self, _exec: &Execution) -> JeeflowResult<String> {
-        Ok(String::new())
+    fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
+        let dept_id = self.base.dept_id_of(&exec.operator);
+        Ok(self.base.by_dept(&dept_id, true))
     }
 }
 
@@ -65,14 +119,15 @@ pub struct FormFieldAssigneeHandler;
 
 impl AssignmentHandler for FormFieldAssigneeHandler {
     fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
-        // Look for variable named after the current node id
+        // 对齐 Go findFieldValue / Java：f_ 前缀优先、裸名兜底（issues/71 跨语言顺序）。
+        // 引擎 resume 已把 instance.variables 并入 exec.args（见 engine.rs），
+        // 故发起时提交的 f_<nodeId> 在此可达（L3 S11-B）。
         if let Some(node) = &exec.current_node {
-            if let Some(val) = exec.args.get_str(&node.id) {
-                return Ok(val.to_string());
-            }
-            // Also check f_ prefixed
             let f_key = format!("f_{}", node.id);
             if let Some(val) = exec.args.get_str(&f_key) {
+                return Ok(val.to_string());
+            }
+            if let Some(val) = exec.args.get_str(&node.id) {
                 return Ok(val.to_string());
             }
         }
@@ -80,13 +135,23 @@ impl AssignmentHandler for FormFieldAssigneeHandler {
     }
 }
 
-/// 7. TaskRoleAssigneeHandler — assignee by task node id as role code.
-pub struct TaskRoleAssigneeHandler;
+/// 7. TaskRoleAssigneeHandler — assignee by task node id as role code (对齐 Go FindByRole(node.ID)).
+pub struct TaskRoleAssigneeHandler {
+    org: Option<Arc<dyn OrgUserProvider>>,
+}
 
 impl AssignmentHandler for TaskRoleAssigneeHandler {
-    fn assign(&self, _exec: &Execution) -> JeeflowResult<String> {
-        // Needs OrgUserProvider.findByRole(node.id) — resolved at runtime
-        Ok(String::new())
+    fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
+        let Some(node) = &exec.current_node else {
+            return Ok(String::new());
+        };
+        let Some(org) = &self.org else {
+            return Ok(String::new());
+        };
+        match org.find_by_role(&node.id) {
+            Ok(v) if !v.is_empty() => Ok(v.join(",")),
+            _ => Ok(String::new()),
+        }
     }
 }
 
@@ -129,28 +194,34 @@ pub fn filter_fields_by_permission(args: &FlowData, permissions: &HashMap<String
 }
 
 /// Register all 7 built-in assignment handlers into a ServiceContext.
+/// 组织维度 handler 在注册时捕获 user/org provider（对齐 Go RegisterBuiltinAssignments：
+/// provider 必须先注册——wf_factory 的 with_user_provider/with_org_user_provider 在本函数之前）。
 pub fn register_builtin_assignment_handlers(ctx: &mut ServiceContext) {
+    let base = OrgAssignBase {
+        user: ctx.user_provider.clone(),
+        org: ctx.org_user_provider.clone(),
+    };
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler",
         Arc::new(OperatorAssignmentHandler));
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$ApplicantDeptLeaderAssignmentHandler",
-        Arc::new(ApplicantDeptLeaderAssignmentHandler));
+        Arc::new(ApplicantDeptLeaderAssignmentHandler { base: base.clone() }));
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$ApplicantDeptMainLeaderAssignmentHandler",
-        Arc::new(ApplicantDeptMainLeaderAssignmentHandler));
+        Arc::new(ApplicantDeptMainLeaderAssignmentHandler { base: base.clone() }));
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptLeaderAssignmentHandler",
-        Arc::new(DeptLeaderAssignmentHandler));
+        Arc::new(DeptLeaderAssignmentHandler { base: base.clone() }));
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptMainLeaderAssignmentHandler",
-        Arc::new(DeptMainLeaderAssignmentHandler));
+        Arc::new(DeptMainLeaderAssignmentHandler { base }));
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.FormFieldAssigneeHandler",
         Arc::new(FormFieldAssigneeHandler));
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler",
-        Arc::new(TaskRoleAssigneeHandler));
+        Arc::new(TaskRoleAssigneeHandler { org: ctx.org_user_provider.clone() }));
 }
 
 #[cfg(test)]

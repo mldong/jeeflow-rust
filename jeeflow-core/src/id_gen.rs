@@ -18,7 +18,9 @@ struct SnowflakeState {
     sequence: i64,
 }
 
-const EPOCH: i64 = 1577836800000;
+// 对齐 Java MyBatis-Plus IdWorker（1288834974657 = 2010-11-04），与 Go/Java/Python/Node
+// 联邦各栈同一 ID 空间：共享库 ORDER BY id DESC 待办排序中新数据恒排在旧种子数据之前。
+const EPOCH: i64 = 1288834974657;
 const WORKER_ID_BITS: i64 = 10;
 const SEQUENCE_BITS: i64 = 12;
 const MAX_WORKER_ID: i64 = (1 << WORKER_ID_BITS) - 1;
