@@ -69,17 +69,20 @@ let done = facade.flow("processTask/execute", &exec_args).await;
 
 ## 安装
 
-crates.io 发布准备中（打 tag `v*.*.*` 后 CI 按
+crates.io 正式版本（2026-08-25 首发 v1.0.5；打 tag `v*.*.*` 后 CI 按
 `jeeflow-core → jeeflow-repository-sqlx → jeeflow-persist → jeeflow-facade` 拓扑序发布）。
-发布后按 crates.io 最新版本依赖即可，例如：
+按 crates.io 最新版本依赖即可，例如：
 
 ```toml
 [dependencies]
-jeeflow-facade = "1"          # 统一门面
-jeeflow-core = "1"            # 引擎核心（零第三方依赖）
-jeeflow-persist = "1"         # 持久层
-jeeflow-repository-sqlx = { version = "1", features = ["mysql"] }
+jeeflow-facade = "1.0.5"      # 统一门面
+jeeflow-core = "1.0.5"        # 引擎核心（零第三方依赖）
+jeeflow-persist = "1.0.5"     # 持久层
+jeeflow-repository-sqlx = "1.0.5"   # MySQL 仓储（sqlx）
 ```
+
+> 语言指南（快速开始 / 引擎 API / 流程定义 / SPI / persist / salvo 集成 / demo）见 `docs/`，
+> 聚合到[文档站语言指南](https://jeeflow-doc.mldong.com/languages/rust/)。
 
 ## 目录结构
 
