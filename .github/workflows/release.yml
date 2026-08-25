@@ -42,16 +42,29 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
         run: |
+          failed=""
           for c in jeeflow-core jeeflow-repository-sqlx jeeflow-persist jeeflow-facade; do
             echo "=== cargo publish $c ==="
+            ok=0
             for i in 1 2 3; do
               if cargo publish -p "$c"; then
                 echo "✅ $c published"
+                ok=1
                 break
               fi
               echo "重试 $i（等 registry 可解析）"
               sleep 30
             done
+            if [ "$ok" -ne 1 ]; then
+              echo "❌ $c publish 失败，停止（后续 crate 依赖它，必然连带失败）"
+              failed="$failed $c"
+              break
+            fi
             sleep 15  # 让刚发的 crate 可被下一个 crate 的校验构建解析
           done
+          if [ -n "$failed" ]; then
+            echo "## ❌ publish 未完成: $failed"
+            echo "修复后无需重打 tag：gh workflow run release.yml -f tag=<本次tag>"
+            exit 1
+          fi
           echo "✅ 4 crates published"
