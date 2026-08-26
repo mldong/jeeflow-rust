@@ -17,6 +17,8 @@ pub mod engine;
 pub mod handler;
 pub mod interceptor;
 pub mod memory;
+#[cfg(any(test, feature = "dev-flows"))]
+pub mod flowsdir;
 
 pub use error::{JeeflowError, JeeflowResult};
 pub use model::*;

@@ -9,19 +9,11 @@ jobs:
     name: Build & Deploy Rust demo
     runs-on: ubuntu-latest
     steps:
-      # 共享 flows：Dockerfile 需要 jeeflow-java/.../flows
-      - name: Checkout jeeflow-java
-        uses: actions/checkout@v4
-        with:
-          repository: mldong/jeeflow-java
-          path: jeeflow-java
-      - name: Checkout jeeflow-rust
-        uses: actions/checkout@v4
-        with:
-          path: jeeflow-rust
+      # 流程定义用本仓 flows/ 副本（已入库），无需 checkout jeeflow-java
+      - uses: actions/checkout@v4
       - name: Build Docker image
         run: |
-          docker build -f jeeflow-rust/Dockerfile.demo -t jeeflow-rust-demo:latest .
+          docker build -f Dockerfile.demo -t jeeflow-rust-demo:latest .
       - name: Export image
         run: |
           docker save jeeflow-rust-demo:latest -o jeeflow-rust-demo.tar

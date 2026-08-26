@@ -144,16 +144,7 @@ impl UserSearchProvider for DemoUserSearchProvider {
 }
 
 fn flows_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("JEFFLOW_FLOWS_DIR") {
-        return PathBuf::from(d);
-    }
-    // Docker 镜像约定挂载/打包路径
-    let docker = PathBuf::from("/app/flows");
-    if docker.is_dir() {
-        return docker;
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../jeeflow-java/jeeflow-core/src/test/resources/flows")
+    jeeflow_core::flowsdir::dir()
 }
 
 /// 加载共享 LogicFlow JSON（id=1..N 文件名排序），与其他语言 demo 对齐。

@@ -1,19 +1,19 @@
 # jeeflow-rust demo Docker 镜像（多阶段构建）
-# 构建上下文：同时包含 jeeflow-rust/ 与 jeeflow-java/（共享 flows），见 .github/workflows/demo-deploy.yml
+# 构建上下文：本仓根（jeeflow-rust/），见 .github/workflows/demo-deploy.yml
 #
-#   docker build -f jeeflow-rust/Dockerfile.demo -t jeeflow-rust-demo:latest .
+#   docker build -f Dockerfile.demo -t jeeflow-rust-demo:latest .
 #
 FROM rust:1.97-slim AS builder
 
 WORKDIR /build
 
 # 先复制 workspace 配置 + 各 crate Cargo.toml（利用 Docker 层缓存）
-COPY jeeflow-rust/Cargo.toml jeeflow-rust/Cargo.lock ./
-COPY jeeflow-rust/jeeflow-core/Cargo.toml jeeflow-core/Cargo.toml
-COPY jeeflow-rust/jeeflow-repository-sqlx/Cargo.toml jeeflow-repository-sqlx/Cargo.toml
-COPY jeeflow-rust/jeeflow-persist/Cargo.toml jeeflow-persist/Cargo.toml
-COPY jeeflow-rust/jeeflow-facade/Cargo.toml jeeflow-facade/Cargo.toml
-COPY jeeflow-rust/jeeflow-demo-salvo/Cargo.toml jeeflow-demo-salvo/Cargo.toml
+COPY Cargo.toml Cargo.lock ./
+COPY jeeflow-core/Cargo.toml jeeflow-core/Cargo.toml
+COPY jeeflow-repository-sqlx/Cargo.toml jeeflow-repository-sqlx/Cargo.toml
+COPY jeeflow-persist/Cargo.toml jeeflow-persist/Cargo.toml
+COPY jeeflow-facade/Cargo.toml jeeflow-facade/Cargo.toml
+COPY jeeflow-demo-salvo/Cargo.toml jeeflow-demo-salvo/Cargo.toml
 
 # 创建 dummy src 以通过依赖编译缓存
 RUN mkdir -p jeeflow-core/src && echo "pub fn dummy(){}" > jeeflow-core/src/lib.rs && \
@@ -26,11 +26,11 @@ RUN mkdir -p jeeflow-core/src && echo "pub fn dummy(){}" > jeeflow-core/src/lib.
 RUN cargo build --release -p jeeflow-demo-salvo 2>/dev/null || true
 
 # 复制真实源码
-COPY jeeflow-rust/jeeflow-core/src jeeflow-core/src
-COPY jeeflow-rust/jeeflow-repository-sqlx/src jeeflow-repository-sqlx/src
-COPY jeeflow-rust/jeeflow-persist/src jeeflow-persist/src
-COPY jeeflow-rust/jeeflow-facade/src jeeflow-facade/src
-COPY jeeflow-rust/jeeflow-demo-salvo/src jeeflow-demo-salvo/src
+COPY jeeflow-core/src jeeflow-core/src
+COPY jeeflow-repository-sqlx/src jeeflow-repository-sqlx/src
+COPY jeeflow-persist/src jeeflow-persist/src
+COPY jeeflow-facade/src jeeflow-facade/src
+COPY jeeflow-demo-salvo/src jeeflow-demo-salvo/src
 
 # 关键：COPY 保留 git 旧 mtime，会比 dummy 产物还旧 → cargo 跳过重编，镜像里变成空 main！
 # 必须清掉该 package 产物并 touch 源码后再编
@@ -53,7 +53,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 WORKDIR /app
 COPY --chmod=755 --from=builder /out/jeeflow-demo-salvo /usr/local/bin/jeeflow-demo-salvo
-COPY jeeflow-java/jeeflow-core/src/test/resources/flows /app/flows
+# 流程定义用本仓 flows/ 副本（已入库；flowsdir 由 JEFFLOW_FLOWS_DIR 指向 /app/flows，用户单仓即可构建）
+COPY flows /app/flows
 
 ENV JEFFLOW_FLOWS_DIR=/app/flows
 EXPOSE 8091

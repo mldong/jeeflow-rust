@@ -1,7 +1,7 @@
 # 流程定义格式
 
 jeeflow 使用 LogicFlow JSON 作为流程定义格式，与 Java 版完全一致——**同一份流程 JSON 六语言可移植**
-（Java / Go / Python / Node / PHP / Rust 共享 `jeeflow-java/jeeflow-core/src/test/resources/flows/` 驱动测试）。
+（Java / Go / Python / Node / PHP / Rust 各仓带 `flows/` 副本驱动测试，唯一编辑源在 `jeeflow-java` 仓，执行时由 resolver 精确镜像）。
 
 ## 顶层结构
 

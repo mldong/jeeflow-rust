@@ -1168,9 +1168,7 @@ mod tests {
     }
 
     fn flows_dir() -> String {
-        std::env::var("JEFFLOW_FLOWS_DIR").unwrap_or_else(|_| {
-            "G:/mldong-bot/mldong-hub/jeeflow-hub/jeeflow-java/jeeflow-core/src/test/resources/flows".into()
-        })
+        crate::flowsdir::dir().to_string_lossy().into_owned()
     }
 
     fn load_flow(name: &str) -> String {

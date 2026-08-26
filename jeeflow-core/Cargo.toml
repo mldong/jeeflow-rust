@@ -8,6 +8,11 @@ description = "jeeflow workflow engine core - zero external dependencies"
 [dependencies]
 # Zero third-party dependencies - core is pure Rust stdlib only
 
+[features]
+# 仅开发用：暴露 flowsdir 模块（本仓 flows/ 解析 + 镜像 Java 源）。
+# 发布 crate 默认关闭；demo-salvo 以 feature 形式开启。
+dev-flows = []
+
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

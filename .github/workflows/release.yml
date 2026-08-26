@@ -21,20 +21,14 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     env:
-      # engine.rs:908 flows_dir() 默认是 Windows 本机绝对路径，CI 必须覆盖
-      JEFFLOW_FLOWS_DIR: ${{ github.workspace }}/jeeflow-java/jeeflow-core/src/test/resources/flows
+      # cargo publish 打包校验在临时目录跑 jeeflow-core 测试，flowsdir 的
+      # CARGO_MANIFEST_DIR 默认落不到本仓 flows/，故显式指向本仓已入库的 flows/
+      # （内容来自 jeeflow-java 编辑源，维护者执行时由 flowsdir 镜像同步）
+      JEFFLOW_FLOWS_DIR: ${{ github.workspace }}/flows
       # 跳过 sqlx 仓 5 个 T1 MySQL 冒烟测试（CI 无 MySQL 环境，不连 160）
       SKIP_MYSQL: "1"
     steps:
       - uses: actions/checkout@v4
-
-      # 共享 flows：cargo publish 打包校验会编译并跑 jeeflow-core 测试，
-      # 测试用 load_flow() 读共享流程 JSON
-      - name: Checkout jeeflow-java（共享 flows，供打包校验测试用）
-        uses: actions/checkout@v4
-        with:
-          repository: mldong/jeeflow-java
-          path: jeeflow-java
 
       - uses: dtolnay/rust-toolchain@stable
 

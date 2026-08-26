@@ -123,8 +123,8 @@ cargo test --workspace                # T0 内存仓（CI 同款，SKIP_MYSQL=1�
 SKIP_MYSQL=0 cargo test --workspace --features mysql-smoke   # T1 本地 160 MySQL 冒烟
 ```
 
-与 Java 版共享同一套流程 JSON 驱动测试（`jeeflow-java/jeeflow-core/src/test/resources/flows/`，
-15 个共享 fixture，含会签/一票否决/比例场景）。
+与 Java 版共享同一套流程 JSON 驱动测试（本仓 `flows/` 副本，15 个共享 fixture，
+含会签/一票否决/比例场景；唯一编辑源在 `jeeflow-java` 仓，`flowsdir` 在维护者机器上执行时精确镜像进本仓，单语言用户下载即用）。
 
 ## 演示服务
 
@@ -132,7 +132,7 @@ SKIP_MYSQL=0 cargo test --workspace --features mysql-smoke   # T1 本地 160 MyS
 cargo run -p jeeflow-demo-salvo       # :8091
 ```
 
-- 启动时从共享 `jeeflow-java/.../flows/` 加载种子流程（id=1..N）
+- 启动时从本仓 `flows/` 副本加载种子流程（id=1..N；`JEFFLOW_FLOWS_DIR` 可覆盖）
 - 演示用户与其他语言 demo / jeeflow-ui 对齐（user1 / leader / manager …）
 - `POST /wf/{action}` → `facade.flow(action, body)`（门面 action 全转发）
 - `GET /healthz` / `GET /api/stats` / `POST /api/reset`（reset 会重载种子）

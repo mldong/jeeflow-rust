@@ -68,4 +68,4 @@ cargo run -p jeeflow-demo-salvo
 # 打开 http://localhost:8091
 ```
 
-从 `jeeflow-java` 仓库的共享流程 JSON 加载示例流程（简单 / 多级 / 决策 / 会签 / 驳回 / 混合）。
+从本仓 `flows/` 副本加载示例流程（简单 / 多级 / 决策 / 会签 / 驳回 / 混合，15 个；唯一编辑源在 `jeeflow-java` 仓，维护者机器上执行时自动镜像同步）。
