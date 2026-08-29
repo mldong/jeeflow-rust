@@ -2003,9 +2003,15 @@ impl JeeflowFacade {
 
     fn process_surrogate_remove(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let id = arg_i64(args, "id")?.ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        ext.remove_surrogate(id)?;
-        Ok(json!({"id": id}))
+        // issues/95：前端「我的委托」行内/批量删除统一发 {ids}，与 define/design remove 同惯例
+        let ids = arg_ids(args)?;
+        if ids.is_empty() {
+            return Err(JeeflowError::Business("缺少id参数".into()));
+        }
+        for id in ids {
+            ext.remove_surrogate(id)?;
+        }
+        Ok(json!({}))
     }
 }
 
@@ -2445,6 +2451,79 @@ mod tests {
         remove_args.insert("id".to_string(), json!(sg_id));
         let resp4 = facade.flow("processSurrogate/remove", &remove_args).await;
         assert_eq!(resp4["code"], 0);
+    }
+
+    /// issues/95：前端「我的委托」行内与批量删除统一发 {ids}（行内 = 长度 1 的数组），
+    /// 此前门面只读单数 {id} → 该页删除整体不可用；单 {id} 形态保留兼容（移动端发这个）。
+    #[tokio::test]
+    async fn test_process_surrogate_remove_batch_ids() {
+        let facade = make_facade();
+        macro_rules! save_sg {
+            ($op:expr, $agent:expr, $name:expr) => {{
+                let mut a = HashMap::new();
+                a.insert("operator".to_string(), json!($op));
+                a.insert("surrogate".to_string(), json!($agent));
+                a.insert("processName".to_string(), json!($name));
+                let r = facade.flow("processSurrogate/save", &a).await;
+                assert_eq!(r["code"], 0, "save {} 应成功: {}", $name, r);
+                r["data"]["id"].as_str().unwrap().parse::<i64>().unwrap()
+            }};
+        }
+        macro_rules! assert_gone {
+            ($id:expr, $label:expr) => {{
+                let mut d = HashMap::new();
+                d.insert("id".to_string(), json!($id));
+                assert_eq!(
+                    facade.flow("processSurrogate/detail", &d).await["code"],
+                    99999999,
+                    "{} 应已删除",
+                    $label
+                );
+            }};
+        }
+
+        let a = save_sg!("zhangsan", "lisiA", "leaveA");
+        let b = save_sg!("zhangsan", "lisiB", "leaveB");
+        let mut ids_args = HashMap::new();
+        ids_args.insert("ids".to_string(), json!([a, b]));
+        let resp = facade.flow("processSurrogate/remove", &ids_args).await;
+        assert_eq!(resp["code"], 0, "批量 {{ids}} 删除应成功: {}", resp);
+        assert_gone!(a, "批量 a");
+        assert_gone!(b, "批量 b");
+
+        // 行内删除：前端同样走 {ids}，长度 1
+        let c = save_sg!("lisiC", "lisiD", "leaveC");
+        let mut one = HashMap::new();
+        one.insert("ids".to_string(), json!([c]));
+        assert_eq!(facade.flow("processSurrogate/remove", &one).await["code"], 0);
+        assert_gone!(c, "行内 c");
+
+        // 单 {id} 兼容形态回归
+        let d = save_sg!("zhangsan", "lisiE", "leaveD");
+        let mut single = HashMap::new();
+        single.insert("id".to_string(), json!(d));
+        assert_eq!(facade.flow("processSurrogate/remove", &single).await["code"], 0);
+        assert_gone!(d, "单 id d");
+    }
+
+    /// issues/95 §5②：{ids}/{id} 缺失或空数组一律报错，禁止静默成功。
+    #[tokio::test]
+    async fn test_remove_empty_ids_rejected() {
+        let facade = make_facade();
+        let cases: Vec<(&str, Vec<(&str, Json)>)> = vec![
+            ("processSurrogate/remove", vec![("ids", json!([]))]),
+            ("processSurrogate/remove", vec![("surrogate", json!("lisi"))]),
+            ("processSurrogate/remove", vec![("ids", json!([123, null]))]),
+            ("processDefine/remove", vec![("ids", json!([]))]),
+            ("processDesign/remove", vec![("ids", json!([]))]),
+            ("processDefine/upAndDown", vec![("ids", json!([])), ("opType", json!(0))]),
+        ];
+        for (action, pairs) in cases {
+            let args: HashMap<String, Json> =
+                pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            let resp = facade.flow(action, &args).await;
+            assert_eq!(resp["code"], 99999999, "{} {:?} 应报错而非静默成功", action, args);
+        }
     }
 
     // ─── Pagination envelope tests ───
