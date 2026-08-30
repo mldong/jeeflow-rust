@@ -2526,6 +2526,309 @@ mod tests {
         }
     }
 
+    // ─── issues/96 §4B 入口批量参数形态矩阵（arg_ids 助手四态 + 4 action × 4 态）───
+
+    /// 门面入口 args 构造助手（`&str` 键不匹配 `String`，必须 to_string 后再 collect）。
+    fn args_of(pairs: Vec<(&str, Json)>) -> HashMap<String, Json> {
+        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    /// 走仓储落一条测试用流程定义（state=1），返回 id —— 与 make_facade_with_define 同源写法。
+    fn save_define(facade: &JeeflowFacade, name: &str) -> i64 {
+        let mut define = ProcessDefine {
+            id: 0,
+            name: name.into(),
+            display_name: name.into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: br#"{"name":"shape-matrix","nodes":[],"edges":[]}"#.to_vec(),
+            version: 1,
+            create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+        define.id
+    }
+
+    /// 走门面落一条流程设计，返回 id。
+    async fn save_design(facade: &JeeflowFacade, name: &str) -> i64 {
+        let args = args_of(vec![("name", json!(name)), ("displayName", json!(name))]);
+        let resp = facade.flow("processDesign/save", &args).await;
+        assert_eq!(resp["code"], 0, "processDesign/save {} 应成功: {}", name, resp);
+        resp["data"]["id"].as_str().unwrap().parse::<i64>().unwrap()
+    }
+
+    /// 走门面落一条委托，返回 id。
+    async fn save_surrogate(facade: &JeeflowFacade, operator: &str, agent: &str) -> i64 {
+        let args = args_of(vec![
+            ("operator", json!(operator)),
+            ("surrogate", json!(agent)),
+            ("processName", json!("shape-matrix-flow")),
+        ]);
+        let resp = facade.flow("processSurrogate/save", &args).await;
+        assert_eq!(resp["code"], 0, "processSurrogate/save {}→{} 应成功: {}", operator, agent, resp);
+        resp["data"]["id"].as_str().unwrap().parse::<i64>().unwrap()
+    }
+
+    async fn assert_surrogate_gone(facade: &JeeflowFacade, id: i64, label: &str) {
+        let args = args_of(vec![("id", json!(id))]);
+        assert_eq!(
+            facade.flow("processSurrogate/detail", &args).await["code"],
+            99999999,
+            "{}(surrogate id={}) 应已删除",
+            label,
+            id
+        );
+    }
+
+    async fn assert_design_gone(facade: &JeeflowFacade, id: i64, label: &str) {
+        let args = args_of(vec![("id", json!(id))]);
+        assert_eq!(
+            facade.flow("processDesign/detail", &args).await["code"],
+            99999999,
+            "{}(design id={}) 应已删除",
+            label,
+            id
+        );
+    }
+
+    async fn assert_define_gone(facade: &JeeflowFacade, id: i64, label: &str) {
+        let args = args_of(vec![("id", json!(id))]);
+        assert_eq!(
+            facade.flow("processDefine/detail", &args).await["code"],
+            99999999,
+            "{}(define id={}) 应已删除",
+            label,
+            id
+        );
+    }
+
+    /// upAndDown 不删数据，"取不到"的等价断言是 state 已变更。
+    async fn assert_define_state(facade: &JeeflowFacade, id: i64, want: i64, label: &str) {
+        let args = args_of(vec![("id", json!(id))]);
+        let resp = facade.flow("processDefine/detail", &args).await;
+        assert_eq!(resp["code"], 0, "{}(define id={}) 应仍可查", label, id);
+        assert_eq!(
+            resp["data"]["state"].as_i64(),
+            Some(want),
+            "{}(define id={}) 的 state 应已变为 {}",
+            label,
+            id,
+            want
+        );
+    }
+
+    /// issues/96 §4B：把 `arg_ids()` 助手直接单元化（此前零测试）。四态 = 正常数组 / 单值 id 回落 /
+    /// 空数组 / 含非法值。
+    /// ⚠️ 助手对「空数组」与「ids、id 皆缺」的语义是 `Ok(空 Vec)`——那是"没拿到 id"的信号，
+    /// **报错责任在调用方**的 `ids.is_empty()` 守卫（四个 action 的红由下方矩阵用例钉住）；
+    /// 只有含非法值（空串 / null / 非数字串）才由助手本身 Err。
+    #[test]
+    fn test_arg_ids_helper_four_states() {
+        // ① 正常数组（前端 Long 会序列化成字符串，故数字/字符串/混合都要收）
+        let parsed = arg_ids(&args_of(vec![("ids", json!([1, "2", 3]))])).unwrap();
+        assert_eq!(parsed, vec![1i64, 2, 3], "{{ids:[1,\"2\",3]}} 应解析成 3 个 i64");
+        let both = arg_ids(&args_of(vec![("ids", json!([7])), ("id", json!(9))])).unwrap();
+        assert_eq!(both, vec![7], "ids 与 id 同时在时应取 ids");
+
+        // ② 单值 id 回落（移动端旧形态）
+        assert_eq!(arg_ids(&args_of(vec![("id", json!(5))])).unwrap(), vec![5]);
+        assert_eq!(
+            arg_ids(&args_of(vec![("id", json!("6"))])).unwrap(),
+            vec![6],
+            "字符串形式的单值 id 也应回落成功"
+        );
+
+        // ③ 空数组 / 两者皆缺 → Ok(空集)，由 action 守卫报错（禁止静默成功）
+        assert_eq!(
+            arg_ids(&args_of(vec![("ids", json!([]))])).unwrap(),
+            Vec::<i64>::new(),
+            "{{ids:[]}} 助手应交出空集（非 Err），action 必须据此报错"
+        );
+        assert_eq!(
+            arg_ids(&args_of(vec![("surrogate", json!("lisi"))])).unwrap(),
+            Vec::<i64>::new(),
+            "ids/id 皆缺时同样交出空集"
+        );
+
+        // ④ 含非法值 → 助手本身必须 Err
+        for bad in [json!([""]), json!([123, null]), json!(["abc"]), json!([null])] {
+            assert!(
+                arg_ids(&args_of(vec![("ids", bad.clone())])).is_err(),
+                "{{ids:{}}} 应 Err",
+                bad
+            );
+        }
+    }
+
+    /// issues/96 §4B：processSurrogate/remove 的 4 种入口形态。
+    /// 负向只断 code —— Rust 文案（「缺少id参数」/「非法id: …」）与其余五语言
+    /// （「id 缺失或非法」）的 drift 是 issues/95 §偏差 1 + issues/77 已挂号残留，本轮不改文案。
+    #[tokio::test]
+    async fn test_process_surrogate_remove_ids_shape_matrix() {
+        let facade = make_facade();
+
+        // ① {ids:[a,b]} → 成功且事后回查两条都取不到
+        let a = save_surrogate(&facade, "zhangsan", "lisiA").await;
+        let b = save_surrogate(&facade, "zhangsan", "lisiB").await;
+        let args = args_of(vec![("ids", json!([a, b]))]);
+        let resp = facade.flow("processSurrogate/remove", &args).await;
+        assert_eq!(resp["code"], 0, "{{ids:[a,b]}} 删除应成功: {}", resp);
+        assert_surrogate_gone(&facade, a, "批量 a").await;
+        assert_surrogate_gone(&facade, b, "批量 b").await;
+
+        // ② {id:c} → 旧形态不被改坏
+        let c = save_surrogate(&facade, "lisiC", "lisiD").await;
+        let args = args_of(vec![("id", json!(c))]);
+        let resp = facade.flow("processSurrogate/remove", &args).await;
+        assert_eq!(resp["code"], 0, "{{id}} 旧形态应仍可用: {}", resp);
+        assert_surrogate_gone(&facade, c, "单 id c").await;
+
+        // ③ {ids:[]} → 必须非成功（禁止静默成功）
+        let args = args_of(vec![("ids", json!([]))]);
+        assert_eq!(
+            facade.flow("processSurrogate/remove", &args).await["code"],
+            99999999,
+            "{{ids:[]}} 必须报错"
+        );
+
+        // ④ {ids:[""]} / 含 null → 必须报错
+        for bad in [json!([""]), json!([1, null])] {
+            let args = args_of(vec![("ids", bad.clone())]);
+            assert_eq!(
+                facade.flow("processSurrogate/remove", &args).await["code"],
+                99999999,
+                "{{ids:{}}} 必须报错",
+                bad
+            );
+        }
+    }
+
+    /// issues/96 §4B：processDesign/remove 的 4 种入口形态。
+    #[tokio::test]
+    async fn test_process_design_remove_ids_shape_matrix() {
+        let facade = make_facade();
+
+        // ① {ids:[a,b]}
+        let a = save_design(&facade, "design-matrix-a").await;
+        let b = save_design(&facade, "design-matrix-b").await;
+        let args = args_of(vec![("ids", json!([a, b]))]);
+        let resp = facade.flow("processDesign/remove", &args).await;
+        assert_eq!(resp["code"], 0, "{{ids:[a,b]}} 删除应成功: {}", resp);
+        assert_design_gone(&facade, a, "批量 a").await;
+        assert_design_gone(&facade, b, "批量 b").await;
+
+        // ② {id:c}
+        let c = save_design(&facade, "design-matrix-c").await;
+        let args = args_of(vec![("id", json!(c))]);
+        let resp = facade.flow("processDesign/remove", &args).await;
+        assert_eq!(resp["code"], 0, "{{id}} 旧形态应仍可用: {}", resp);
+        assert_design_gone(&facade, c, "单 id c").await;
+
+        // ③ {ids:[]}
+        let args = args_of(vec![("ids", json!([]))]);
+        assert_eq!(
+            facade.flow("processDesign/remove", &args).await["code"],
+            99999999,
+            "{{ids:[]}} 必须报错"
+        );
+
+        // ④ {ids:[""]} / 含 null
+        for bad in [json!([""]), json!([1, null])] {
+            let args = args_of(vec![("ids", bad.clone())]);
+            assert_eq!(
+                facade.flow("processDesign/remove", &args).await["code"],
+                99999999,
+                "{{ids:{}}} 必须报错",
+                bad
+            );
+        }
+    }
+
+    /// issues/96 §4B：processDefine/remove 的 4 种入口形态。
+    #[tokio::test]
+    async fn test_process_define_remove_ids_shape_matrix() {
+        let facade = make_facade();
+
+        // ① {ids:[a,b]}
+        let a = save_define(&facade, "define-matrix-a");
+        let b = save_define(&facade, "define-matrix-b");
+        let args = args_of(vec![("ids", json!([a, b]))]);
+        let resp = facade.flow("processDefine/remove", &args).await;
+        assert_eq!(resp["code"], 0, "{{ids:[a,b]}} 删除应成功: {}", resp);
+        assert_define_gone(&facade, a, "批量 a").await;
+        assert_define_gone(&facade, b, "批量 b").await;
+
+        // ② {id:c}
+        let c = save_define(&facade, "define-matrix-c");
+        let args = args_of(vec![("id", json!(c))]);
+        let resp = facade.flow("processDefine/remove", &args).await;
+        assert_eq!(resp["code"], 0, "{{id}} 旧形态应仍可用: {}", resp);
+        assert_define_gone(&facade, c, "单 id c").await;
+
+        // ③ {ids:[]}
+        let args = args_of(vec![("ids", json!([]))]);
+        assert_eq!(
+            facade.flow("processDefine/remove", &args).await["code"],
+            99999999,
+            "{{ids:[]}} 必须报错"
+        );
+
+        // ④ {ids:[""]} / 含 null
+        for bad in [json!([""]), json!([1, null])] {
+            let args = args_of(vec![("ids", bad.clone())]);
+            assert_eq!(
+                facade.flow("processDefine/remove", &args).await["code"],
+                99999999,
+                "{{ids:{}}} 必须报错",
+                bad
+            );
+        }
+    }
+
+    /// issues/96 §4B：processDefine/upAndDown 的 4 种入口形态。
+    /// ⚠️ 每条载荷都带 opType：该 action 先校验 state/opType，不带就先撞 state 报错，
+    /// ③④ 的"非成功"断言会恒真（失去意义）。state 别名回落已由 test_process_define_up_and_down 覆盖。
+    #[tokio::test]
+    async fn test_process_define_up_and_down_ids_shape_matrix() {
+        let facade = make_facade();
+
+        // ① {ids:[a,b]} + opType → 成功且两条 state 都已变更（upAndDown 不删数据）
+        let a = save_define(&facade, "updown-matrix-a");
+        let b = save_define(&facade, "updown-matrix-b");
+        let args = args_of(vec![("ids", json!([a, b])), ("opType", json!(0))]);
+        let resp = facade.flow("processDefine/upAndDown", &args).await;
+        assert_eq!(resp["code"], 0, "{{ids:[a,b]}} 停用应成功: {}", resp);
+        assert_define_state(&facade, a, 0, "批量 a").await;
+        assert_define_state(&facade, b, 0, "批量 b").await;
+
+        // ② {id:c} + opType
+        let c = save_define(&facade, "updown-matrix-c");
+        let args = args_of(vec![("id", json!(c)), ("opType", json!(0))]);
+        let resp = facade.flow("processDefine/upAndDown", &args).await;
+        assert_eq!(resp["code"], 0, "{{id}} 旧形态应仍可用: {}", resp);
+        assert_define_state(&facade, c, 0, "单 id c").await;
+
+        // ③ {ids:[]} + opType
+        let args = args_of(vec![("ids", json!([])), ("opType", json!(0))]);
+        assert_eq!(
+            facade.flow("processDefine/upAndDown", &args).await["code"],
+            99999999,
+            "{{ids:[]}} 必须报错"
+        );
+
+        // ④ {ids:[""]} / 含 null + opType
+        for bad in [json!([""]), json!([c, null])] {
+            let args = args_of(vec![("ids", bad.clone()), ("opType", json!(0))]);
+            assert_eq!(
+                facade.flow("processDefine/upAndDown", &args).await["code"],
+                99999999,
+                "{{ids:{}}} 必须报错",
+                bad
+            );
+        }
+    }
+
     // ─── Pagination envelope tests ───
 
     #[tokio::test]
