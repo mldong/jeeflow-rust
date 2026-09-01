@@ -340,10 +340,11 @@ impl JeeflowEngineImpl {
                 let tasks = exec.process_instance.create_countersign_tasks(
                     &node.id, &node.display_name, &[actor_ids[0].clone()], &exec.operator,
                     task_type, node.form_key(), None);
-                for t in &tasks {
-                    let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, t.task_id);
-                    ProcessPublisher::notify(&event, &self.ctx.event_listeners);
-                }
+                // TASK_START 不在这里 fire：此处 task_id 尚为 0（create_task 只置 0，
+                // 真实 id 由 persist_tasks→save_task 的 next_id 分配）。若在此 fire，
+                // 监听器 find_task(0) 查不到 → TODO 丢失（issues/13 salvo 栈根因，对齐
+                // Java jeeflow-java 1.8.20「notifyTaskStart 移到 saveTask 之后」的时机修复）。
+                // 统一改在 persist_tasks 落库后 fire（见下）。
                 exec.new_tasks.extend(tasks);
                 exec.process_instance.tasks.last().cloned().unwrap()
             } else {
@@ -351,10 +352,7 @@ impl JeeflowEngineImpl {
                 let tasks = exec.process_instance.create_countersign_tasks(
                     &node.id, &node.display_name, &actor_ids, &exec.operator,
                     task_type, node.form_key(), None);
-                for t in &tasks {
-                    let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, t.task_id);
-                    ProcessPublisher::notify(&event, &self.ctx.event_listeners);
-                }
+                // TASK_START 统一改在 persist_tasks 落库后 fire（见下）。
                 exec.new_tasks.extend(tasks);
                 exec.process_instance.tasks.last().cloned().unwrap()
             }
@@ -364,10 +362,8 @@ impl JeeflowEngineImpl {
                 task_type, perform_type, node.form_key(), None)
         };
 
-        // Fire task start event (non-countersign path)
+        // TASK_START 统一改在 persist_tasks 落库后 fire（见下）。此处只登记新任务。
         if perform_type != PerformType::Countersign {
-            let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, task.task_id);
-            ProcessPublisher::notify(&event, &self.ctx.event_listeners);
             exec.new_tasks.push(task);
         }
 
@@ -525,6 +521,13 @@ impl JeeflowEngineImpl {
     }
 
     /// Persist new tasks (assigns IDs in-place for tasks with id=0).
+    ///
+    /// TASK_START 时机（issues/13 salvo 栈根因闭环，对齐 Java jeeflow-java 1.8.20
+    /// 「notifyTaskStart 移到 saveTask 之后」）：`create_node_tasks` 里 create_task 只置
+    /// task_id=0，真实 id 在本方法 `save_task` 内分配（sqlx save_task 内部 next_id）并
+    /// 立即提交（autocommit，无显式事务）。故 TASK_START 必须在 `save_task` 之后 fire——
+    /// 监听器 `find_task(source_id)` 此时才查得到该任务。若在 create 阶段 fire（id=0/未落库），
+    /// 监听器 find_task 查空 → 静默 return → TODO 待办丢失（messagePage 恒空）。
     fn persist_tasks(&self, instance: &ProcessInstance, new_tasks: &mut [ProcessTask]) -> JeeflowResult<()> {
         for task in new_tasks.iter_mut() {
             if task.task_id == 0 {
@@ -536,6 +539,9 @@ impl JeeflowEngineImpl {
             if !task.actor_ids.is_empty() {
                 self.repo().add_task_actor(task.task_id, &task.actor_ids)?;
             }
+            // 落库后 fire TASK_START（此时 task_id 已分配且行已提交，监听器 find_task 可查）
+            let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, task.task_id);
+            ProcessPublisher::notify(&event, &self.ctx.event_listeners);
         }
         Ok(())
     }
@@ -1072,6 +1078,48 @@ mod tests {
         assert!(result.is_ok());
         let instance = result.unwrap();
         assert_eq!(instance.operator, "user1");
+    }
+
+    /// 捕获 TASK_START 事件的监听器（issues/13 回归测试用，对齐 Java TaskStartEventOrderTest）。
+    struct TaskStartCapture {
+        source_ids: std::sync::Mutex<Vec<i64>>,
+    }
+
+    impl ProcessEventListener for TaskStartCapture {
+        fn on_event(&self, event: &ProcessEvent) {
+            if event.event_type == ProcessEventType::ProcessTaskStart {
+                self.source_ids.lock().unwrap().push(event.source_id);
+            }
+        }
+    }
+
+    /// TASK_START 时机回归（issues/13 salvo 栈根因闭环，对齐 Java jeeflow-java 1.8.20）：
+    /// 事件必须在任务**落库后** fire——source_id 非 0，且事件到达时 find_task(source_id) 查得到。
+    /// 若退回 create 阶段 fire（task_id=0/未落库），此处 `find_task_by_id` 必为 None → 红。
+    #[test]
+    fn test_task_start_event_fires_after_persist() {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let capture = Arc::new(TaskStartCapture { source_ids: std::sync::Mutex::new(Vec::new()) });
+        ctx.register_event_listener(capture.clone());
+        let engine = JeeflowEngineImpl::new(ctx);
+
+        let define_id = make_define(&repo);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+        assert!(instance.instance_id > 0);
+
+        let fired = capture.source_ids.lock().unwrap().clone();
+        // simple_flow_json 的 apply 节点 assignee=applicant → 必产生 1 个任务 → TASK_START 必 fire
+        assert_eq!(fired.len(), 1, "TASK_START 应恰好 fire 一次（simple_flow 单任务节点）");
+        let task_id = fired[0];
+        assert!(task_id > 0, "TASK_START 的 source_id 必须是已分配的真实 task_id（非 0）");
+        assert!(
+            repo.find_task_by_id(task_id).unwrap().is_some(),
+            "TASK_START fire 时任务必须已落库（find_task_by_id 可查）"
+        );
     }
 
     #[test]
