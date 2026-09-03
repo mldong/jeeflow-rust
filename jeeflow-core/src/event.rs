@@ -69,9 +69,44 @@ impl ProcessEvent {
 pub struct ProcessPublisher;
 
 impl ProcessPublisher {
+    /// 发布事件到全部监听器。
+    ///
+    /// 兜底语义（issues/104 P2 统一口径）：单监听器 panic 只捕获不传播——
+    /// 不得影响引擎主流程，也不得中断后续监听器（对齐 PHP per-listener catch；
+    /// Rust 侧 `on_event` 无返回值、异常形态为 panic，故用 catch_unwind 兜底）。
     pub fn notify(event: &ProcessEvent, listeners: &[std::sync::Arc<dyn crate::spi::ProcessEventListener>]) {
         for listener in listeners {
-            listener.on_event(event);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener.on_event(event)));
         }
+    }
+}
+
+#[cfg(test)]
+mod publisher_tests {
+    use super::*;
+    use crate::spi::ProcessEventListener;
+    use std::sync::Arc;
+
+    struct Panicky;
+    impl ProcessEventListener for Panicky {
+        fn on_event(&self, _event: &ProcessEvent) { panic!("boom"); }
+    }
+
+    struct Recorder(std::sync::Mutex<Vec<i64>>);
+    impl ProcessEventListener for Recorder {
+        fn on_event(&self, event: &ProcessEvent) {
+            self.0.lock().unwrap().push(event.source_id);
+        }
+    }
+
+    /// 兜底语义（issues/104 P2）：单监听器 panic 不传播、不中断后续监听器。
+    #[test]
+    fn test_publisher_listener_panic_isolated() {
+        let recorder = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        let listeners: Vec<std::sync::Arc<dyn ProcessEventListener>> =
+            vec![Arc::new(Panicky), recorder.clone()];
+        let event = ProcessEvent::new(ProcessEventType::ProcessInstanceStart, 42);
+        ProcessPublisher::notify(&event, &listeners);
+        assert_eq!(*recorder.0.lock().unwrap(), vec![42], "panic 后后续监听器应仍被调用");
     }
 }
