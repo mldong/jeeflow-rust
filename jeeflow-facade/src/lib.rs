@@ -1297,6 +1297,8 @@ impl JeeflowFacade {
             return Err(JeeflowError::Business("actorIds 缺失".into()));
         }
         self.repo.create_cc_instance(id, &operator, &actors)?;
+        // CC_CREATE（issues/102·104，六语言统一）：手动补抄送逐抄送人 fire（对齐 Go facade）
+        self.engine.notify_cc_create(id, &actors);
         Ok(json!({}))
     }
 
@@ -4387,6 +4389,50 @@ mod tests {
             let resp = facade.flow(action, &args).await;
             assert_eq!(resp["code"], 0, "Action {} should succeed, got: {}", action, resp);
         }
+    }
+
+    use jeeflow_core::event::{ProcessEvent, ProcessEventType};
+
+    /// 捕获 CC_CREATE 事件的监听器（issues/102·104 P0）。
+    struct CcCreateCapture {
+        events: std::sync::Mutex<Vec<(i64, Option<String>)>>,
+    }
+
+    impl ProcessEventListener for CcCreateCapture {
+        fn on_event(&self, event: &ProcessEvent) {
+            if event.event_type == ProcessEventType::CcCreate {
+                self.events.lock().unwrap()
+                    .push((event.source_id, event.cc_actor_id.clone()));
+            }
+        }
+    }
+
+    /// P0：facade 手动补抄送（createCCInstance）→ 逐抄送人 fire CC_CREATE（对齐 Go facade）。
+    #[tokio::test]
+    async fn test_cc_create_fired_on_manual_create_cc() {
+        use jeeflow_core::spi::ProcessEventListener as _;
+
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let capture = Arc::new(CcCreateCapture { events: std::sync::Mutex::new(Vec::new()) });
+        ctx.register_event_listener(capture.clone());
+        let facade = JeeflowFacade::new(ctx);
+
+        let mut args = HashMap::new();
+        args.insert("processInstanceId".to_string(), json!(1001));
+        args.insert("operator".to_string(), json!("user1"));
+        args.insert("actorIds".to_string(), json!(["u3", "u4"]));
+        let resp = facade.flow("processInstance/createCCInstance", &args).await;
+        assert_eq!(resp["code"], 0, "createCCInstance 应成功：{}", resp);
+
+        let fired = capture.events.lock().unwrap().clone();
+        assert_eq!(fired.len(), 2, "手动补抄送应逐抄送人 fire，实得 {:?}", fired);
+        assert!(fired.iter().all(|(sid, _)| *sid == 1001));
+        let actors: Vec<String> = fired.iter().map(|(_, a)| a.clone().unwrap()).collect();
+        assert_eq!(actors, vec!["u3".to_string(), "u4".to_string()]);
     }
 
     #[test]

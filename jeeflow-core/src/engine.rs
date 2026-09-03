@@ -99,6 +99,17 @@ impl JeeflowEngineImpl {
         &self.ctx
     }
 
+    /// 抄送知会事件（CC_CREATE / issues/102·104）：逐抄送人 fire，`cc_actor_id` 直传事件体。
+    /// 接收人过滤（trim / 非空 / 去重）由集成层监听器负责，引擎只按 cc 行粒度 fire
+    /// （对齐 Java `notifyCcCreate` / PHP v1.3.8）。无监听器装配时零副作用。
+    pub fn notify_cc_create(&self, instance_id: i64, cc_actors: &[String]) {
+        for actor in cc_actors {
+            let event = ProcessEvent::new(ProcessEventType::CcCreate, instance_id)
+                .with_cc_actor_id(actor.clone());
+            ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+        }
+    }
+
     fn repo(&self) -> &Arc<dyn ProcessRepository> {
         self.ctx.get_repository()
     }
@@ -622,6 +633,8 @@ impl JeeflowEngineImpl {
         let cc_actors = parse_cc_actors(full_args.inner().get("f_ccActors"));
         if !cc_actors.is_empty() {
             self.repo().create_cc_instance(instance.instance_id, operator, &cc_actors)?;
+            // CC_CREATE（issues/102·104，六语言统一）：逐抄送人 fire，与 cc 行粒度一一对应
+            self.notify_cc_create(instance.instance_id, &cc_actors);
         }
 
         // 9. Execute from start node
@@ -843,6 +856,8 @@ impl JeeflowEngineImpl {
                 .collect();
             if !actors.is_empty() {
                 self.repo().create_cc_instance(exec.process_instance.instance_id, operator, &actors)?;
+                // CC_CREATE（issues/102·104，六语言统一）：办理时抄送同样逐抄送人 fire
+                self.notify_cc_create(exec.process_instance.instance_id, &actors);
             }
         }
 
@@ -1120,6 +1135,76 @@ mod tests {
             repo.find_task_by_id(task_id).unwrap().is_some(),
             "TASK_START fire 时任务必须已落库（find_task_by_id 可查）"
         );
+    }
+
+    /// 捕获 CC_CREATE 事件的监听器（issues/102·104 P0 测试，对齐 Java CcCreateEventTest）。
+    struct CcCreateCapture {
+        events: std::sync::Mutex<Vec<(i64, Option<String>)>>,
+    }
+
+    impl ProcessEventListener for CcCreateCapture {
+        fn on_event(&self, event: &ProcessEvent) {
+            if event.event_type == ProcessEventType::CcCreate {
+                self.events.lock().unwrap()
+                    .push((event.source_id, event.cc_actor_id.clone()));
+            }
+        }
+    }
+
+    /// P0 正向（issues/102 验收口径）：带抄送人发起 → **逐抄送人** fire CC_CREATE，
+    /// source_id=instance_id、cc_actor_id 与 f_ccActors 顺序一一对应、cc 行已落库。
+    #[test]
+    fn test_cc_create_event_fired_per_actor() {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let capture = Arc::new(CcCreateCapture { events: std::sync::Mutex::new(Vec::new()) });
+        ctx.register_event_listener(capture.clone());
+        let engine = JeeflowEngineImpl::new(ctx);
+
+        let define_id = make_define(&repo);
+        let mut args = FlowData::new();
+        args.insert("f_ccActors".into(), JsonValue::Array(vec![
+            JsonValue::Str("u1".into()), JsonValue::Str("u2".into()),
+        ]));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &args)).unwrap();
+
+        let fired = capture.events.lock().unwrap().clone();
+        assert_eq!(fired.len(), 2, "应逐抄送人 fire 恰好两次，实得 {:?}", fired);
+        assert!(fired.iter().all(|(sid, _)| *sid == instance.instance_id),
+            "source_id 应为 instance_id：{:?}", fired);
+        let actors: Vec<String> = fired.iter().map(|(_, a)| a.clone().expect("cc_actor_id 应直传")).collect();
+        assert_eq!(actors, vec!["u1".to_string(), "u2".to_string()], "cc_actor_id 顺序应与 f_ccActors 一致");
+
+        // cc 行已落库，且与 fire 粒度一一对应
+        let mut q = crate::model::PageQuery::new(1, 10);
+        let page = repo.page_cc_instances(&mut q).unwrap();
+        assert_eq!(page.record_count, 2, "cc 实例应逐人落库");
+    }
+
+    /// P0 零副作用（issues/102 验收口径）：无监听器装配 → 抄送照常落库、fire 侧不抛错。
+    #[test]
+    fn test_cc_create_no_listener_zero_side_effect() {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let engine = JeeflowEngineImpl::new(ctx);
+
+        let define_id = make_define(&repo);
+        let mut args = FlowData::new();
+        args.insert("f_ccActors".into(), JsonValue::Array(vec![
+            JsonValue::Str("u9".into()),
+        ]));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &args)).unwrap();
+
+        let mut q = crate::model::PageQuery::new(1, 10);
+        let page = repo.page_cc_instances(&mut q).unwrap();
+        assert_eq!(page.record_count, 1, "无监听器时 cc 实例仍应照常落库");
+        assert!(instance.instance_id > 0);
     }
 
     #[test]
