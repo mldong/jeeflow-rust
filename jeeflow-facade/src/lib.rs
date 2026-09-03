@@ -2220,7 +2220,8 @@ fn stats_filter_instances(
         }
         if let (Some(e), Some(ct)) = (end, inst.create_time.as_ref()) {
             if let Ok(t) = chrono::NaiveDateTime::parse_from_str(ct, "%Y-%m-%d %H:%M:%S") {
-                if t >= e { return false; }
+                // end 含端（对齐内置线 create_time < date_add(end, interval 1 second)）
+                if t > e { return false; }
             } else { return false; }
         }
         true
@@ -2237,7 +2238,8 @@ fn stats_filter_finished_tasks(
         if let Some(ft_str) = &t.finish_time {
             if let Ok(ft) = chrono::NaiveDateTime::parse_from_str(ft_str, "%Y-%m-%d %H:%M:%S") {
                 if let Some(s) = start { if ft < s { return false; } }
-                if let Some(e) = end { if ft >= e { return false; } }
+                // end 含端（对齐内置线 finish_time < date_add(end, interval 1 second)）
+                if let Some(e) = end { if ft > e { return false; } }
                 true
             } else { false }
         } else { false }
