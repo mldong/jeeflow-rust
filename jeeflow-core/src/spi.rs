@@ -49,6 +49,10 @@ pub trait ProcessRepository: Send + Sync {
     fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>>;
     fn page_defines(&self, query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>>;
     fn count_todo_tasks(&self, user_id: &str) -> JeeflowResult<i64>;
+
+    // ═══ Stats bulk queries (issues/103) ═══
+    fn get_all_instances(&self) -> JeeflowResult<Vec<ProcessInstance>>;
+    fn get_all_tasks(&self) -> JeeflowResult<Vec<ProcessTask>>;
 }
 
 // ═══════════════════════════════════════════════════════

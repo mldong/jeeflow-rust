@@ -12,6 +12,7 @@ use jeeflow_core::spi::*;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use chrono::{Datelike, Timelike};
 
 // ═══════════════════════════════════════════════════════
 // Response envelope
@@ -781,7 +782,7 @@ impl JeeflowFacade {
             "processDefine/upAndDown" => self.process_define_up_and_down(args),
             "processDefine/getLastByName" => self.process_define_get_last_by_name(args),
 
-            // ═══ processInstance (11) ═══
+            // ═══ processInstance (14) ═══
             "processInstance/page" => self.process_instance_page(args),
             "processInstance/detail" => self.process_instance_detail(args),
             "processInstance/startAndExecute" => self.process_instance_start_and_execute(args).await,
@@ -793,6 +794,9 @@ impl JeeflowFacade {
             "processInstance/createCCInstance" => self.process_instance_create_cc(args),
             "processInstance/updateCCStatus" => self.process_instance_update_cc_status(args),
             "processInstance/ccList" => self.process_instance_cc_list(args),
+            "processInstance/stats/overview" => self.stats_overview(args),
+            "processInstance/stats/trend" => self.stats_trend(args),
+            "processInstance/stats/group" => self.stats_group(args),
 
             // ═══ processTask (9) ═══
             "processTask/todoList" => self.process_task_todo_list(args),
@@ -2177,6 +2181,573 @@ fn build_node_progress(
 }
 
 // ═══════════════════════════════════════════════════════
+// Stats 3 actions (issues/103)
+// ═══════════════════════════════════════════════════════
+
+const DEFAULT_STATE_IN: &[i32] = &[10, 20, 30, 40, 45, 50];
+const DEFAULT_STATS_LIMIT: usize = 10;
+const VALID_GRANULARITY: &[&str] = &["hour", "day", "week", "month"];
+const VALID_DIMENSION: &[&str] = &[
+    "state", "define", "category", "approver", "applicant",
+    "node", "stuckNode", "stuckApprover", "durationBucket",
+];
+
+fn stats_parse_time(s: Option<&str>) -> Option<chrono::NaiveDateTime> {
+    s.and_then(|v| chrono::NaiveDateTime::parse_from_str(v, "%Y-%m-%d %H:%M:%S").ok())
+}
+
+fn stats_round4(v: f64) -> f64 {
+    (v * 10000.0).round() / 10000.0
+}
+
+fn stats_filter_instances(
+    instances: &[ProcessInstance],
+    state_in: &[i32],
+    start: Option<chrono::NaiveDateTime>,
+    end: Option<chrono::NaiveDateTime>,
+) -> Vec<ProcessInstance> {
+    instances.iter().filter(|inst| {
+        if !state_in.contains(&inst.state) {
+            return false;
+        }
+        if let (Some(s), Some(ct)) = (start, inst.create_time.as_ref()) {
+            if let Ok(t) = chrono::NaiveDateTime::parse_from_str(ct, "%Y-%m-%d %H:%M:%S") {
+                if t < s { return false; }
+            } else { return false; }
+        }
+        if let (Some(e), Some(ct)) = (end, inst.create_time.as_ref()) {
+            if let Ok(t) = chrono::NaiveDateTime::parse_from_str(ct, "%Y-%m-%d %H:%M:%S") {
+                if t >= e { return false; }
+            } else { return false; }
+        }
+        true
+    }).cloned().collect()
+}
+
+fn stats_filter_finished_tasks(
+    tasks: &[ProcessTask],
+    start: Option<chrono::NaiveDateTime>,
+    end: Option<chrono::NaiveDateTime>,
+) -> Vec<ProcessTask> {
+    tasks.iter().filter(|t| {
+        if t.task_state != TaskState::Finished.code() { return false; }
+        if let Some(ft_str) = &t.finish_time {
+            if let Ok(ft) = chrono::NaiveDateTime::parse_from_str(ft_str, "%Y-%m-%d %H:%M:%S") {
+                if let Some(s) = start { if ft < s { return false; } }
+                if let Some(e) = end { if ft >= e { return false; } }
+                true
+            } else { false }
+        } else { false }
+    }).cloned().collect()
+}
+
+fn stats_enumerate_buckets(
+    start: Option<chrono::NaiveDateTime>,
+    end: Option<chrono::NaiveDateTime>,
+    granularity: &str,
+) -> Vec<String> {
+    let now = chrono::Local::now().naive_local();
+    let s = start.unwrap_or_else(|| now - chrono::Duration::days(30));
+    let e = end.unwrap_or(now);
+    let mut buckets = Vec::new();
+    match granularity {
+        "hour" => {
+            let mut cursor = s.date().and_hms_opt(s.hour(), 0, 0).unwrap();
+            while cursor <= e {
+                buckets.push(cursor.format("%Y-%m-%d %H:00").to_string());
+                cursor += chrono::Duration::hours(1);
+            }
+        }
+        "day" => {
+            let mut cursor = s.date().and_hms_opt(0, 0, 0).unwrap();
+            let end_day = e.date().and_hms_opt(0, 0, 0).unwrap();
+            while cursor <= end_day {
+                buckets.push(cursor.format("%Y-%m-%d").to_string());
+                cursor += chrono::Duration::days(1);
+            }
+        }
+        "week" => {
+            let mut cursor = s.date().and_hms_opt(0, 0, 0).unwrap();
+            let weekday = cursor.date().weekday();
+            let offset = weekday.num_days_from_monday() as i64;
+            cursor -= chrono::Duration::days(offset);
+            let end_day = e.date().and_hms_opt(0, 0, 0).unwrap();
+            while cursor <= end_day {
+                let iso_year = cursor.date().iso_week().year();
+                let iso_week = cursor.date().iso_week().week();
+                buckets.push(format!("{}-W{:02}", iso_year, iso_week));
+                cursor += chrono::Duration::days(7);
+            }
+        }
+        "month" => {
+            let mut year = s.year();
+            let mut month = s.month() as i32;
+            let end_year = e.year();
+            let end_month = e.month() as i32;
+            while year < end_year || (year == end_year && month <= end_month) {
+                buckets.push(format!("{:04}-{:02}", year, month));
+                month += 1;
+                if month > 12 { month = 1; year += 1; }
+            }
+        }
+        _ => {}
+    }
+    buckets
+}
+
+fn stats_bucket_key(dt: chrono::NaiveDateTime, granularity: &str) -> String {
+    match granularity {
+        "hour" => dt.format("%Y-%m-%d %H:00").to_string(),
+        "day" => dt.format("%Y-%m-%d").to_string(),
+        "week" => {
+            let iso_year = dt.date().iso_week().year();
+            let iso_week = dt.date().iso_week().week();
+            format!("{}-W{:02}", iso_year, iso_week)
+        }
+        "month" => dt.format("%Y-%m").to_string(),
+        _ => String::new(),
+    }
+}
+
+impl JeeflowFacade {
+    /// stats/overview — 13-field flat overview
+    pub fn stats_overview(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        let start = stats_parse_time(args.get("start").and_then(|v| v.as_str()));
+        let end = stats_parse_time(args.get("end").and_then(|v| v.as_str()));
+
+        let all_instances = self.repo.get_all_instances()?;
+        let filtered = stats_filter_instances(&all_instances, DEFAULT_STATE_IN, start, end);
+
+        let mut by_state: HashMap<i32, i32> = HashMap::new();
+        for inst in &filtered {
+            *by_state.entry(inst.state).or_insert(0) += 1;
+        }
+        let total = filtered.len() as i32;
+        let in_progress = by_state.get(&10).copied().unwrap_or(0);
+        let completed = by_state.get(&20).copied().unwrap_or(0);
+        let rejected = by_state.get(&45).copied().unwrap_or(0);
+        let withdrawn = by_state.get(&30).copied().unwrap_or(0);
+        let suspended = by_state.get(&50).copied().unwrap_or(0);
+
+        // todayNew — server today, ignores start/end
+        let now = chrono::Local::now().naive_local();
+        let today_start = now.date().and_hms_opt(0, 0, 0).unwrap();
+        let today_end = today_start + chrono::Duration::days(1);
+        let today_filtered = stats_filter_instances(&all_instances, DEFAULT_STATE_IN, Some(today_start), Some(today_end));
+        let today_new = today_filtered.len() as i32;
+
+        // pendingTaskCount + overdueTaskCount — all tasks, not filtered by stateIn
+        let all_tasks = self.repo.get_all_tasks()?;
+        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut pending_count = 0i32;
+        let mut overdue_count = 0i32;
+        for t in &all_tasks {
+            if t.task_state == TaskState::Doing.code() {
+                pending_count += 1;
+                if let Some(exp) = &t.expire_time {
+                    if exp.as_str() < now_str.as_str() {
+                        overdue_count += 1;
+                    }
+                }
+            }
+        }
+
+        // countersignRate + onTimeRate — from finished tasks
+        let finished_tasks: Vec<&ProcessTask> = all_tasks.iter()
+            .filter(|t| t.task_state == TaskState::Finished.code())
+            .collect();
+        let task_total = finished_tasks.len();
+        let countersign = finished_tasks.iter()
+            .filter(|t| t.perform_type == PerformType::Countersign.code())
+            .count();
+        let mut on_time = 0i32;
+        let mut on_time_denom = 0i32;
+        for t in &finished_tasks {
+            if let (Some(ft_str), Some(exp_str)) = (&t.finish_time, &t.expire_time) {
+                on_time_denom += 1;
+                if ft_str.as_str() <= exp_str.as_str() {
+                    on_time += 1;
+                }
+            }
+        }
+        let countersign_rate = if task_total > 0 {
+            stats_round4(countersign as f64 / task_total as f64)
+        } else { 0.0 };
+        let on_time_rate = if on_time_denom > 0 {
+            stats_round4(on_time as f64 / on_time_denom as f64)
+        } else { 0.0 };
+
+        // avgDurationSeconds — completed instances: MAX(task.finish_time) - instance.create_time
+        let completed_instances: Vec<&ProcessInstance> = filtered.iter()
+            .filter(|inst| inst.state == InstanceState::Finished.code())
+            .collect();
+        let mut total_dur: i64 = 0;
+        let mut dur_count = 0i64;
+        for inst in &completed_instances {
+            if let Some(ct_str) = &inst.create_time {
+                if let Some(ct) = stats_parse_time(Some(ct_str.as_str())) {
+                    let mut max_ft: Option<chrono::NaiveDateTime> = None;
+                    for t in &all_tasks {
+                        if t.process_instance_id == inst.instance_id {
+                            if let Some(ft_str) = &t.finish_time {
+                                if let Some(ft) = stats_parse_time(Some(ft_str.as_str())) {
+                                    max_ft = Some(match max_ft {
+                                        Some(prev) if prev > ft => prev,
+                                        _ => ft,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ft) = max_ft {
+                        total_dur += (ft - ct).num_seconds();
+                        dur_count += 1;
+                    }
+                }
+            }
+        }
+        let avg_duration = if dur_count > 0 {
+            ((total_dur as f64) / (dur_count as f64)).round() as i64
+        } else { 0 };
+
+        let reject_rate = stats_round4(rejected as f64 / std::cmp::max(1, completed + rejected) as f64);
+
+        Ok(json!({
+            "total": total,
+            "inProgress": in_progress,
+            "completed": completed,
+            "rejected": rejected,
+            "withdrawn": withdrawn,
+            "suspended": suspended,
+            "todayNew": today_new,
+            "avgDurationSeconds": avg_duration,
+            "rejectRate": reject_rate,
+            "pendingTaskCount": pending_count,
+            "overdueTaskCount": overdue_count,
+            "countersignRate": countersign_rate,
+            "onTimeRate": on_time_rate,
+        }))
+    }
+
+    /// stats/trend — continuous time buckets
+    pub fn stats_trend(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        let start = stats_parse_time(args.get("start").and_then(|v| v.as_str()));
+        let end = stats_parse_time(args.get("end").and_then(|v| v.as_str()));
+        let granularity = args.get("granularity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("day");
+        if !VALID_GRANULARITY.contains(&granularity) {
+            return Err(JeeflowError::Business("granularity 参数非法，允许值：hour/day/week/month".into()));
+        }
+
+        let all_instances = self.repo.get_all_instances()?;
+        let filtered = stats_filter_instances(&all_instances, DEFAULT_STATE_IN, start, end);
+
+        let all_tasks = self.repo.get_all_tasks()?;
+        let finished_tasks = stats_filter_finished_tasks(&all_tasks, start, end);
+
+        let buckets = stats_enumerate_buckets(start, end, granularity);
+        let mut bucket_map: HashMap<String, (i32, i32)> = HashMap::new();
+        for b in &buckets {
+            bucket_map.insert(b.clone(), (0, 0));
+        }
+
+        for inst in &filtered {
+            if let Some(ct_str) = &inst.create_time {
+                if let Some(ct) = stats_parse_time(Some(ct_str.as_str())) {
+                    let bk = stats_bucket_key(ct, granularity);
+                    if let Some(entry) = bucket_map.get_mut(&bk) {
+                        entry.0 += 1;
+                    }
+                }
+            }
+        }
+
+        for task in &finished_tasks {
+            if let Some(ft_str) = &task.finish_time {
+                if let Some(ft) = stats_parse_time(Some(ft_str.as_str())) {
+                    let bk = stats_bucket_key(ft, granularity);
+                    if let Some(entry) = bucket_map.get_mut(&bk) {
+                        entry.1 += 1;
+                    }
+                }
+            }
+        }
+
+        let series: Vec<Json> = buckets.iter().map(|b| {
+            let (started, finished) = bucket_map.get(b).copied().unwrap_or((0, 0));
+            json!({"bucket": b, "started": started, "finished": finished})
+        }).collect();
+
+        Ok(json!({
+            "granularity": granularity,
+            "series": series,
+        }))
+    }
+
+    /// stats/group — dimension-based grouping
+    pub fn stats_group(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        let start = stats_parse_time(args.get("start").and_then(|v| v.as_str()));
+        let end = stats_parse_time(args.get("end").and_then(|v| v.as_str()));
+        let dimension = args.get("dimension")
+            .and_then(|v| v.as_str())
+            .unwrap_or("define");
+        let limit = args.get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_STATS_LIMIT);
+
+        if !VALID_DIMENSION.contains(&dimension) {
+            return Err(JeeflowError::Business("dimension 参数非法，允许值：state/define/category/approver/applicant/node/stuckNode/stuckApprover/durationBucket".into()));
+        }
+
+        let all_instances = self.repo.get_all_instances()?;
+        let all_tasks = self.repo.get_all_tasks()?;
+        let filtered = stats_filter_instances(&all_instances, DEFAULT_STATE_IN, start, end);
+
+        let rows: Vec<Json> = match dimension {
+            "state" => {
+                let mut grouped: HashMap<String, i32> = HashMap::new();
+                for inst in &filtered {
+                    *grouped.entry(inst.state.to_string()).or_insert(0) += 1;
+                }
+                let mut entries: Vec<(String, i32)> = grouped.into_iter().collect();
+                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                entries.truncate(limit);
+                entries.iter().map(|(k, c)| json!({
+                    "key": k, "label": Json::Null, "count": c, "avgDurationSeconds": Json::Null,
+                })).collect()
+            }
+
+            "define" => {
+                let ext = self.ext_repo.as_ref()
+                    .ok_or_else(|| JeeflowError::Internal("ExtRepository not registered".into()))?;
+                let mut by_define: HashMap<i64, Vec<&ProcessInstance>> = HashMap::new();
+                for inst in &filtered {
+                    by_define.entry(inst.define_id).or_default().push(inst);
+                }
+                // max finish_time per instance from all_tasks
+                let mut inst_max_ft: HashMap<i64, Option<chrono::NaiveDateTime>> = HashMap::new();
+                for t in &all_tasks {
+                    if t.task_state == TaskState::Finished.code() {
+                        if let Some(ft_str) = &t.finish_time {
+                            if let Some(ft) = stats_parse_time(Some(ft_str.as_str())) {
+                                let entry = inst_max_ft.entry(t.process_instance_id).or_insert(None);
+                                *entry = Some(match entry {
+                                    Some(prev) if *prev > ft => *prev,
+                                    _ => ft,
+                                });
+                            }
+                        }
+                    }
+                }
+                let mut entries: Vec<(String, Option<String>, usize, Option<i64>)> = Vec::new();
+                for (define_id, insts) in &by_define {
+                    let design = ext.find_design_by_id(*define_id)?;
+                    let (key, label) = match &design {
+                        Some(d) => (d.name.clone(), Some(d.display_name.clone())),
+                        None => (define_id.to_string(), None),
+                    };
+                    let mut total_dur: i64 = 0;
+                    let mut dur_count: i64 = 0;
+                    for inst in insts {
+                        if inst.state == InstanceState::Finished.code() {
+                            if let Some(ct_str) = &inst.create_time {
+                                if let Some(ct) = stats_parse_time(Some(ct_str.as_str())) {
+                                    if let Some(Some(ft)) = inst_max_ft.get(&inst.instance_id) {
+                                        total_dur += (*ft - ct).num_seconds();
+                                        dur_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let avg = if dur_count > 0 {
+                        Some((total_dur as f64 / dur_count as f64).round() as i64)
+                    } else { None };
+                    entries.push((key, label, insts.len(), avg));
+                }
+                entries.sort_by(|a, b| b.2.cmp(&a.2));
+                entries.truncate(limit);
+                entries.iter().map(|(k, l, c, avg)| json!({
+                    "key": k, "label": l, "count": c, "avgDurationSeconds": avg,
+                })).collect()
+            }
+
+            "category" => {
+                let ext = self.ext_repo.as_ref()
+                    .ok_or_else(|| JeeflowError::Internal("ExtRepository not registered".into()))?;
+                let mut define_types: HashMap<i64, String> = HashMap::new();
+                for inst in &filtered {
+                    if !define_types.contains_key(&inst.define_id) {
+                        let design = ext.find_design_by_id(inst.define_id)?;
+                        let tp = design.map(|d| d.design_type.clone()).unwrap_or_default();
+                        define_types.insert(inst.define_id, tp);
+                    }
+                }
+                let mut grouped: HashMap<String, i32> = HashMap::new();
+                for inst in &filtered {
+                    let tp = define_types.get(&inst.define_id).cloned().unwrap_or_default();
+                    *grouped.entry(tp).or_insert(0) += 1;
+                }
+                let mut entries: Vec<(String, i32)> = grouped.into_iter().collect();
+                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                entries.truncate(limit);
+                entries.iter().map(|(k, c)| json!({
+                    "key": k, "label": Json::Null, "count": c, "avgDurationSeconds": Json::Null,
+                })).collect()
+            }
+
+            "approver" => {
+                let finished = stats_filter_finished_tasks(&all_tasks, start, end);
+                let mut grouped: HashMap<String, i32> = HashMap::new();
+                for t in &finished {
+                    if let Some(aid) = &t.actor_id {
+                        if !aid.is_empty() {
+                            *grouped.entry(aid.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let mut entries: Vec<(String, i32)> = grouped.into_iter().collect();
+                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                entries.truncate(limit);
+                entries.iter().map(|(k, c)| json!({
+                    "key": k, "label": Json::Null, "count": c, "avgDurationSeconds": Json::Null,
+                })).collect()
+            }
+
+            "applicant" => {
+                let mut grouped: HashMap<String, i32> = HashMap::new();
+                for inst in &filtered {
+                    if !inst.operator.is_empty() {
+                        *grouped.entry(inst.operator.clone()).or_insert(0) += 1;
+                    }
+                }
+                let mut entries: Vec<(String, i32)> = grouped.into_iter().collect();
+                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                entries.truncate(limit);
+                entries.iter().map(|(k, c)| json!({
+                    "key": k, "label": Json::Null, "count": c, "avgDurationSeconds": Json::Null,
+                })).collect()
+            }
+
+            "node" => {
+                let finished = stats_filter_finished_tasks(&all_tasks, start, end);
+                struct NodeAgg { count: i32, total_dur: i64 }
+                let mut grouped: HashMap<String, NodeAgg> = HashMap::new();
+                for t in &finished {
+                    if t.display_name.is_empty() { continue; }
+                    let dur = if let (Some(ft_str), Some(ct_str)) = (&t.finish_time, &t.create_time) {
+                        if let (Some(ft), Some(ct)) = (stats_parse_time(Some(ft_str.as_str())), stats_parse_time(Some(ct_str.as_str()))) {
+                            (ft - ct).num_seconds()
+                        } else { 0 }
+                    } else { 0 };
+                    let agg = grouped.entry(t.display_name.clone()).or_insert(NodeAgg { count: 0, total_dur: 0 });
+                    agg.count += 1;
+                    agg.total_dur += dur;
+                }
+                let mut entries: Vec<(String, NodeAgg)> = grouped.into_iter().collect();
+                entries.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+                entries.truncate(limit);
+                entries.iter().map(|(k, agg)| {
+                    let avg: Option<i64> = if agg.count > 0 {
+                        Some((agg.total_dur as f64 / agg.count as f64).round() as i64)
+                    } else { None };
+                    json!({"key": k, "label": Json::Null, "count": agg.count, "avgDurationSeconds": avg})
+                }).collect()
+            }
+
+            "stuckNode" => {
+                let stuck: Vec<&ProcessTask> = all_tasks.iter()
+                    .filter(|t| t.task_state == TaskState::Doing.code())
+                    .collect();
+                let mut grouped: HashMap<String, i32> = HashMap::new();
+                for t in &stuck {
+                    if !t.display_name.is_empty() {
+                        *grouped.entry(t.display_name.clone()).or_insert(0) += 1;
+                    }
+                }
+                let mut entries: Vec<(String, i32)> = grouped.into_iter().collect();
+                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                entries.truncate(limit);
+                entries.iter().map(|(k, c)| json!({
+                    "key": k, "label": Json::Null, "count": c, "avgDurationSeconds": Json::Null,
+                })).collect()
+            }
+
+            "stuckApprover" => {
+                let stuck: Vec<&ProcessTask> = all_tasks.iter()
+                    .filter(|t| t.task_state == TaskState::Doing.code())
+                    .collect();
+                let mut grouped: HashMap<String, i32> = HashMap::new();
+                for t in &stuck {
+                    for aid in &t.actor_ids {
+                        if !aid.is_empty() {
+                            *grouped.entry(aid.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let mut entries: Vec<(String, i32)> = grouped.into_iter().collect();
+                entries.sort_by(|a, b| b.1.cmp(&a.1));
+                entries.truncate(limit);
+                entries.iter().map(|(k, c)| json!({
+                    "key": k, "label": Json::Null, "count": c, "avgDurationSeconds": Json::Null,
+                })).collect()
+            }
+
+            "durationBucket" => {
+                let completed: Vec<&ProcessInstance> = filtered.iter()
+                    .filter(|inst| inst.state == InstanceState::Finished.code())
+                    .collect();
+                let mut inst_max_ft: HashMap<i64, Option<chrono::NaiveDateTime>> = HashMap::new();
+                for t in &all_tasks {
+                    if t.task_state == TaskState::Finished.code() {
+                        if let Some(ft_str) = &t.finish_time {
+                            if let Some(ft) = stats_parse_time(Some(ft_str.as_str())) {
+                                let entry = inst_max_ft.entry(t.process_instance_id).or_insert(None);
+                                *entry = Some(match entry {
+                                    Some(prev) if *prev > ft => *prev,
+                                    _ => ft,
+                                });
+                            }
+                        }
+                    }
+                }
+                let mut same_day = 0i32;
+                let mut d1to3 = 0i32;
+                let mut d3to7 = 0i32;
+                let mut over7d = 0i32;
+                for inst in &completed {
+                    if let Some(ct_str) = &inst.create_time {
+                        if let Some(ct) = stats_parse_time(Some(ct_str.as_str())) {
+                            if let Some(Some(ft)) = inst_max_ft.get(&inst.instance_id) {
+                                let dur = (*ft - ct).num_seconds();
+                                if dur < 86400 { same_day += 1; }
+                                else if dur < 259200 { d1to3 += 1; }
+                                else if dur < 604800 { d3to7 += 1; }
+                                else { over7d += 1; }
+                            }
+                        }
+                    }
+                }
+                let keys = ["sameDay", "1to3d", "3to7d", "over7d"];
+                let counts = [same_day, d1to3, d3to7, over7d];
+                keys.iter().zip(counts.iter()).map(|(k, c)| json!({
+                    "key": k, "label": Json::Null, "count": c, "avgDurationSeconds": Json::Null,
+                })).collect()
+            }
+
+            _ => unreachable!(),
+        };
+
+        Ok(json!({
+            "dimension": dimension,
+            "rows": rows,
+        }))
+    }
+}
+
+// ═══════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════
 
@@ -3520,7 +4091,7 @@ mod tests {
     // ─── Action count test ───
 
     #[tokio::test]
-    async fn test_all_42_actions_dispatchable() {
+    async fn test_all_45_actions_dispatchable() {
         let facade = make_facade();
         let actions = vec![
             "processDefine/page", "processDefine/detail", "processDefine/startAndExecute",
@@ -3531,6 +4102,8 @@ mod tests {
             "processInstance/approvalRecord", "processInstance/getAssigneeTextData",
             "processInstance/bizData", "processInstance/createCCInstance",
             "processInstance/updateCCStatus", "processInstance/ccList",
+            "processInstance/stats/overview", "processInstance/stats/trend",
+            "processInstance/stats/group",
             "processTask/todoList", "processTask/doneList", "processTask/execute",
             "processTask/detail", "processTask/jumpAbleTaskNameList",
             "processTask/candidatePage", "processTask/surrogate",
@@ -3544,7 +4117,7 @@ mod tests {
             "processSurrogate/update", "processSurrogate/detail",
             "processSurrogate/remove",
         ];
-        assert_eq!(actions.len(), 42, "Should have exactly 42 actions");
+        assert_eq!(actions.len(), 45, "Should have exactly 45 actions");
         // All actions should return a response (not panic)
         for action in &actions {
             let resp = facade.flow(action, &HashMap::new()).await;
@@ -3684,5 +4257,318 @@ mod tests {
         assert!(matches!(fd.inner().get("nested"), Some(JsonValue::Object(_))));
         // 标量不受影响
         assert_eq!(fd.get_str("reason"), Some("hello"));
+    }
+
+    // ─── Stats tests (issues/103) ───
+
+    fn seed_stats_facade() -> JeeflowFacade {
+        let repo = Arc::new(MemoryRepository::new());
+
+        let mut design = ProcessDesign {
+            id: 1001, name: "leave".into(), display_name: "请假审批".into(),
+            design_type: "leave".into(), icon: None, is_deployed: 1,
+            remark: None, create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        repo.save_design(&mut design).unwrap();
+
+        let mut inst1 = ProcessInstance {
+            instance_id: 0, parent_id: None, define_id: 1001, state: 20,
+            parent_node_name: None, business_no: None,
+            operator: "user1".into(), expire_time: None,
+            variables: FlowData::new(), tasks: vec![],
+            create_time: Some("2025-01-10 10:00:00".into()),
+            create_user: Some("user1".into()),
+            update_time: None, update_user: None,
+            define: None,
+        };
+        repo.save_instance(&mut inst1).unwrap();
+
+        let mut inst2 = ProcessInstance {
+            instance_id: 0, parent_id: None, define_id: 1001, state: 10,
+            parent_node_name: None, business_no: None,
+            operator: "user2".into(), expire_time: None,
+            variables: FlowData::new(), tasks: vec![],
+            create_time: Some("2025-01-11 10:00:00".into()),
+            create_user: Some("user2".into()),
+            update_time: None, update_user: None,
+            define: None,
+        };
+        repo.save_instance(&mut inst2).unwrap();
+
+        let mut inst3 = ProcessInstance {
+            instance_id: 0, parent_id: None, define_id: 1001, state: 45,
+            parent_node_name: None, business_no: None,
+            operator: "user3".into(), expire_time: None,
+            variables: FlowData::new(), tasks: vec![],
+            create_time: Some("2025-01-12 10:00:00".into()),
+            create_user: Some("user3".into()),
+            update_time: None, update_user: None,
+            define: None,
+        };
+        repo.save_instance(&mut inst3).unwrap();
+
+        let mut task1 = ProcessTask {
+            task_id: 0, process_instance_id: inst1.instance_id,
+            task_name: "managerApproval".into(), display_name: "经理审批".into(),
+            task_type: 0, perform_type: 1, task_state: 20,
+            actor_id: Some("approver1".into()), actor_ids: vec![],
+            finish_time: Some("2025-01-10 11:00:00".into()),
+            expire_time: Some("2025-01-10 18:00:00".into()),
+            form_key: None, parent_task_id: None,
+            variables: FlowData::new(),
+            create_time: Some("2025-01-10 10:00:00".into()),
+            create_user: None, update_time: None, update_user: None,
+        };
+        repo.save_task(&mut task1).unwrap();
+
+        let mut task2 = ProcessTask {
+            task_id: 0, process_instance_id: inst1.instance_id,
+            task_name: "directorApproval".into(), display_name: "总监审批".into(),
+            task_type: 0, perform_type: 0, task_state: 20,
+            actor_id: Some("approver1".into()), actor_ids: vec![],
+            finish_time: Some("2025-01-10 10:30:00".into()),
+            expire_time: None,
+            form_key: None, parent_task_id: None,
+            variables: FlowData::new(),
+            create_time: Some("2025-01-10 10:00:00".into()),
+            create_user: None, update_time: None, update_user: None,
+        };
+        repo.save_task(&mut task2).unwrap();
+
+        let mut task3 = ProcessTask {
+            task_id: 0, process_instance_id: inst2.instance_id,
+            task_name: "deptApproval".into(), display_name: "部门审批".into(),
+            task_type: 0, perform_type: 0, task_state: 10,
+            actor_id: None, actor_ids: vec!["approver2".into(), "approver3".into()],
+            finish_time: None, expire_time: None,
+            form_key: None, parent_task_id: None,
+            variables: FlowData::new(),
+            create_time: Some("2025-01-11 10:00:00".into()),
+            create_user: None, update_time: None, update_user: None,
+        };
+        repo.save_task(&mut task3).unwrap();
+
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        JeeflowFacade::new(ctx)
+    }
+
+    #[tokio::test]
+    async fn test_stats_dispatch_via_flow() {
+        let facade = seed_stats_facade();
+        for action in &["processInstance/stats/overview", "processInstance/stats/trend", "processInstance/stats/group"] {
+            let resp = facade.flow(action, &HashMap::new()).await;
+            assert_eq!(resp["code"], 0, "Action {} should succeed, got: {}", action, resp);
+        }
+    }
+
+    #[test]
+    fn test_stats_overview_empty() {
+        let facade = make_facade();
+        let resp = facade.stats_overview(&HashMap::new()).unwrap();
+        assert_eq!(resp["total"], 0);
+        assert_eq!(resp["inProgress"], 0);
+        assert_eq!(resp["completed"], 0);
+        assert_eq!(resp["rejected"], 0);
+        assert_eq!(resp["withdrawn"], 0);
+        assert_eq!(resp["suspended"], 0);
+        assert_eq!(resp["todayNew"], 0);
+        assert_eq!(resp["avgDurationSeconds"], 0);
+        assert_eq!(resp["rejectRate"], 0.0);
+        assert_eq!(resp["pendingTaskCount"], 0);
+        assert_eq!(resp["overdueTaskCount"], 0);
+        assert_eq!(resp["countersignRate"], 0.0);
+        assert_eq!(resp["onTimeRate"], 0.0);
+    }
+
+    #[test]
+    fn test_stats_overview_with_data() {
+        let facade = seed_stats_facade();
+        let resp = facade.stats_overview(&HashMap::new()).unwrap();
+        assert_eq!(resp["total"], 3);
+        assert_eq!(resp["inProgress"], 1);
+        assert_eq!(resp["completed"], 1);
+        assert_eq!(resp["rejected"], 1);
+        assert_eq!(resp["withdrawn"], 0);
+        assert_eq!(resp["suspended"], 0);
+        assert_eq!(resp["todayNew"], 0);
+        assert_eq!(resp["avgDurationSeconds"], 3600);
+        assert_eq!(resp["rejectRate"], 0.5);
+        assert_eq!(resp["pendingTaskCount"], 1);
+        assert_eq!(resp["overdueTaskCount"], 0);
+        assert_eq!(resp["countersignRate"], 0.5);
+        assert_eq!(resp["onTimeRate"], 1.0);
+    }
+
+    #[test]
+    fn test_stats_overview_null_expire() {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut inst = ProcessInstance {
+            instance_id: 0, parent_id: None, define_id: 1, state: 20,
+            parent_node_name: None, business_no: None,
+            operator: "u1".into(), expire_time: None,
+            variables: FlowData::new(), tasks: vec![],
+            create_time: Some("2025-01-10 10:00:00".into()),
+            create_user: None, update_time: None, update_user: None,
+            define: None,
+        };
+        repo.save_instance(&mut inst).unwrap();
+        let mut task = ProcessTask {
+            task_id: 0, process_instance_id: inst.instance_id,
+            task_name: "t".into(), display_name: "T".into(),
+            task_type: 0, perform_type: 0, task_state: 20,
+            actor_id: Some("a1".into()), actor_ids: vec![],
+            finish_time: Some("2025-01-10 11:00:00".into()),
+            expire_time: None,
+            form_key: None, parent_task_id: None,
+            variables: FlowData::new(),
+            create_time: Some("2025-01-10 10:00:00".into()),
+            create_user: None, update_time: None, update_user: None,
+        };
+        repo.save_task(&mut task).unwrap();
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        let facade = JeeflowFacade::new(ctx);
+        let resp = facade.stats_overview(&HashMap::new()).unwrap();
+        assert_eq!(resp["overdueTaskCount"], 0);
+        assert_eq!(resp["onTimeRate"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_stats_trend_invalid_granularity() {
+        let facade = seed_stats_facade();
+        let mut args = HashMap::new();
+        args.insert("granularity".to_string(), json!("abc"));
+        let resp = facade.flow("processInstance/stats/trend", &args).await;
+        assert_ne!(resp["code"], 0);
+    }
+
+    #[test]
+    fn test_stats_trend_day_empty() {
+        let facade = make_facade();
+        let mut args = HashMap::new();
+        args.insert("start".to_string(), json!("2025-01-10 00:00:00"));
+        args.insert("end".to_string(), json!("2025-01-12 00:00:00"));
+        args.insert("granularity".to_string(), json!("day"));
+        let resp = facade.stats_trend(&args).unwrap();
+        assert_eq!(resp["granularity"], "day");
+        let series = resp["series"].as_array().unwrap();
+        assert_eq!(series.len(), 3);
+        assert_eq!(series[0]["bucket"], "2025-01-10");
+        assert_eq!(series[0]["started"], 0);
+        assert_eq!(series[0]["finished"], 0);
+        assert_eq!(series[1]["bucket"], "2025-01-11");
+        assert_eq!(series[2]["bucket"], "2025-01-12");
+    }
+
+    #[test]
+    fn test_stats_trend_day_with_data() {
+        let facade = seed_stats_facade();
+        let mut args = HashMap::new();
+        args.insert("start".to_string(), json!("2025-01-10 00:00:00"));
+        args.insert("end".to_string(), json!("2025-01-12 00:00:00"));
+        args.insert("granularity".to_string(), json!("day"));
+        let resp = facade.stats_trend(&args).unwrap();
+        let series = resp["series"].as_array().unwrap();
+        assert_eq!(series.len(), 3);
+        assert_eq!(series[0]["bucket"], "2025-01-10");
+        assert_eq!(series[0]["started"], 1);
+        assert_eq!(series[0]["finished"], 2);
+        assert_eq!(series[1]["bucket"], "2025-01-11");
+        assert_eq!(series[1]["started"], 1);
+        assert_eq!(series[1]["finished"], 0);
+        assert_eq!(series[2]["bucket"], "2025-01-12");
+        assert_eq!(series[2]["started"], 0);
+        assert_eq!(series[2]["finished"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_stats_group_invalid_dimension() {
+        let facade = seed_stats_facade();
+        let mut args = HashMap::new();
+        args.insert("dimension".to_string(), json!("bogus"));
+        let resp = facade.flow("processInstance/stats/group", &args).await;
+        assert_ne!(resp["code"], 0);
+    }
+
+    #[test]
+    fn test_stats_group_empty_state() {
+        let facade = make_facade();
+        let mut args = HashMap::new();
+        args.insert("dimension".to_string(), json!("state"));
+        let resp = facade.stats_group(&args).unwrap();
+        let rows = resp["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_stats_group_all_9_dimensions() {
+        let facade = seed_stats_facade();
+        for dim in &["state", "define", "category", "approver", "applicant",
+                     "node", "stuckNode", "stuckApprover", "durationBucket"] {
+            let mut args = HashMap::new();
+            args.insert("dimension".to_string(), json!(dim));
+            let resp = facade.stats_group(&args).unwrap();
+            assert_eq!(resp["dimension"], *dim);
+            let rows = resp["rows"].as_array().unwrap();
+            assert!(rows.len() > 0, "Dimension {} should have rows", dim);
+            for row in rows {
+                assert!(row.get("key").is_some(), "Dimension {} row missing key", dim);
+                assert!(row.get("count").is_some(), "Dimension {} row missing count", dim);
+            }
+        }
+    }
+
+    #[test]
+    fn test_stats_group_duration_bucket_fixed_order() {
+        let facade = seed_stats_facade();
+        let mut args = HashMap::new();
+        args.insert("dimension".to_string(), json!("durationBucket"));
+        let resp = facade.stats_group(&args).unwrap();
+        let rows = resp["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["key"], "sameDay");
+        assert_eq!(rows[1]["key"], "1to3d");
+        assert_eq!(rows[2]["key"], "3to7d");
+        assert_eq!(rows[3]["key"], "over7d");
+        assert_eq!(rows[0]["count"], 1);
+        assert_eq!(rows[1]["count"], 0);
+        assert_eq!(rows[2]["count"], 0);
+        assert_eq!(rows[3]["count"], 0);
+    }
+
+    #[test]
+    fn test_stats_group_define_with_label() {
+        let facade = seed_stats_facade();
+        let mut args = HashMap::new();
+        args.insert("dimension".to_string(), json!("define"));
+        let resp = facade.stats_group(&args).unwrap();
+        let rows = resp["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["key"], "leave");
+        assert_eq!(rows[0]["label"], "请假审批");
+        assert_eq!(rows[0]["count"], 3);
+        assert_eq!(rows[0]["avgDurationSeconds"], 3600);
+    }
+
+    #[test]
+    fn test_stats_group_node_with_avg() {
+        let facade = seed_stats_facade();
+        let mut args = HashMap::new();
+        args.insert("dimension".to_string(), json!("node"));
+        let resp = facade.stats_group(&args).unwrap();
+        let rows = resp["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let mgr = rows.iter().find(|r| r["key"] == "经理审批").unwrap();
+        assert_eq!(mgr["count"], 1);
+        assert_eq!(mgr["avgDurationSeconds"], 3600);
+        let dir = rows.iter().find(|r| r["key"] == "总监审批").unwrap();
+        assert_eq!(dir["count"], 1);
+        assert_eq!(dir["avgDurationSeconds"], 1800);
     }
 }

@@ -1047,6 +1047,53 @@ impl ProcessRepository for SqlxRepository {
             Ok(row.get::<i64, _>("cnt"))
         })
     }
+
+    fn get_all_instances(&self) -> JeeflowResult<Vec<ProcessInstance>> {
+        self.block_on(async {
+            let rows = sqlx::query(
+                "SELECT id, parent_id, process_define_id, state, parent_node_name, business_no, \
+                        operator, expire_time, variable, create_time, create_user, update_time, update_user \
+                 FROM wf_process_instance"
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+
+            Ok(rows.into_iter().map(|r| ProcessInstance {
+                instance_id: r.get("id"),
+                parent_id: r.get("parent_id"),
+                define_id: r.get("process_define_id"),
+                state: r.get("state"),
+                parent_node_name: r.get("parent_node_name"),
+                business_no: r.get("business_no"),
+                operator: r.get("operator"),
+                expire_time: get_opt_datetime(&r, "expire_time"),
+                variables: parse_flow_data(&r.get("variable")),
+                tasks: vec![],
+                create_time: get_opt_datetime(&r, "create_time"),
+                create_user: r.get("create_user"),
+                update_time: get_opt_datetime(&r, "update_time"),
+                update_user: r.get("update_user"),
+                define: None,
+            }).collect())
+        })
+    }
+
+    fn get_all_tasks(&self) -> JeeflowResult<Vec<ProcessTask>> {
+        self.block_on(async {
+            let rows = sqlx::query(
+                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, \
+                        task_state, operator, finish_time, expire_time, form_key, task_parent_id, \
+                        variable, create_time, create_user, update_time, update_user \
+                 FROM wf_process_task"
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+
+            tasks_from_rows(&self.pool, rows).await
+        })
+    }
 }
 
 impl ProcessExtRepository for SqlxRepository {

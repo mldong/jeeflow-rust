@@ -450,6 +450,25 @@ impl ProcessRepository for MemoryRepository {
             .count() as i64;
         Ok(count)
     }
+
+    fn get_all_instances(&self) -> JeeflowResult<Vec<ProcessInstance>> {
+        let instances = self.instances.lock().unwrap();
+        Ok(instances.values().cloned().collect())
+    }
+
+    fn get_all_tasks(&self) -> JeeflowResult<Vec<ProcessTask>> {
+        let tasks = self.tasks.lock().unwrap();
+        let task_actors = self.task_actors.lock().unwrap();
+        Ok(tasks.values().map(|t| {
+            let mut task = t.clone();
+            if task.actor_ids.is_empty() {
+                if let Some(actors) = task_actors.get(&t.task_id) {
+                    task.actor_ids = actors.clone();
+                }
+            }
+            task
+        }).collect())
+    }
 }
 
 impl ProcessExtRepository for MemoryRepository {
