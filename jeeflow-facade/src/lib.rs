@@ -2202,13 +2202,16 @@ fn stats_round4(v: f64) -> f64 {
 
 fn stats_filter_instances(
     instances: &[ProcessInstance],
-    state_in: &[i32],
+    state_in: Option<&[i32]>,
     start: Option<chrono::NaiveDateTime>,
     end: Option<chrono::NaiveDateTime>,
 ) -> Vec<ProcessInstance> {
     instances.iter().filter(|inst| {
-        if !state_in.contains(&inst.state) {
-            return false;
+        // state_in 为 None = 无 state 过滤（对齐内置线：仅 overview 六计数用 stateIn）
+        if let Some(states) = state_in {
+            if !states.contains(&inst.state) {
+                return false;
+            }
         }
         if let (Some(s), Some(ct)) = (start, inst.create_time.as_ref()) {
             if let Ok(t) = chrono::NaiveDateTime::parse_from_str(ct, "%Y-%m-%d %H:%M:%S") {
@@ -2315,8 +2318,16 @@ impl JeeflowFacade {
         let start = stats_parse_time(args.get("start").and_then(|v| v.as_str()));
         let end = stats_parse_time(args.get("end").and_then(|v| v.as_str()));
 
+        // B：stateIn 入参（缺省 DEFAULT_STATE_IN），作用于六个状态计数
+        let state_in_arg: Option<Vec<i32>> = args.get("stateIn").and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_i64().map(|n| n as i32)).collect());
+        let state_in: Vec<i32> = match state_in_arg {
+            Some(v) if !v.is_empty() => v,
+            _ => DEFAULT_STATE_IN.to_vec(),
+        };
+
         let all_instances = self.repo.get_all_instances()?;
-        let filtered = stats_filter_instances(&all_instances, DEFAULT_STATE_IN, start, end);
+        let filtered = stats_filter_instances(&all_instances, Some(&state_in), start, end);
 
         let mut by_state: HashMap<i32, i32> = HashMap::new();
         for inst in &filtered {
@@ -2333,7 +2344,8 @@ impl JeeflowFacade {
         let now = chrono::Local::now().naive_local();
         let today_start = now.date().and_hms_opt(0, 0, 0).unwrap();
         let today_end = today_start + chrono::Duration::days(1);
-        let today_filtered = stats_filter_instances(&all_instances, DEFAULT_STATE_IN, Some(today_start), Some(today_end));
+        // E：todayNew 恒按服务器当日、不过滤 state / 不受 stateIn 影响（对齐内置线 countTodayNew）
+        let today_filtered = stats_filter_instances(&all_instances, None, Some(today_start), Some(today_end));
         let today_new = today_filtered.len() as i32;
 
         // pendingTaskCount + overdueTaskCount — all tasks, not filtered by stateIn
@@ -2377,8 +2389,9 @@ impl JeeflowFacade {
             stats_round4(on_time as f64 / on_time_denom as f64)
         } else { 0.0 };
 
-        // avgDurationSeconds — completed instances: MAX(task.finish_time) - instance.create_time
-        let completed_instances: Vec<&ProcessInstance> = filtered.iter()
+        // avgDurationSeconds — state=20 完成实例平均时长，不受 stateIn 影响（对齐内置线 avgCompletedInstanceDurationSeconds）
+        let avg_base = stats_filter_instances(&all_instances, None, start, end);
+        let completed_instances: Vec<&ProcessInstance> = avg_base.iter()
             .filter(|inst| inst.state == InstanceState::Finished.code())
             .collect();
         let mut total_dur: i64 = 0;
@@ -2435,13 +2448,18 @@ impl JeeflowFacade {
         let end = stats_parse_time(args.get("end").and_then(|v| v.as_str()));
         let granularity = args.get("granularity")
             .and_then(|v| v.as_str())
-            .unwrap_or("day");
+            .unwrap_or("");
+        // C：start/end/granularity 均必填（对齐内置线 20010012 缺参语义）
+        if granularity.is_empty() || start.is_none() || end.is_none() {
+            return Err(JeeflowError::Business("trend 缺少必填参数：start/end/granularity".into()));
+        }
         if !VALID_GRANULARITY.contains(&granularity) {
             return Err(JeeflowError::Business("granularity 参数非法，允许值：hour/day/week/month".into()));
         }
 
+        // 实例侧无 state 过滤（对齐内置线 countInstanceStartedByBucket）
         let all_instances = self.repo.get_all_instances()?;
-        let filtered = stats_filter_instances(&all_instances, DEFAULT_STATE_IN, start, end);
+        let filtered = stats_filter_instances(&all_instances, None, start, end);
 
         let all_tasks = self.repo.get_all_tasks()?;
         let finished_tasks = stats_filter_finished_tasks(&all_tasks, start, end);
@@ -2479,10 +2497,8 @@ impl JeeflowFacade {
             json!({"bucket": b, "started": started, "finished": finished})
         }).collect();
 
-        Ok(json!({
-            "granularity": granularity,
-            "series": series,
-        }))
+        // A：data 本体为裸数组（去掉 {granularity, series} 包装，对齐契约 spec 06 §4.2 / 内置线）
+        Ok(json!(series))
     }
 
     /// stats/group — dimension-based grouping
@@ -2503,7 +2519,8 @@ impl JeeflowFacade {
 
         let all_instances = self.repo.get_all_instances()?;
         let all_tasks = self.repo.get_all_tasks()?;
-        let filtered = stats_filter_instances(&all_instances, DEFAULT_STATE_IN, start, end);
+        // 无 state 过滤（对齐内置线 groupByDimension：仅按时间限定，契约 group 无 stateIn 入参）
+        let filtered = stats_filter_instances(&all_instances, None, start, end);
 
         let rows: Vec<Json> = match dimension {
             "state" => {
@@ -2740,10 +2757,8 @@ impl JeeflowFacade {
             _ => unreachable!(),
         };
 
-        Ok(json!({
-            "dimension": dimension,
-            "rows": rows,
-        }))
+        // A：data 本体为裸数组（去掉 {dimension, rows} 包装，对齐契约 spec 06 §4.2 / 内置线）
+        Ok(json!(rows))
     }
 }
 
@@ -4360,7 +4375,14 @@ mod tests {
     async fn test_stats_dispatch_via_flow() {
         let facade = seed_stats_facade();
         for action in &["processInstance/stats/overview", "processInstance/stats/trend", "processInstance/stats/group"] {
-            let resp = facade.flow(action, &HashMap::new()).await;
+            let mut args = HashMap::new();
+            if action.ends_with("/trend") {
+                // C：trend 的 start/end/granularity 必填
+                args.insert("start".to_string(), json!("2025-01-10 00:00:00"));
+                args.insert("end".to_string(), json!("2025-01-12 00:00:00"));
+                args.insert("granularity".to_string(), json!("day"));
+            }
+            let resp = facade.flow(action, &args).await;
             assert_eq!(resp["code"], 0, "Action {} should succeed, got: {}", action, resp);
         }
     }
@@ -4448,6 +4470,37 @@ mod tests {
         assert_ne!(resp["code"], 0);
     }
 
+    #[tokio::test]
+    async fn test_stats_trend_missing_required_params() {
+        // C 自证：缺 start / 缺 end → code!=0，不静默回退不限时间
+        let facade = seed_stats_facade();
+        let mut args = HashMap::new();
+        args.insert("granularity".to_string(), json!("day"));
+        args.insert("end".to_string(), json!("2025-01-12 00:00:00"));
+        let resp = facade.flow("processInstance/stats/trend", &args).await;
+        assert_ne!(resp["code"], 0, "missing start should fail");
+
+        let mut args = HashMap::new();
+        args.insert("granularity".to_string(), json!("day"));
+        args.insert("start".to_string(), json!("2025-01-10 00:00:00"));
+        let resp = facade.flow("processInstance/stats/trend", &args).await;
+        assert_ne!(resp["code"], 0, "missing end should fail");
+    }
+
+    #[test]
+    fn test_stats_overview_state_in_respected() {
+        // B 自证：非缺省 stateIn 六个计数随动
+        let facade = seed_stats_facade();
+        let mut args = HashMap::new();
+        args.insert("stateIn".to_string(), json!([10]));
+        let resp = facade.stats_overview(&args).unwrap();
+        assert_eq!(resp["total"], 1);
+        assert_eq!(resp["inProgress"], 1);
+        assert_eq!(resp["completed"], 0);
+        // 种子日期 2025-01-x，非当日 → todayNew 恒 0
+        assert_eq!(resp["todayNew"], 0);
+    }
+
     #[test]
     fn test_stats_trend_day_empty() {
         let facade = make_facade();
@@ -4456,8 +4509,8 @@ mod tests {
         args.insert("end".to_string(), json!("2025-01-12 00:00:00"));
         args.insert("granularity".to_string(), json!("day"));
         let resp = facade.stats_trend(&args).unwrap();
-        assert_eq!(resp["granularity"], "day");
-        let series = resp["series"].as_array().unwrap();
+        // A：data 本体为裸数组
+        let series = resp.as_array().unwrap();
         assert_eq!(series.len(), 3);
         assert_eq!(series[0]["bucket"], "2025-01-10");
         assert_eq!(series[0]["started"], 0);
@@ -4474,7 +4527,7 @@ mod tests {
         args.insert("end".to_string(), json!("2025-01-12 00:00:00"));
         args.insert("granularity".to_string(), json!("day"));
         let resp = facade.stats_trend(&args).unwrap();
-        let series = resp["series"].as_array().unwrap();
+        let series = resp.as_array().unwrap();
         assert_eq!(series.len(), 3);
         assert_eq!(series[0]["bucket"], "2025-01-10");
         assert_eq!(series[0]["started"], 1);
@@ -4502,7 +4555,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("dimension".to_string(), json!("state"));
         let resp = facade.stats_group(&args).unwrap();
-        let rows = resp["rows"].as_array().unwrap();
+        let rows = resp.as_array().unwrap();
         assert_eq!(rows.len(), 0);
     }
 
@@ -4514,8 +4567,8 @@ mod tests {
             let mut args = HashMap::new();
             args.insert("dimension".to_string(), json!(dim));
             let resp = facade.stats_group(&args).unwrap();
-            assert_eq!(resp["dimension"], *dim);
-            let rows = resp["rows"].as_array().unwrap();
+            // A：data 本体为裸数组
+            let rows = resp.as_array().unwrap();
             assert!(rows.len() > 0, "Dimension {} should have rows", dim);
             for row in rows {
                 assert!(row.get("key").is_some(), "Dimension {} row missing key", dim);
@@ -4530,7 +4583,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("dimension".to_string(), json!("durationBucket"));
         let resp = facade.stats_group(&args).unwrap();
-        let rows = resp["rows"].as_array().unwrap();
+        let rows = resp.as_array().unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0]["key"], "sameDay");
         assert_eq!(rows[1]["key"], "1to3d");
@@ -4548,7 +4601,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("dimension".to_string(), json!("define"));
         let resp = facade.stats_group(&args).unwrap();
-        let rows = resp["rows"].as_array().unwrap();
+        let rows = resp.as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["key"], "leave");
         assert_eq!(rows[0]["label"], "请假审批");
@@ -4562,7 +4615,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("dimension".to_string(), json!("node"));
         let resp = facade.stats_group(&args).unwrap();
-        let rows = resp["rows"].as_array().unwrap();
+        let rows = resp.as_array().unwrap();
         assert_eq!(rows.len(), 2);
         let mgr = rows.iter().find(|r| r["key"] == "经理审批").unwrap();
         assert_eq!(mgr["count"], 1);
