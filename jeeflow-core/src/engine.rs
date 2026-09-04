@@ -991,6 +991,12 @@ impl JeeflowEngineImpl {
             }
         }
 
+        // Fire event（合并派：驳回=办结，同 finish 路径 fire ProcessInstanceEnd；
+        // issues/104 §2.3 兑现缺口——execute_and_jump_to_end_async 此前漏 fire）
+        let event = ProcessEvent::new(ProcessEventType::ProcessInstanceEnd,
+                                       instance.instance_id);
+        ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+
         Ok(Vec::new())
     }
 
@@ -1205,6 +1211,55 @@ mod tests {
         let page = repo.page_cc_instances(&mut q).unwrap();
         assert_eq!(page.record_count, 1, "无监听器时 cc 实例仍应照常落库");
         assert!(instance.instance_id > 0);
+    }
+
+    /// 捕获 PROCESS_INSTANCE_END 事件的监听器（issues/104 §2.3 回归：驳回路径补 fire）。
+    struct InstanceEndCapture {
+        source_ids: std::sync::Mutex<Vec<i64>>,
+    }
+
+    impl ProcessEventListener for InstanceEndCapture {
+        fn on_event(&self, event: &ProcessEvent) {
+            if event.event_type == ProcessEventType::ProcessInstanceEnd {
+                self.source_ids.lock().unwrap().push(event.source_id);
+            }
+        }
+    }
+
+    /// 回归（issues/104 §2.3）：驳回（execute_and_jump_to_end_async）路径必须 fire
+    /// ProcessInstanceEnd——此前该结束路径漏 fire，致 salvo 栈 CC 五场景 reject 维红。
+    #[test]
+    fn test_reject_path_fires_instance_end() {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let capture = Arc::new(InstanceEndCapture { source_ids: std::sync::Mutex::new(Vec::new()) });
+        ctx.register_event_listener(capture.clone());
+        let engine = JeeflowEngineImpl::new(ctx);
+
+        let define_id = make_define(&repo);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+
+        // 取发起后在办任务（simple flow：apply 节点 assignee=applicant → user1）
+        let tasks = repo.find_doing_tasks(instance.instance_id, &[]).unwrap();
+        assert!(!tasks.is_empty(), "驳回前应有在办任务");
+        let task = &tasks[0];
+
+        // 驳回（jump_to_end）：flow.auto 旁路 is_allowed，驱动 execute_and_jump_to_end_async
+        let result = rt.block_on(engine.execute_and_jump_to_end_async(
+            task.task_id, "flow.auto", &FlowData::new()));
+        assert!(result.is_ok(), "驳回应成功：{:?}", result.err());
+
+        // 实例应为已拒绝（state=45）
+        let inst = repo.find_instance_by_id(instance.instance_id).unwrap().unwrap();
+        assert_eq!(inst.state, 45, "驳回后实例 state 应为 45（已拒绝）");
+
+        // 必须 fire 恰好一次 ProcessInstanceEnd，source_id=instance_id
+        let fired = capture.source_ids.lock().unwrap().clone();
+        assert_eq!(fired.len(), 1, "驳回路径应 fire 恰好一次 ProcessInstanceEnd，实得 {:?}", fired);
+        assert_eq!(fired[0], instance.instance_id, "source_id 应为 instance_id");
     }
 
     #[test]
