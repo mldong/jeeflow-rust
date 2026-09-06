@@ -271,6 +271,38 @@ fn page_bounds(query: &PageQuery) -> (i64, i64, i64) {
     (page_num, page_size, offset)
 }
 
+// ── m_ 过滤下推列白名单（issues/106，对齐 java pushdown / spec 06 §2.2）──
+// 未命中白名单的 (alias, column) 返回 None → 该过滤被安全跳过（不注入、不报错）。
+
+const DEFINE_COLS: &[&str] = &["name", "display_name", "type", "state", "version", "id", "create_time", "create_user", "update_time", "update_user"];
+const DESIGN_COLS: &[&str] = &["name", "display_name", "type", "is_deployed", "icon", "remark", "id", "create_time", "create_user", "update_time", "update_user"];
+const INSTANCE_MAIN_COLS: &[&str] = &["id", "state", "business_no", "operator", "parent_node_name", "process_define_id", "expire_time", "create_time", "create_user", "update_time", "update_user"];
+const TASK_MAIN_COLS: &[&str] = &["id", "task_name", "display_name", "task_type", "perform_type", "task_state", "operator", "finish_time", "expire_time", "form_key", "task_parent_id"];
+const PI_TASK_COLS: &[&str] = &["process_define_id", "state", "operator", "business_no"];
+const PD_COLS: &[&str] = &["name", "display_name", "version"];
+
+/// define/design 表无别名 → 裸列名（仅 t.*）
+fn resolve_bare_col<'a>(cols: &'a [&'a str]) -> impl Fn(&str, &str) -> Option<String> + 'a {
+    move |alias, column| {
+        if alias == "t" && cols.contains(&column) { Some(column.to_string()) } else { None }
+    }
+}
+
+/// instance 主表别名 pi（facade 2 段 m_ 过滤 alias=t → pi.*）；pd 为定义表
+fn resolve_instance_col(alias: &str, column: &str) -> Option<String> {
+    if alias == "t" && INSTANCE_MAIN_COLS.contains(&column) { return Some(format!("pi.{}", column)); }
+    if alias == "pd" && PD_COLS.contains(&column) { return Some(format!("pd.{}", column)); }
+    None
+}
+
+/// task 主表别名 t；pi 实例表；pd 定义表
+fn resolve_task_col(alias: &str, column: &str) -> Option<String> {
+    if alias == "t" && TASK_MAIN_COLS.contains(&column) { return Some(format!("t.{}", column)); }
+    if alias == "pi" && PI_TASK_COLS.contains(&column) { return Some(format!("pi.{}", column)); }
+    if alias == "pd" && PD_COLS.contains(&column) { return Some(format!("pd.{}", column)); }
+    None
+}
+
 fn get_opt_string(r: &sqlx::mysql::MySqlRow, col: &str) -> Option<String> {
     r.try_get::<Option<String>, _>(col).ok().flatten()
 }
@@ -840,22 +872,26 @@ impl ProcessRepository for SqlxRepository {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             let op = query.operator.clone();
-            let count_row = sqlx::query(
+            // m_ 过滤下推（issues/106）：白名单条件拼进 COUNT 与 SELECT，bind 顺序 operator → filters → limit
+            let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_task_col);
+            let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
+            let count_sql = format!(
                 "SELECT COUNT(DISTINCT t.id) AS cnt \
                  FROM wf_process_task t \
                  INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.task_state = 10 AND (? IS NULL OR ta.actor_id = ?)"
-            )
-            .bind(op.clone())
-            .bind(op.clone())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+                 WHERE t.task_state = 10 AND (? IS NULL OR ta.actor_id = ?){where_extra}"
+            );
+            let mut count_q = sqlx::query(&count_sql).bind(op.clone()).bind(op.clone());
+            for v in &fvals { count_q = count_q.bind(v); }
+            let count_row = count_q
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
 
-            let rows = sqlx::query(
+            let select_sql = format!(
                 "SELECT DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, \
                         t.task_type, t.perform_type, t.task_state, \
                         t.operator, ta.actor_id AS actor_id, \
@@ -868,16 +904,17 @@ impl ProcessRepository for SqlxRepository {
                  INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.task_state = 10 AND (? IS NULL OR ta.actor_id = ?) \
+                 WHERE t.task_state = 10 AND (? IS NULL OR ta.actor_id = ?){where_extra} \
                  ORDER BY t.id DESC LIMIT ? OFFSET ?"
-            )
-            .bind(op.clone())
-            .bind(op)
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            );
+            let mut rows_q = sqlx::query(&select_sql).bind(op.clone()).bind(op);
+            for v in &fvals { rows_q = rows_q.bind(v); }
+            let rows = rows_q
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_task_row).collect()))
         })
@@ -887,22 +924,25 @@ impl ProcessRepository for SqlxRepository {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             let op = query.operator.clone();
-            let count_row = sqlx::query(
+            // m_ 过滤下推（issues/106）：白名单条件拼进 COUNT 与 SELECT，bind 顺序 operator×3 → filters → limit
+            let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_task_col);
+            let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
+            let count_sql = format!(
                 "SELECT COUNT(*) AS cnt \
                  FROM wf_process_task t \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.task_state = 20 AND (? IS NULL OR t.operator = ? OR t.create_user = ?)"
-            )
-            .bind(op.clone())
-            .bind(op.clone())
-            .bind(op.clone())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+                 WHERE t.task_state = 20 AND (? IS NULL OR t.operator = ? OR t.create_user = ?){where_extra}"
+            );
+            let mut count_q = sqlx::query(&count_sql).bind(op.clone()).bind(op.clone()).bind(op.clone());
+            for v in &fvals { count_q = count_q.bind(v); }
+            let count_row = count_q
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
 
-            let rows = sqlx::query(
+            let select_sql = format!(
                 "SELECT t.id, t.process_instance_id, t.task_name, t.display_name, \
                         t.task_type, t.perform_type, t.task_state, \
                         t.operator, t.operator AS actor_id, \
@@ -914,17 +954,17 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_task t \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.task_state = 20 AND (? IS NULL OR t.operator = ? OR t.create_user = ?) \
+                 WHERE t.task_state = 20 AND (? IS NULL OR t.operator = ? OR t.create_user = ?){where_extra} \
                  ORDER BY t.id DESC LIMIT ? OFFSET ?"
-            )
-            .bind(op.clone())
-            .bind(op.clone())
-            .bind(op)
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            );
+            let mut rows_q = sqlx::query(&select_sql).bind(op.clone()).bind(op.clone()).bind(op);
+            for v in &fvals { rows_q = rows_q.bind(v); }
+            let rows = rows_q
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_task_row).collect()))
         })
@@ -934,36 +974,41 @@ impl ProcessRepository for SqlxRepository {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             let op = query.operator.clone();
-            let count_row = sqlx::query(
+            // m_ 过滤下推（issues/106）：bind 顺序 operator×2 → filters → limit
+            let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_instance_col);
+            let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
+            let count_sql = format!(
                 "SELECT COUNT(*) AS cnt \
                  FROM wf_process_instance pi \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE (? IS NULL OR pi.operator = ?)"
-            )
-            .bind(op.clone())
-            .bind(op.clone())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+                 WHERE (? IS NULL OR pi.operator = ?){where_extra}"
+            );
+            let mut count_q = sqlx::query(&count_sql).bind(op.clone()).bind(op.clone());
+            for v in &fvals { count_q = count_q.bind(v); }
+            let count_row = count_q
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
 
-            let rows = sqlx::query(
+            let select_sql = format!(
                 "SELECT pi.id, pi.parent_id, pi.process_define_id, pi.state, pi.parent_node_name, \
                         pi.business_no, pi.operator, pi.expire_time, pi.variable, \
                         pi.create_time, pi.create_user, pi.update_time, pi.update_user, \
                         pd.name AS define_name, pd.display_name AS define_display_name, pd.version AS define_version \
                  FROM wf_process_instance pi \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE (? IS NULL OR pi.operator = ?) \
+                 WHERE (? IS NULL OR pi.operator = ?){where_extra} \
                  ORDER BY pi.id DESC LIMIT ? OFFSET ?"
-            )
-            .bind(op.clone())
-            .bind(op)
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            );
+            let mut rows_q = sqlx::query(&select_sql).bind(op.clone()).bind(op);
+            for v in &fvals { rows_q = rows_q.bind(v); }
+            let rows = rows_q
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_instance_row).collect()))
         })
@@ -973,21 +1018,25 @@ impl ProcessRepository for SqlxRepository {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             let op = query.operator.clone();
-            let count_row = sqlx::query(
+            // m_ 过滤下推（issues/106）：加 WHERE 后 DISTINCT 语义不受影响；bind 顺序 operator×2 → filters → limit
+            let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_instance_col);
+            let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
+            let count_sql = format!(
                 "SELECT COUNT(DISTINCT pi.id) AS cnt \
                  FROM wf_process_cc_instance cc \
                  INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE (? IS NULL OR cc.actor_id = ?)"
-            )
-            .bind(op.clone())
-            .bind(op.clone())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+                 WHERE (? IS NULL OR cc.actor_id = ?){where_extra}"
+            );
+            let mut count_q = sqlx::query(&count_sql).bind(op.clone()).bind(op.clone());
+            for v in &fvals { count_q = count_q.bind(v); }
+            let count_row = count_q
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
 
-            let rows = sqlx::query(
+            let select_sql = format!(
                 "SELECT DISTINCT pi.id, pi.parent_id, pi.process_define_id, pi.state, pi.parent_node_name, \
                         pi.business_no, pi.operator, pi.expire_time, pi.variable, \
                         pi.create_time, pi.create_user, pi.update_time, pi.update_user, \
@@ -995,16 +1044,17 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_cc_instance cc \
                  INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE (? IS NULL OR cc.actor_id = ?) \
+                 WHERE (? IS NULL OR cc.actor_id = ?){where_extra} \
                  ORDER BY pi.id DESC LIMIT ? OFFSET ?"
-            )
-            .bind(op.clone())
-            .bind(op)
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            );
+            let mut rows_q = sqlx::query(&select_sql).bind(op.clone()).bind(op);
+            for v in &fvals { rows_q = rows_q.bind(v); }
+            let rows = rows_q
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_instance_row).collect()))
         })
@@ -1013,22 +1063,31 @@ impl ProcessRepository for SqlxRepository {
     fn page_defines(&self, query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>> {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
-            let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM wf_process_define")
+            // m_ 过滤下推（issues/106）：表无别名裸列名；有过滤插 WHERE（不前置 AND），无过滤保持原样
+            let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_bare_col(DEFINE_COLS));
+            let where_clause = if frags.is_empty() { String::new() } else { format!(" WHERE {}", frags.join(" AND ")) };
+            let count_sql = format!("SELECT COUNT(*) AS cnt FROM wf_process_define{where_clause}");
+            let mut count_q = sqlx::query(&count_sql);
+            for v in &fvals { count_q = count_q.bind(v); }
+            let count_row = count_q
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
 
-            let rows = sqlx::query(
+            let select_sql = format!(
                 "SELECT id, name, display_name, type, state, version, \
                         create_time, create_user, update_time, update_user \
-                 FROM wf_process_define ORDER BY id DESC LIMIT ? OFFSET ?"
-            )
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+                 FROM wf_process_define{where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
+            );
+            let mut rows_q = sqlx::query(&select_sql);
+            for v in &fvals { rows_q = rows_q.bind(v); }
+            let rows = rows_q
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_define_row).collect()))
         })
@@ -1181,21 +1240,30 @@ impl ProcessExtRepository for SqlxRepository {
     fn page_designs(&self, query: &PageQuery) -> JeeflowResult<PageResult<ProcessDesign>> {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
-            let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM wf_process_design")
+            // m_ 过滤下推（issues/106）：表无别名裸列名；有过滤插 WHERE（不前置 AND），无过滤保持原样
+            let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_bare_col(DESIGN_COLS));
+            let where_clause = if frags.is_empty() { String::new() } else { format!(" WHERE {}", frags.join(" AND ")) };
+            let count_sql = format!("SELECT COUNT(*) AS cnt FROM wf_process_design{where_clause}");
+            let mut count_q = sqlx::query(&count_sql);
+            for v in &fvals { count_q = count_q.bind(v); }
+            let count_row = count_q
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
-            let rows = sqlx::query(
+            let select_sql = format!(
                 "SELECT id, name, display_name, type, icon, is_deployed, remark, \
                         create_time, create_user, update_time, update_user \
-                 FROM wf_process_design ORDER BY id DESC LIMIT ? OFFSET ?"
-            )
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+                 FROM wf_process_design{where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
+            );
+            let mut rows_q = sqlx::query(&select_sql);
+            for v in &fvals { rows_q = rows_q.bind(v); }
+            let rows = rows_q
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_design).collect()))
         })
     }

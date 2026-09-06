@@ -19,6 +19,94 @@ fn flow_data_json_string(fd: &crate::json::FlowData) -> Option<String> {
     Some(crate::json::JsonValue::Object(entries).to_json_string())
 }
 
+// ── m_ 过滤下推（issues/106）：page_* 先过滤全量 → 再算 total → 再切片 ──
+// 列白名单对齐 java pushdown（spec/06 §2.2）；未命中白名单的 (alias, column) → 不命中。
+// Option 字段为 None → 不命中（对齐旧 facade matches_filter 的 None 语义）。
+
+fn field_of(f: &QueryFilter, val: Option<String>) -> bool {
+    match val {
+        Some(v) => crate::filter_sql::op_matches(&f.op, &v, &f.value),
+        None => false,
+    }
+}
+
+fn define_row_matches(f: &QueryFilter, r: &DefineRow) -> bool {
+    field_of(f, match (f.alias.as_str(), f.column.as_str()) {
+        ("t", "name") => Some(r.name.clone()),
+        ("t", "display_name") => Some(r.display_name.clone()),
+        ("t", "type") => Some(r.define_type.clone()),
+        ("t", "state") => Some(r.state.to_string()),
+        ("t", "version") => Some(r.version.to_string()),
+        ("t", "id") => Some(r.id.to_string()),
+        ("t", "create_time") => r.create_time.clone(),
+        ("t", "create_user") => r.create_user.clone(),
+        ("t", "update_time") => r.update_time.clone(),
+        ("t", "update_user") => r.update_user.clone(),
+        _ => None,
+    })
+}
+
+fn instance_row_matches(f: &QueryFilter, r: &InstanceRow) -> bool {
+    field_of(f, match (f.alias.as_str(), f.column.as_str()) {
+        ("t", "id") => Some(r.id.to_string()),
+        ("t", "state") => Some(r.state.to_string()),
+        ("t", "business_no") => r.business_no.clone(),
+        ("t", "operator") => Some(r.operator.clone()),
+        ("t", "parent_node_name") => r.parent_node_name.clone(),
+        ("t", "process_define_id") => Some(r.process_define_id.to_string()),
+        ("t", "expire_time") => r.expire_time.clone(),
+        ("t", "create_time") => r.create_time.clone(),
+        ("t", "create_user") => r.create_user.clone(),
+        ("t", "update_time") => r.update_time.clone(),
+        ("t", "update_user") => r.update_user.clone(),
+        ("pd", "name") => r.define_name.clone(),
+        ("pd", "display_name") => r.define_display_name.clone(),
+        ("pd", "version") => r.define_version.map(|v| v.to_string()),
+        _ => None,
+    })
+}
+
+fn task_row_matches(f: &QueryFilter, r: &TaskRow) -> bool {
+    field_of(f, match (f.alias.as_str(), f.column.as_str()) {
+        ("t", "id") => Some(r.id.to_string()),
+        ("t", "task_name") => Some(r.task_name.clone()),
+        ("t", "display_name") => Some(r.display_name.clone()),
+        ("t", "task_type") => Some(r.task_type.to_string()),
+        ("t", "perform_type") => Some(r.perform_type.to_string()),
+        ("t", "task_state") => Some(r.task_state.to_string()),
+        ("t", "operator") => r.operator.clone(),
+        ("t", "finish_time") => r.finish_time.clone(),
+        ("t", "expire_time") => r.expire_time.clone(),
+        ("t", "form_key") => r.form_key.clone(),
+        ("t", "task_parent_id") => r.task_parent_id.map(|v| v.to_string()),
+        ("pi", "process_define_id") => r.process_define_id.map(|v| v.to_string()),
+        ("pi", "state") => r.instance_state.map(|v| v.to_string()),
+        ("pi", "operator") => r.instance_operator.clone(),
+        ("pi", "business_no") => r.business_no.clone(),
+        ("pd", "name") => r.define_name.clone(),
+        ("pd", "display_name") => r.define_display_name.clone(),
+        ("pd", "version") => r.define_version.map(|v| v.to_string()),
+        _ => None,
+    })
+}
+
+fn design_row_matches(f: &QueryFilter, r: &ProcessDesign) -> bool {
+    field_of(f, match (f.alias.as_str(), f.column.as_str()) {
+        ("t", "name") => Some(r.name.clone()),
+        ("t", "display_name") => Some(r.display_name.clone()),
+        ("t", "type") => Some(r.design_type.clone()),
+        ("t", "is_deployed") => Some(r.is_deployed.to_string()),
+        ("t", "icon") => r.icon.clone(),
+        ("t", "remark") => r.remark.clone(),
+        ("t", "id") => Some(r.id.to_string()),
+        ("t", "create_time") => r.create_time.clone(),
+        ("t", "create_user") => r.create_user.clone(),
+        ("t", "update_time") => r.update_time.clone(),
+        ("t", "update_user") => r.update_user.clone(),
+        _ => None,
+    })
+}
+
 pub struct MemoryRepository {
     id_counter: AtomicI64,
     defines: Mutex<HashMap<i64, ProcessDefine>>,
@@ -227,7 +315,7 @@ impl ProcessRepository for MemoryRepository {
         let instances = self.instances.lock().unwrap();
         let defines = self.defines.lock().unwrap();
 
-        let rows: Vec<TaskRow> = tasks.values()
+        let mut rows: Vec<TaskRow> = tasks.values()
             .filter(|t| {
                 t.task_state == TaskState::Doing.code()
                     && (query.operator.is_none() || t.actor_ids.contains(query.operator.as_ref().unwrap()))
@@ -267,6 +355,9 @@ impl ProcessRepository for MemoryRepository {
             })
             .collect();
 
+        if !query.filters.is_empty() {
+            rows.retain(|r| query.filters.iter().all(|f| task_row_matches(f, r)));
+        }
         let total = rows.len() as i64;
         let start = ((query.page_num - 1) * query.page_size) as usize;
         let end = std::cmp::min(start + query.page_size as usize, rows.len());
@@ -280,7 +371,7 @@ impl ProcessRepository for MemoryRepository {
         let instances = self.instances.lock().unwrap();
         let defines = self.defines.lock().unwrap();
 
-        let rows: Vec<TaskRow> = tasks
+        let mut rows: Vec<TaskRow> = tasks
             .values()
             .filter(|t| {
                 t.task_state == TaskState::Finished.code()
@@ -323,6 +414,9 @@ impl ProcessRepository for MemoryRepository {
             })
             .collect();
 
+        if !query.filters.is_empty() {
+            rows.retain(|r| query.filters.iter().all(|f| task_row_matches(f, r)));
+        }
         let total = rows.len() as i64;
         let start = ((query.page_num - 1) * query.page_size) as usize;
         let end = std::cmp::min(start + query.page_size as usize, rows.len());
@@ -337,7 +431,7 @@ impl ProcessRepository for MemoryRepository {
     fn page_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
         let instances = self.instances.lock().unwrap();
         let defines = self.defines.lock().unwrap();
-        let rows: Vec<InstanceRow> = instances
+        let mut rows: Vec<InstanceRow> = instances
             .values()
             .filter(|i| {
                 query
@@ -369,6 +463,9 @@ impl ProcessRepository for MemoryRepository {
             })
             .collect();
 
+        if !query.filters.is_empty() {
+            rows.retain(|r| query.filters.iter().all(|f| instance_row_matches(f, r)));
+        }
         let total = rows.len() as i64;
         let start = ((query.page_num - 1) * query.page_size) as usize;
         let end = std::cmp::min(start + query.page_size as usize, rows.len());
@@ -384,7 +481,7 @@ impl ProcessRepository for MemoryRepository {
         let ccs = self.cc_instances.lock().unwrap();
         let instances = self.instances.lock().unwrap();
         let defines = self.defines.lock().unwrap();
-        let rows: Vec<InstanceRow> = ccs
+        let mut rows: Vec<InstanceRow> = ccs
             .iter()
             .filter(|cc| {
                 query
@@ -415,6 +512,9 @@ impl ProcessRepository for MemoryRepository {
                 define_version: define.map(|d| d.version),
             }
         }).collect();
+        if !query.filters.is_empty() {
+            rows.retain(|r| query.filters.iter().all(|f| instance_row_matches(f, r)));
+        }
         let total = rows.len() as i64;
         let start = ((query.page_num - 1) * query.page_size) as usize;
         let end = std::cmp::min(start + query.page_size as usize, rows.len());
@@ -424,7 +524,7 @@ impl ProcessRepository for MemoryRepository {
 
     fn page_defines(&self, query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>> {
         let defines = self.defines.lock().unwrap();
-        let rows: Vec<DefineRow> = defines.values().map(|d| DefineRow {
+        let mut rows: Vec<DefineRow> = defines.values().map(|d| DefineRow {
             id: d.id,
             name: d.name.clone(),
             display_name: d.display_name.clone(),
@@ -436,6 +536,9 @@ impl ProcessRepository for MemoryRepository {
             update_time: d.update_time.clone(),
             update_user: d.update_user.clone(),
         }).collect();
+        if !query.filters.is_empty() {
+            rows.retain(|r| query.filters.iter().all(|f| define_row_matches(f, r)));
+        }
         let total = rows.len() as i64;
         let start = ((query.page_num - 1) * query.page_size) as usize;
         let end = std::cmp::min(start + query.page_size as usize, rows.len());
@@ -498,7 +601,10 @@ impl ProcessExtRepository for MemoryRepository {
 
     fn page_designs(&self, query: &PageQuery) -> JeeflowResult<PageResult<ProcessDesign>> {
         let designs = self.designs.lock().unwrap();
-        let rows: Vec<ProcessDesign> = designs.values().cloned().collect();
+        let mut rows: Vec<ProcessDesign> = designs.values().cloned().collect();
+        if !query.filters.is_empty() {
+            rows.retain(|r| query.filters.iter().all(|f| design_row_matches(f, r)));
+        }
         let total = rows.len() as i64;
         let start = ((query.page_num - 1) * query.page_size) as usize;
         let end = std::cmp::min(start + query.page_size as usize, rows.len());

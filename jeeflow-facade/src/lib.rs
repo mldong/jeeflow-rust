@@ -667,46 +667,8 @@ fn parse_m_params(args: &HashMap<String, Json>) -> Vec<jeeflow_core::model::Quer
     filters
 }
 
-/// Apply filters to JSON rows (camelCase field names).
-fn matches_filter(row: &Json, f: &jeeflow_core::model::QueryFilter) -> bool {
-    let camel_col = to_camel(&f.column);
-    let field_val = row.get(&camel_col).or_else(|| row.get(&f.column));
-    let field_str = match field_val {
-        Some(Json::String(s)) => s.clone(),
-        Some(v) => v.to_string().trim_matches('"').to_string(),
-        None => return false,
-    };
-    use jeeflow_core::model::FilterOp;
-    match f.op {
-        FilterOp::Eq => field_str == f.value,
-        FilterOp::Ne => field_str != f.value,
-        FilterOp::Like => field_str.contains(&f.value),
-        FilterOp::Gt => field_str > f.value,
-        FilterOp::Lt => field_str < f.value,
-        FilterOp::Ge => field_str >= f.value,
-        FilterOp::Le => field_str <= f.value,
-        FilterOp::In => f.value.split(',').any(|v| v.trim() == field_str),
-        FilterOp::Nin => !f.value.split(',').any(|v| v.trim() == field_str),
-        FilterOp::Bt => {
-            let parts: Vec<&str> = f.value.split(',').collect();
-            parts.len() == 2 && field_str.as_str() >= parts[0].trim() && field_str.as_str() <= parts[1].trim()
-        }
-    }
-}
-
-fn apply_filters_to_rows(rows: &mut Vec<Json>, filters: &[jeeflow_core::model::QueryFilter]) {
-    if filters.is_empty() { return; }
-    rows.retain(|row| filters.iter().all(|f| matches_filter(row, f)));
-}
-
-/// Re-paginate filtered rows (called when facade-level filtering is applied after repo pagination).
-fn re_paginate(rows: Vec<Json>, page_num: i64, page_size: i64) -> (Vec<Json>, i64) {
-    let total = rows.len() as i64;
-    let start = ((page_num - 1) * page_size) as usize;
-    let end = std::cmp::min(start + page_size as usize, rows.len());
-    let page_rows = if start < rows.len() { rows[start..end].to_vec() } else { vec![] };
-    (page_rows, total)
-}
+// issues/106：m_ 过滤与分页已整体下推仓储（memory/sqlx 消费 PageQuery.filters），
+// 旧的 facade 内存过滤 matches_filter/apply_filters_to_rows 与二次切片 re_paginate 已删除。
 
 fn args_to_flow_data(args: &HashMap<String, Json>) -> FlowData {
     let mut fd = FlowData::new();
@@ -892,13 +854,11 @@ impl JeeflowFacade {
     fn process_define_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
-        let filters = parse_m_params(args);
-        let query = PageQuery::new(page_num, page_size);
+        let mut query = PageQuery::new(page_num, page_size);
+        query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_defines(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(define_row_to_json).collect();
-        apply_filters_to_rows(&mut rows, &filters);
-        let (page_rows, total) = re_paginate(rows, page_num, page_size);
-        let result = PageResult::new(page_num, page_size, total, page_rows);
+        let rows: Vec<Json> = page.rows.iter().map(define_row_to_json).collect();
+        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
@@ -1055,14 +1015,12 @@ impl JeeflowFacade {
     fn process_instance_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
-        let filters = parse_m_params(args);
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
+        query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_instances(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(instance_row_to_json).collect();
-        apply_filters_to_rows(&mut rows, &filters);
-        let (page_rows, total) = re_paginate(rows, page_num, page_size);
-        let result = PageResult::new(page_num, page_size, total, page_rows);
+        let rows: Vec<Json> = page.rows.iter().map(instance_row_to_json).collect();
+        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
@@ -1313,14 +1271,12 @@ impl JeeflowFacade {
     fn process_instance_cc_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
-        let filters = parse_m_params(args);
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
+        query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_cc_instances(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(instance_row_to_json).collect();
-        apply_filters_to_rows(&mut rows, &filters);
-        let (page_rows, total) = re_paginate(rows, page_num, page_size);
-        let result = PageResult::new(page_num, page_size, total, page_rows);
+        let rows: Vec<Json> = page.rows.iter().map(instance_row_to_json).collect();
+        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
@@ -1331,29 +1287,25 @@ impl JeeflowFacade {
     fn process_task_todo_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
-        let filters = parse_m_params(args);
         let mut query = PageQuery::new(page_num, page_size);
         // UI 注入 operator；兼容 userId（curl/旧客户端）
         query.operator = arg_str(args, "operator").or_else(|| arg_str(args, "userId"));
+        query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_todo_tasks(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(task_row_to_json).collect();
-        apply_filters_to_rows(&mut rows, &filters);
-        let (page_rows, total) = re_paginate(rows, page_num, page_size);
-        let result = PageResult::new(page_num, page_size, total, page_rows);
+        let rows: Vec<Json> = page.rows.iter().map(task_row_to_json).collect();
+        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
     fn process_task_done_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
-        let filters = parse_m_params(args);
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
+        query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_done_tasks(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(task_row_to_json).collect();
-        apply_filters_to_rows(&mut rows, &filters);
-        let (page_rows, total) = re_paginate(rows, page_num, page_size);
-        let result = PageResult::new(page_num, page_size, total, page_rows);
+        let rows: Vec<Json> = page.rows.iter().map(task_row_to_json).collect();
+        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
@@ -1637,13 +1589,11 @@ impl JeeflowFacade {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
-        let filters = parse_m_params(args);
-        let query = PageQuery::new(page_num, page_size);
+        let mut query = PageQuery::new(page_num, page_size);
+        query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = ext.page_designs(&query)?;
-        let mut rows: Vec<Json> = page.rows.iter().map(design_to_json).collect();
-        apply_filters_to_rows(&mut rows, &filters);
-        let (page_rows, total) = re_paginate(rows, page_num, page_size);
-        let result = PageResult::new(page_num, page_size, total, page_rows);
+        let rows: Vec<Json> = page.rows.iter().map(design_to_json).collect();
+        let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
@@ -4240,6 +4190,93 @@ mod tests {
         let resp = facade.flow("processDefine/page", &args).await;
         assert_eq!(resp["code"], 0);
         assert_eq!(resp["data"]["recordCount"], 1);
+    }
+
+    // ─── issues/106：分页下推（recordCount=总数、pageNum≥2 非空、m_ 过滤跨页口径一致）───
+
+    fn seed_define(facade: &JeeflowFacade, name: &str, display_name: &str, state: i32) {
+        let mut define = ProcessDefine {
+            id: 0,
+            name: name.into(),
+            display_name: display_name.into(),
+            define_type: "approval".into(),
+            state,
+            content: Vec::new(),
+            version: 1,
+            create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+    }
+
+    fn make_facade_with_n_defines(n: usize) -> JeeflowFacade {
+        let facade = make_facade();
+        for i in 0..n {
+            seed_define(&facade, &format!("flow-{}", i), &format!("Flow {}", i), 1);
+        }
+        facade
+    }
+
+    fn make_facade_with_defines_mixed_state() -> JeeflowFacade {
+        let facade = make_facade();
+        // 3 条 state=1、2 条 state=2（共 5）
+        for i in 0..3 {
+            seed_define(&facade, &format!("on-{}", i), &format!("On {}", i), 1);
+        }
+        for i in 0..2 {
+            seed_define(&facade, &format!("off-{}", i), &format!("Off {}", i), 2);
+        }
+        facade
+    }
+
+    async fn page_define_page(facade: &JeeflowFacade, page_num: i64, page_size: i64) -> Json {
+        let mut args = HashMap::new();
+        args.insert("pageNum".to_string(), json!(page_num));
+        args.insert("pageSize".to_string(), json!(page_size));
+        let resp = facade.flow("processDefine/page", &args).await;
+        assert_eq!(resp["code"], 0, "page resp: {}", resp);
+        resp["data"].clone()
+    }
+
+    async fn filter_define_page(facade: &JeeflowFacade, filter: Json, page_num: i64, page_size: i64) -> Json {
+        let mut args = HashMap::new();
+        args.insert("pageNum".to_string(), json!(page_num));
+        args.insert("pageSize".to_string(), json!(page_size));
+        if let Json::Object(map) = filter {
+            for (k, v) in map {
+                args.insert(k, v);
+            }
+        }
+        let resp = facade.flow("processDefine/page", &args).await;
+        assert_eq!(resp["code"], 0, "filter resp: {}", resp);
+        resp["data"].clone()
+    }
+
+    #[tokio::test]
+    async fn test_define_page_multipage_total() {
+        let facade = make_facade_with_n_defines(5);
+        let r = page_define_page(&facade, 1, 2).await;
+        assert_eq!(r["recordCount"], 5); // 总记录数，非本页行数
+        assert_eq!(r["totalPage"], 3); // 5/2 向上取整
+        assert_eq!(r["rows"].as_array().unwrap().len(), 2);
+        let r2 = page_define_page(&facade, 2, 2).await;
+        assert_eq!(r2["recordCount"], 5);
+        assert_eq!(r2["rows"].as_array().unwrap().len(), 2); // 翻页不再恒空
+        let r3 = page_define_page(&facade, 3, 2).await;
+        assert_eq!(r3["recordCount"], 5);
+        assert_eq!(r3["rows"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_define_page_filter_cross_page() {
+        let facade = make_facade_with_defines_mixed_state();
+        let r = filter_define_page(&facade, json!({"m_EQ_state": 1}), 1, 2).await;
+        assert_eq!(r["recordCount"], 3); // = 命中总数(3)，非本页行数(2)
+        assert_eq!(r["totalPage"], 2); // 3/2 向上取整
+        assert_eq!(r["rows"].as_array().unwrap().len(), 2);
+        let r2 = filter_define_page(&facade, json!({"m_EQ_state": 1}), 2, 2).await;
+        assert_eq!(r2["recordCount"], 3);
+        assert_eq!(r2["rows"].as_array().unwrap().len(), 1); // 翻页非空
     }
 
     #[test]
