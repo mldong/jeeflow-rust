@@ -8,6 +8,8 @@
 //!   GET  /api/stats   → todoCount / instanceCount
 //!   POST /api/reset   → reset all data + reload shared flows
 
+mod seed_business;
+
 use jeeflow_core::context::ServiceContext;
 use jeeflow_core::error::JeeflowResult;
 use jeeflow_core::id_gen::AtomicIdGenerator;
@@ -332,10 +334,13 @@ async fn api_stats(req: &mut Request, res: &mut Response) {
 
 #[handler]
 async fn api_reset(res: &mut Response) {
-    {
+    let facade = {
         let mut state = STATE.lock().unwrap();
         *state = AppState::new();
-    }
+        state.facade.clone()
+    };
+    // T003：reset 重建 repo 后复跑业务种子 driver
+    seed_business::seed_business(&facade).await;
     res.render(salvo::prelude::Json(json!({
         "code": 0,
         "msg": "成功",
@@ -363,6 +368,12 @@ async fn main() {
 
     // 预热：加载共享 flows 种子
     let _ = &*STATE;
+
+    // T003：业务数据种子（引擎真实启动 16 进行中 + 9 已完成 + 8 委托）
+    {
+        let facade = STATE.lock().unwrap().facade.clone();
+        seed_business::seed_business(&facade).await;
+    }
 
     println!("jeeflow-demo-salvo starting on http://0.0.0.0:8091");
     println!("  POST /wf/<group>/<action>  - workflow facade");
