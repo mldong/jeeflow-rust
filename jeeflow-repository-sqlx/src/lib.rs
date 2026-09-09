@@ -584,7 +584,23 @@ impl ProcessRepository for SqlxRepository {
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
-            Ok(row.map(|r| ProcessInstance {
+            let Some(r) = row else { return Ok(None) };
+            let instance_id_v: i64 = r.get("id");
+
+            // issues/110：聚合水合——二次查 wf_process_task 装任务副本（含 actor_ids），
+            // 对齐 Java findTasksByInstanceId / PHP PdoProcessRepository / C# issues/89；
+            // 否则门面 detail 的 tasks/activeTaskList 恒空。
+            // 直接内联查询 + tasks_from_rows（复用连接池，批查 actor），避免嵌套 block_on。
+            let task_rows = sqlx::query(
+                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ?"
+            )
+            .bind(instance_id_v)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let tasks = tasks_from_rows(&self.pool, task_rows).await?;
+
+            Ok(Some(ProcessInstance {
                 instance_id: r.get("id"),
                 parent_id: r.get("parent_id"),
                 define_id: r.get("process_define_id"),
@@ -594,7 +610,7 @@ impl ProcessRepository for SqlxRepository {
                 operator: r.get("operator"),
                 expire_time: get_opt_datetime(&r, "expire_time"),
                 variables: parse_flow_data(&r.get("variable")),
-                tasks: vec![],
+                tasks,
                 create_time: get_opt_datetime(&r, "create_time"),
                 create_user: r.get("create_user"),
                 update_time: get_opt_datetime(&r, "update_time"),
@@ -1849,6 +1865,95 @@ mod tests {
         // Cleanup
         sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+    }
+
+    /// issues/110：SQL 仓 find_instance_by_id 水合任务 → detail 任务列表非空。
+    /// 修复前：find_instance_by_id 只查 wf_process_instance 单表，tasks 硬编码 vec![]，
+    /// 门面 processInstance/detail 的 tasks/activeTaskList 恒为空数组（L2-12 门禁真根因）。
+    /// 对齐 Java findTasksByInstanceId / PHP PdoProcessRepository / C# issues/89 聚合水合。
+    /// 直接驱动 SQL 仓（真实 MySQL）：造实例 + 进行中任务 + 参与者，再断言
+    /// find_instance_by_id 水合出的任务非空、带 actor_ids，且门面 detail 消费
+    /// （遍历 inst.tasks 组 tasks/activeTaskList）非空。
+    #[tokio::test]
+    async fn test_mysql_i110_find_instance_by_id_hydrates_tasks() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        // Pre-cleanup（独立 ID 段 9008xx，避免与 C8 的 9004xx 段并行撞主键）
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id IN (SELECT id FROM wf_process_task WHERE process_instance_id BETWEEN 900801 AND 900899)").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE process_instance_id BETWEEN 900801 AND 900899").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900801 AND 900899").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900801 AND 900899").execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        let instance_id = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            // 定义（01-simple 结构：start→apply(applicant)→end）
+            let mut define = ProcessDefine {
+                id: 900801, name: "rust_i110".into(), display_name: "i110 Test".into(),
+                define_type: "approval".into(), state: 1,
+                content: r#"{"name":"rust_i110","displayName":"i110 Test","type":"approval",
+                    "nodes":[{"id":"start","type":"snaker:start","text":{"value":"s"}},
+                              {"id":"apply","type":"snaker:task","text":{"value":"申请"},"properties":{"assignee":"applicant"}},
+                              {"id":"end","type":"snaker:end","text":{"value":"e"}}],
+                    "edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                             {"id":"e2","sourceNodeId":"apply","targetNodeId":"end"}]}"#.as_bytes().to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            // 进行中实例
+            let mut instance = ProcessInstance {
+                instance_id: 900802, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: Some("BIZ-RUST-110".into()),
+                operator: "zhangsan".into(), expire_time: None,
+                variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some("zhangsan".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut instance).unwrap();
+            // 进行中任务 apply + 参与者
+            let mut task = ProcessTask {
+                task_id: 900803, process_instance_id: instance.instance_id,
+                task_name: "apply".into(), display_name: "申请".into(),
+                task_type: 0, perform_type: 0, task_state: 10,
+                actor_id: Some("zhangsan".into()), actor_ids: vec!["zhangsan".into()],
+                finish_time: None, expire_time: None, form_key: None,
+                parent_task_id: None, variables: jeeflow_core::json::FlowData::new(),
+                create_time: None, create_user: Some("zhangsan".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_task(&mut task).unwrap();
+            repo.add_task_actor(task.task_id, &["zhangsan".into()]).unwrap();
+            instance.instance_id
+        }).await;
+
+        // ① 仓储层：find_instance_by_id 水合任务 + actor_ids（修复前恒空）
+        let pool3 = pool.clone();
+        let loaded = run_sync(move || {
+            let repo = SqlxRepository::new(pool3);
+            repo.find_instance_by_id(instance_id).unwrap().unwrap()
+        }).await;
+        assert!(!loaded.tasks.is_empty(), "issues/110: find_instance_by_id tasks should be non-empty, got {}", loaded.tasks.len());
+        assert!(loaded.tasks.iter().all(|t| !t.actor_ids.is_empty()), "issues/110: hydrated tasks must carry actor_ids");
+
+        // ② 门面 detail 消费口径：遍历 inst.tasks 组 tasks/activeTaskList（对齐 jeeflow-facade process_instance_detail）
+        let doing_code = TaskState::Doing.code();
+        let mut tasks_out: Vec<&ProcessTask> = Vec::new();
+        let mut active: Vec<&ProcessTask> = Vec::new();
+        for t in &loaded.tasks {
+            if t.task_state == doing_code { active.push(t); }
+            tasks_out.push(t);
+        }
+        assert!(!tasks_out.is_empty(), "issues/110: detail tasks should be non-empty");
+        assert!(!active.is_empty(), "issues/110: detail activeTaskList should be non-empty");
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id IN (SELECT id FROM wf_process_task WHERE process_instance_id BETWEEN 900801 AND 900899)").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE process_instance_id BETWEEN 900801 AND 900899").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900801 AND 900899").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900801 AND 900899").execute(&pool).await.unwrap();
     }
 
     /// C8: m_ filter on sqlx side — verify sqlx returns data with filterable fields.
