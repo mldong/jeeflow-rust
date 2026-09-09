@@ -78,7 +78,7 @@ let _next = engine.execute_process_task(task_id, "张三", &args)?;
 - **分页 5 键信封**（C6）：`pageNum` / `pageSize` / `recordCount` / `totalPage` / `rows`
 - **错误码**（C7）：统一 `99999999` + msg
 - **args 透传**（1.0.5）：`args_to_flow_data` 数组/对象原样透传（旧版兜底 `to_string()` 会把多选
-  ApiSelect 的 JSON 数组字符串化成 `"[...]"`，抄送人变字面量——issues/56 根因）
+  ApiSelect 的 JSON 数组字符串化成 `"[...]"`，抄送人变字面量—— 根因）
 
 ## 流程变量
 

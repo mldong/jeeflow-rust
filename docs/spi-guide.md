@@ -63,8 +63,8 @@ impl UserProvider for MyUserProvider {
 - `Applicant` 发起人
 - `ApplicantDeptLeader` / `ApplicantDeptMainLeader` 发起人部门（主）经理
 - `TaskRoleAssignee` 任务角色
-- `FormFieldAssignee` 表单字段取人（`f_` 前缀优先匹配，裸名回落，`_NN` 后缀去后缀——对齐 Go/Java issues/71）
-- 抄送 `f_ccActors` 数组/字符串双形态解析（`parse_cc_actors`，对齐 Go facade.go:203 issues/56）
+- `FormFieldAssignee` 表单字段取人（`f_` 前缀优先匹配，裸名回落，`_NN` 后缀去后缀——对齐 Go/Java）
+- 抄送 `f_ccActors` 数组/字符串双形态解析（`parse_cc_actors`，对齐 Go facade.go:203）
 
 自定义 handler 实现 `AssignmentHandler` trait 后注册进 `HandlerRegistry`
 （mldong 框架集成侧扫描注册；引擎侧 `ServiceContext` 注入）。
@@ -77,4 +77,4 @@ impl UserProvider for MyUserProvider {
 | 注册 | `@Bean` | `NewEngine(opts)` | `Engine(...)` | `new Engine({...})` | `new Engine([...])` | `ServiceContext::with_*` |
 
 trait 方法签名与五语言语义一一对应（命名 snake_case）。跨语言行为差异一律以
-`jeeflow-doc/docs/spec/` 规范为准，Rust 侧对齐记录见 `jeeflow-hub/issues/`。
+`jeeflow-doc/docs/spec/` 规范为准。
