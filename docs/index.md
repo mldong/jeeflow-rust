@@ -22,5 +22,5 @@
 
 | 文档 | 内容 |
 |------|------|
-| [mldong-salvo 集成](./salvo.md) | mldong 框架 Rust 栈（Salvo + SeaORM）薄映射接入，42 action 全覆盖 |
+| [mldong-salvo 集成](./salvo.md) | mldong 框架 Rust 栈（Salvo + SeaORM）薄映射接入，40+ action 全覆盖 |
 | [演示站（Demo）](./demo.md) | 启动 jeeflow-demo-salvo（:8091）、快速验证 |

@@ -1,7 +1,7 @@
 # 演示站（jeeflow-demo-salvo）
 
 Rust 引擎的 Salvo 演示站，与 Java（:8080）/ Go（:8081）/ Python（:8100）/ Node（:8082）/
-PHP 演示站同款形态：**统一前端 jeeflow-ui + 42 action `/wf/**` 转发**。
+PHP 演示站同款形态：**统一前端 jeeflow-ui + 40+ action `/wf/**` 转发**。
 
 ## 本地运行
 
@@ -19,7 +19,7 @@ cargo run -p jeeflow-demo-salvo
 | `/healthz` | GET | 健康检查 `{status: UP, service: jeeflow-demo-salvo}` |
 | `/api/stats` | GET | `todoCount` / `instanceCount` |
 | `/api/reset` | POST | 重置全部数据 + 重载共享流程 |
-| `/wf/{action}` | POST | 42 action 统一入口（`JeeflowFacade::flow`） |
+| `/wf/{action}` | POST | 40+ action 统一入口（`JeeflowFacade::flow`） |
 
 内存仓储（`MemoryRepository`），8 个具名用户（与五语言 demo 同款：张三 / 孙倩 / 周明 /
 吴婷 等），登录态由 demo 侧模拟（无 mldong 框架 RBAC）。

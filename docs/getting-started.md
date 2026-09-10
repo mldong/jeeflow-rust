@@ -37,7 +37,7 @@ async fn main() {
         .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
         .with_user_provider(Arc::new(DemoUserProvider));
 
-    // 3. 门面（42 action 统一入口）
+    // 3. 门面（40+ action 统一入口）
     let facade = JeeflowFacade::new(ctx);
 
     // 4. 发起流程：action = "startProcess"（与 Java/Go/Python/Node/PHP 同款 action 名）
@@ -56,7 +56,7 @@ async fn main() {
 ```
 
 > 引擎核心（`JeeflowEngineImpl`）提供 `start_process` / `execute_task` / `jump_*` 等细粒度方法；
-> 业务系统**对接 mldong 框架时走 `JeeflowFacade::flow(action, args)`**——42 个 action 与
+> 业务系统**对接 mldong 框架时走 `JeeflowFacade::flow(action, args)`**——40+ 个 action 与
 > Java/Go/Python/Node/PHP 门面一一对应，前端无需改代码。
 
 ## 运行演示站

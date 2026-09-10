@@ -33,7 +33,7 @@ src/modules/wf/
     └── wf_db / wf_factory …        # 装配 + 生命周期
 ```
 
-**42 个 action 全覆盖**：controller 层不做业务，全部转发 `JeeflowFacade::flow(action, args)`
+**40+ 个 action 全覆盖**：controller 层不做业务，全部转发 `JeeflowFacade::flow(action, args)`
 （与 boot4 集成同款"单 controller 转发"形态，boot2/boot3 的多 controller 是历史结构）。
 
 ## 权限码规律
