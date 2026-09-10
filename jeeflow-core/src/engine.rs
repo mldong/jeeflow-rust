@@ -144,10 +144,25 @@ impl JeeflowEngineImpl {
 
     /// Resolve assignee for a task node.
     fn resolve_assignee(&self, exec: &Execution, node: &NodeModel) -> Vec<String> {
-        // Priority 1: tf_nextNodeOperator variable
-        if let Some(next_op) = exec.args.get_str("tf_nextNodeOperator") {
-            if !next_op.is_empty() {
-                return next_op.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        // Priority 1: tf_nextNodeOperator variable（v1.0.1 对齐 boot3 / 对齐 Python _resolve_actors）。
+        // 前端「指定下一节点处理人」UserSelect 是 multiple，提交值是**数组**；也可能有
+        // 字符串逗号分隔的旧形态——两种都收，否则数组形态 get_str 取不到 → 落到 assignee
+        // 字面量，指定下一节点处理人不生效（e2e S15 红：指定刘洋后 gm_approve 仍是 chenhong）。
+        if let Some(v) = exec.args.get("tf_nextNodeOperator") {
+            let list: Vec<String> = match v {
+                JsonValue::Array(items) => items
+                    .iter()
+                    .filter_map(|it| it.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                _ => v
+                    .as_str()
+                    .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+                    .unwrap_or_default(),
+            };
+            if !list.is_empty() {
+                return list;
             }
         }
 

@@ -590,12 +590,10 @@ fn collect_static_candidate_actors(
         if node.node_type != jeeflow_core::parser::NodeType::Task {
             continue;
         }
-        if let Some(a) = node.assignee() {
-            let t = a.trim().to_string();
-            if !t.is_empty() && t != "applicant" && seen.insert(t.clone()) {
-                actors.push(t);
-            }
-        }
+        // 候选源只取 candidateUsers（对齐 Java/Python/Go 参考实现，salvo s15 修复）：
+        // assignee 是节点默认处理人（引擎运行时落 task.actor_id），不属于候选池成员——
+        // 若把它收进静态候选，candidatePage 会短路 user_search 全量搜索，使「指定
+        // 下一节点处理人」弹窗只剩默认处理人、选不到他人（e2e S15 红）。
         if let Some(cu) = node.candidate_users() {
             for u in cu.split(',') {
                 let t = u.trim().to_string();
@@ -2757,6 +2755,45 @@ mod tests {
         JeeflowFacade::new(ctx)
     }
 
+    /// 固定返回 3 人的 user_search 桩（candidatePage 全量搜索判据用）
+    struct TestUserSearchProvider;
+    impl UserSearchProvider for TestUserSearchProvider {
+        fn page(&self, query: &PageQuery) -> JeeflowResult<PageResult<HashMap<String, JsonValue>>> {
+            let mut all = Vec::new();
+            for id in ["user1", "user2", "user3"] {
+                let mut m = HashMap::new();
+                m.insert("id".into(), JsonValue::Str(id.into()));
+                m.insert("userId".into(), JsonValue::Str(id.into()));
+                m.insert("realName".into(), JsonValue::Str(id.into()));
+                all.push(m);
+            }
+            let pn = query.page_num.max(1);
+            let ps = query.page_size.max(1);
+            let start = ((pn - 1) * ps) as usize;
+            let end = (start + ps as usize).min(all.len());
+            let rows = if start < all.len() { all[start..end].to_vec() } else { Vec::new() };
+            Ok(PageResult::new(pn, ps, all.len() as i64, rows))
+        }
+        fn find_by_id(&self, user_id: &str) -> JeeflowResult<Option<HashMap<String, JsonValue>>> {
+            let mut m = HashMap::new();
+            m.insert("id".into(), JsonValue::Str(user_id.into()));
+            m.insert("userId".into(), JsonValue::Str(user_id.into()));
+            m.insert("realName".into(), JsonValue::Str(user_id.into()));
+            Ok(Some(m))
+        }
+    }
+
+    fn make_facade_with_user_search() -> JeeflowFacade {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_user_provider(Arc::new(TestUserProvider))
+            .with_user_search_provider(Arc::new(TestUserSearchProvider))
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        JeeflowFacade::new(ctx)
+    }
+
     fn make_facade_with_define() -> (JeeflowFacade, i64) {
         let facade = make_facade();
         let mut define = ProcessDefine {
@@ -3741,6 +3778,158 @@ mod tests {
         assert_eq!(output["taskIds"][0], "999999999999999999");
         assert_eq!(output["roleIds"][0], "1");
         assert_eq!(output["roleIds"][1], "2");
+    }
+
+    // ─── s15 回归：candidatePage 静态候选源不含 assignee（对齐 Java/Python/Go）───
+    // 后继节点仅配置 assignee（默认处理人）而无 candidateUsers 时，candidatePage 的
+    // 静态候选必须为空——否则短路 user_search 全量搜索，「指定下一节点处理人」弹窗
+    // 只剩默认处理人、选不到他人（e2e S15 红）。此处以 user_search 全量返回非空
+    // 作为"已落到用户搜索"的判据：修复前会短路返回 [assignee]（rows 仅 1 行 user2）。
+    #[tokio::test]
+    async fn test_candidate_page_assignee_only_falls_back_to_user_search() {
+        let facade = make_facade_with_user_search();
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), json!("s15-flow"));
+        args.insert("displayName".to_string(), json!("S15 Flow"));
+        let resp = facade.flow("processDesign/save", &args).await;
+        assert_eq!(resp["code"], 0, "save failed: {:?}", resp);
+        let design_id = resp["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        // t1→t2 两个 task 节点；t2 仅 assignee 无 candidateUsers（复刻 e2e L3请假申请
+        // leave_approve→gm_approve：lina 办 leave_approve，后继 gm_approve 只有默认处理人）
+        let flow_json = r#"{
+            "name":"s15-flow","displayName":"S15 Flow","type":"approval",
+            "nodes":[
+                {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                {"id":"apply","type":"snaker:task","text":{"value":"Apply"},
+                 "properties":{"assignee":"applicant"}},
+                {"id":"t1","type":"snaker:task","text":{"value":"T1"},
+                 "properties":{"assignee":"user1"}},
+                {"id":"t2","type":"snaker:task","text":{"value":"T2"},
+                 "properties":{"assignee":"user2"}},
+                {"id":"end","type":"snaker:end","text":{"value":"End"}}
+            ],
+            "edges":[
+                {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                {"id":"e2","sourceNodeId":"apply","targetNodeId":"t1"},
+                {"id":"e3","sourceNodeId":"t1","targetNodeId":"t2"},
+                {"id":"e4","sourceNodeId":"t2","targetNodeId":"end"}
+            ]
+        }"#;
+        let mut args2 = HashMap::new();
+        args2.insert("id".to_string(), json!(design_id));
+        args2.insert("content".to_string(), json!(flow_json));
+        assert_eq!(facade.flow("processDesign/updateDefine", &args2).await["code"], 0);
+
+        let mut args3 = HashMap::new();
+        args3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &args3).await["code"], 0);
+
+        let mut args4 = HashMap::new();
+        args4.insert("name".to_string(), json!("s15-flow"));
+        args4.insert("operator".to_string(), json!("applicant"));
+        let resp4 = facade.flow("processDefine/startAndExecute", &args4).await;
+        assert_eq!(resp4["code"], 0, "startAndExecute failed: {:?}", resp4);
+
+        // apply 自动完成 → 当前 DOING=t1（user1）。查 user1 待办里的 t1
+        let mut args5 = HashMap::new();
+        args5.insert("operator".to_string(), json!("user1"));
+        let resp5 = facade.flow("processTask/todoList", &args5).await;
+        let rows5 = resp5["data"]["rows"].as_array().unwrap();
+        assert_eq!(rows5.len(), 1, "user1 待办应为 t1: {:?}", rows5);
+        let task_id: i64 = rows5[0]["id"].as_str().unwrap().parse().unwrap();
+
+        // t1 的后继 t2 仅 assignee 无 candidateUsers：
+        //   修复前 → 静态候选=[user2] 短路，rows 仅 1 行（bug）
+        //   修复后 → 静态候选空 → 落 user_search 全量 3 人（对齐 Java/Python/Go）
+        let mut args6 = HashMap::new();
+        args6.insert("processTaskId".to_string(), json!(task_id));
+        let resp6 = facade.flow("processTask/candidatePage", &args6).await;
+        assert_eq!(resp6["code"], 0, "candidatePage failed: {:?}", resp6);
+        let rows = resp6["data"]["rows"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "assignee-only 后继节点应落到 user_search 全量搜索（非短路 [assignee]）: {:?}",
+            rows
+        );
+        let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(ids.contains(&"user2") && ids.len() > 1, "应含 assignee 之外的候选: {:?}", ids);
+    }
+
+    // ─── s15 回归②：tf_nextNodeOperator 数组形态必须生效（对齐 Python _resolve_actors）───
+    // 前端「指定下一节点处理人」UserSelect(multiple) 提交的是**数组**，经 args_to_flow_data
+    // 存成 JsonValue::Array。旧 resolve_assignee Priority 1 只用 get_str（只认字符串）→
+    // 数组取不到 → 落到 assignee 字面量（默认处理人）→ 指定不生效（e2e S15 红：指定刘洋后
+    // gm_approve 仍是 chenhong）。本测试用数组形态断言下一节点落到指定人而非默认 assignee。
+    #[tokio::test]
+    async fn test_execute_next_node_operator_array_applies_to_next_task() {
+        let facade = make_facade_with_user_provider();
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), json!("s15b-flow"));
+        args.insert("displayName".to_string(), json!("S15b Flow"));
+        let resp = facade.flow("processDesign/save", &args).await;
+        assert_eq!(resp["code"], 0, "save failed: {:?}", resp);
+        let design_id = resp["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        // t1(assignee=user1) → t2(assignee=user2)：execute t1 时用数组指定 t2 给 user3
+        let flow_json = r#"{
+            "name":"s15b-flow","displayName":"S15b Flow","type":"approval",
+            "nodes":[
+                {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                {"id":"apply","type":"snaker:task","text":{"value":"Apply"},
+                 "properties":{"assignee":"applicant"}},
+                {"id":"t1","type":"snaker:task","text":{"value":"T1"},
+                 "properties":{"assignee":"user1"}},
+                {"id":"t2","type":"snaker:task","text":{"value":"T2"},
+                 "properties":{"assignee":"user2"}},
+                {"id":"end","type":"snaker:end","text":{"value":"End"}}
+            ],
+            "edges":[
+                {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                {"id":"e2","sourceNodeId":"apply","targetNodeId":"t1"},
+                {"id":"e3","sourceNodeId":"t1","targetNodeId":"t2"},
+                {"id":"e4","sourceNodeId":"t2","targetNodeId":"end"}
+            ]
+        }"#;
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(design_id));
+        a2.insert("content".to_string(), json!(flow_json));
+        assert_eq!(facade.flow("processDesign/updateDefine", &a2).await["code"], 0);
+        let mut a3 = HashMap::new();
+        a3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &a3).await["code"], 0);
+        let mut a4 = HashMap::new();
+        a4.insert("name".to_string(), json!("s15b-flow"));
+        a4.insert("operator".to_string(), json!("applicant"));
+        assert_eq!(facade.flow("processDefine/startAndExecute", &a4).await["code"], 0);
+
+        // user1 办 t1，指定下一节点处理人 = 数组 ["user3"]（模拟 UserSelect multiple 提交）
+        let mut a5 = HashMap::new();
+        a5.insert("operator".to_string(), json!("user1"));
+        let r5 = facade.flow("processTask/todoList", &a5).await;
+        let t1_id: i64 = r5["data"]["rows"][0]["id"].as_str().unwrap().parse().unwrap();
+        let mut a6 = HashMap::new();
+        a6.insert("processTaskId".to_string(), json!(t1_id));
+        a6.insert("operator".to_string(), json!("user1"));
+        a6.insert("submitType".to_string(), json!(1));
+        a6.insert("tf_nextNodeOperator".to_string(), json!(["user3"]));
+        assert_eq!(facade.flow("processTask/execute", &a6).await["code"], 0);
+
+        // t2 应落到 user3（指定人）而非默认 assignee user2
+        let mut a7 = HashMap::new();
+        a7.insert("operator".to_string(), json!("user3"));
+        let r7 = facade.flow("processTask/todoList", &a7).await;
+        let user3_rows = r7["data"]["rows"].as_array().unwrap();
+        assert_eq!(user3_rows.len(), 1, "t2 应落到指定人 user3 处: {:?}", user3_rows);
+        // 默认处理人 user2 不应再持有 t2
+        let mut a8 = HashMap::new();
+        a8.insert("operator".to_string(), json!("user2"));
+        let r8 = facade.flow("processTask/todoList", &a8).await;
+        assert!(r8["data"]["rows"].as_array().unwrap().is_empty(),
+            "t2 不应仍是默认处理人 user2（数组 tf_nextNodeOperator 未生效）");
     }
 
     // ─── #91+#92 cross-call test: execute → taskIds match todoList ───
