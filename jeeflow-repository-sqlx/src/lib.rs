@@ -23,141 +23,10 @@ pub fn schema_mysql() -> &'static str {
 // wf_process_define/design 用 type，抄送表叫 wf_process_cc_instance。
 // init_schema 仅用于全新库 bootstrap；既有规范表因 IF NOT EXISTS 直接跳过，
 // 严禁用 ALTER ADD 补列的方式"对齐"（历史坑：曾污染共享 3306 测试库导致引擎自测假通过）。
-pub const MYSQL_SCHEMA: &str = r#"
--- 1. 流程定义表
-CREATE TABLE IF NOT EXISTS wf_process_define (
-    id BIGINT NOT NULL COMMENT '主键',
-    name VARCHAR(64) NOT NULL COMMENT '唯一编码',
-    display_name VARCHAR(100) NOT NULL COMMENT '显示名称',
-    type VARCHAR(32) NULL COMMENT '流程类型',
-    state INT NULL COMMENT '流程是否可用(1可用、0不可用)',
-    content BLOB NULL COMMENT '流程模型定义',
-    version INT NULL COMMENT '版本',
-    create_time DATETIME(3) NULL COMMENT '创建时间',
-    create_user VARCHAR(64) NULL COMMENT '创建用户',
-    update_time DATETIME(3) NULL COMMENT '更新时间',
-    update_user VARCHAR(64) NULL COMMENT '更新用户',
-    PRIMARY KEY (id),
-    KEY idx_process_define_name (name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程定义';
-
--- 2. 流程实例表
-CREATE TABLE IF NOT EXISTS wf_process_instance (
-    id BIGINT NOT NULL COMMENT '主键',
-    parent_id BIGINT NULL COMMENT '父流程实例ID(子流程)',
-    process_define_id BIGINT NULL COMMENT '流程定义ID',
-    state INT NULL COMMENT '实例状态(10进行中、20已完成、45已驳回、99废弃)',
-    parent_node_name VARCHAR(100) NULL COMMENT '父流程依赖的节点名称',
-    business_no VARCHAR(64) NULL COMMENT '业务编号',
-    operator VARCHAR(64) NULL COMMENT '流程发起人',
-    expire_time DATETIME(3) NULL COMMENT '期望完成时间',
-    variable TEXT NULL COMMENT '附属变量json存储',
-    create_time DATETIME(3) NULL COMMENT '创建时间',
-    create_user VARCHAR(64) NULL COMMENT '创建用户',
-    update_time DATETIME(3) NULL COMMENT '更新时间',
-    update_user VARCHAR(64) NULL COMMENT '更新用户',
-    PRIMARY KEY (id),
-    KEY idx_process_instance_pfid (process_define_id),
-    KEY idx_process_instance_operator (operator)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程实例';
-
--- 3. 流程任务表
-CREATE TABLE IF NOT EXISTS wf_process_task (
-    id BIGINT NOT NULL COMMENT '主键',
-    process_instance_id BIGINT NOT NULL COMMENT '流程实例ID',
-    task_name VARCHAR(100) NOT NULL COMMENT '任务名称编码',
-    display_name VARCHAR(100) NOT NULL COMMENT '任务显示名称',
-    task_type INT NULL COMMENT '任务类型(0主办、1协办)',
-    perform_type INT NULL COMMENT '参与类型(0普通、1会签)',
-    task_state INT NULL COMMENT '任务状态(10进行中、20已完成、99废弃)',
-    operator VARCHAR(64) NULL COMMENT '任务处理人',
-    finish_time DATETIME(3) NULL COMMENT '任务完成时间',
-    expire_time DATETIME(3) NULL COMMENT '任务期待完成时间',
-    form_key VARCHAR(100) NULL COMMENT '任务处理表单KEY',
-    task_parent_id BIGINT NULL COMMENT '父任务ID',
-    variable TEXT NULL COMMENT '附属变量json存储',
-    create_time DATETIME(3) NULL COMMENT '创建时间',
-    create_user VARCHAR(64) NULL COMMENT '创建用户',
-    update_time DATETIME(3) NULL COMMENT '更新时间',
-    update_user VARCHAR(64) NULL COMMENT '更新用户',
-    PRIMARY KEY (id),
-    KEY idx_process_task_piid (process_instance_id),
-    KEY idx_process_task_name (task_name),
-    KEY idx_process_task_operator (operator)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程任务';
-
--- 4. 任务参与者表
-CREATE TABLE IF NOT EXISTS wf_process_task_actor (
-    id BIGINT NOT NULL COMMENT '主键',
-    process_task_id BIGINT NOT NULL COMMENT '任务ID',
-    actor_id VARCHAR(64) NOT NULL COMMENT '参与者ID',
-    create_time DATETIME(3) NULL COMMENT '创建时间',
-    create_user VARCHAR(64) NULL COMMENT '创建用户',
-    PRIMARY KEY (id),
-    KEY idx_process_task_actor_ptid (process_task_id),
-    KEY idx_process_task_actor_aid (actor_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='任务参与人关系';
-
--- 5. 抄送实例表
-CREATE TABLE IF NOT EXISTS wf_process_cc_instance (
-    id BIGINT NOT NULL COMMENT '主键',
-    process_instance_id BIGINT NOT NULL COMMENT '流程实例ID',
-    actor_id VARCHAR(64) NOT NULL COMMENT '被抄送人ID',
-    state INT NULL DEFAULT 0 COMMENT '抄送状态(1已读、0未读)',
-    create_time DATETIME(3) NULL COMMENT '创建时间',
-    create_user VARCHAR(64) NULL COMMENT '创建用户',
-    update_time DATETIME(3) NULL COMMENT '更新时间',
-    update_user VARCHAR(64) NULL COMMENT '更新用户',
-    PRIMARY KEY (id),
-    KEY idx_process_cc_instance_piid (process_instance_id),
-    KEY idx_process_cc_instance_aid (actor_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程抄送实例';
-
--- 6. 流程设计表
-CREATE TABLE IF NOT EXISTS wf_process_design (
-    id BIGINT NOT NULL COMMENT '主键',
-    name VARCHAR(100) NOT NULL COMMENT '流程编码(唯一)',
-    display_name VARCHAR(200) NOT NULL COMMENT '流程显示名称',
-    type VARCHAR(50) NULL DEFAULT 'approval' COMMENT '流程类型',
-    icon VARCHAR(200) NULL COMMENT '图标',
-    is_deployed INT NULL DEFAULT 0 COMMENT '是否已部署(0否、1是)',
-    remark TEXT NULL COMMENT '备注',
-    create_time DATETIME(3) NULL COMMENT '创建时间',
-    create_user VARCHAR(64) NULL COMMENT '创建用户',
-    update_time DATETIME(3) NULL COMMENT '更新时间',
-    update_user VARCHAR(64) NULL COMMENT '更新用户',
-    PRIMARY KEY (id),
-    KEY idx_process_design_name (name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程设计';
-
--- 7. 流程设计历史表
-CREATE TABLE IF NOT EXISTS wf_process_design_his (
-    id BIGINT NOT NULL COMMENT '主键',
-    process_design_id BIGINT NOT NULL COMMENT '流程设计ID',
-    content BLOB NULL COMMENT '流程模型定义',
-    create_time DATETIME(3) NULL COMMENT '创建时间',
-    create_user VARCHAR(64) NULL COMMENT '创建用户',
-    PRIMARY KEY (id),
-    KEY idx_process_design_his_pdid (process_design_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程设计历史';
-
--- 8. 委托代理表
-CREATE TABLE IF NOT EXISTS wf_process_surrogate (
-    id BIGINT NOT NULL COMMENT '主键',
-    process_name VARCHAR(100) NULL COMMENT '流程编码(空=全部流程)',
-    operator VARCHAR(64) NOT NULL COMMENT '授权人',
-    surrogate VARCHAR(64) NOT NULL COMMENT '代理人',
-    start_time DATETIME(3) NULL COMMENT '授权开始时间',
-    end_time DATETIME(3) NULL COMMENT '授权结束时间',
-    enabled INT NULL DEFAULT 1 COMMENT '是否启用(1启用、0停用)',
-    create_time DATETIME(3) NULL COMMENT '创建时间',
-    create_user VARCHAR(64) NULL COMMENT '创建用户',
-    update_time DATETIME(3) NULL COMMENT '更新时间',
-    update_user VARCHAR(64) NULL COMMENT '更新用户',
-    PRIMARY KEY (id),
-    KEY idx_process_surrogate_op (operator)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='流程委托代理';
-"#;
+/// 单一来源：同目录 `schema/schema-mysql.sql`（与 Java 参考实现仓
+/// `jeeflow-repository-jdbc/src/test/resources/schema-mysql.sql` 唯一编辑源同步；
+/// 改表结构只改 Java 仓后跑 `jeeflow-hub/scripts/sync-schema.sh` 分发）。
+pub const MYSQL_SCHEMA: &str = include_str!("../schema/schema-mysql.sql");
 
 // ═══════════════════════════════════════════════════════
 // SqlxRepository
@@ -218,10 +87,18 @@ impl SqlxRepository {
     }
 
     /// Initialize the schema by executing the DDL.
+    ///
+    /// 先剥掉 `--` 行注释再按 `;` 分句：DDL 文件头部与表之间都有注释行
+    /// （规范源首行即 `--` 注释），只判首字符会误吞首句。
     pub async fn init_schema(pool: &MySqlPool) -> JeeflowResult<()> {
-        for stmt in MYSQL_SCHEMA.split(';') {
+        let ddl: String = MYSQL_SCHEMA
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for stmt in ddl.split(';') {
             let trimmed = stmt.trim();
-            if trimmed.is_empty() || trimmed.starts_with("--") {
+            if trimmed.is_empty() {
                 continue;
             }
             sqlx::query(trimmed)
@@ -1558,6 +1435,27 @@ mod tests {
         assert_eq!(pk_count, 8, "Each table should have a PRIMARY KEY");
     }
 
+    /// 回归：init_schema 的「剥注释 + 按 `;` 分句」逻辑必须 8 句全产出。
+    /// 历史坑：旧实现按分句后首字符判 `--` 跳过，规范源文件头部注释行
+    /// 紧跟首句 DDL，会把第一句 CREATE TABLE 误吞（建表静默缺表）。
+    #[test]
+    fn test_init_schema_statement_split() {
+        let ddl: String = MYSQL_SCHEMA
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stmts: Vec<&str> = ddl.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        assert_eq!(stmts.len(), 8, "init_schema should yield exactly 8 statements");
+        for stmt in &stmts {
+            assert!(
+                stmt.starts_with("CREATE TABLE IF NOT EXISTS"),
+                "each statement must be a CREATE TABLE, got: {}...",
+                &stmt[..stmt.len().min(60)]
+            );
+        }
+    }
+
     #[test]
     fn test_schema_indexes() {
         let schema = schema_mysql();
@@ -1614,9 +1512,15 @@ mod tests {
         assert!(json.contains("test"));
     }
 
+    /// 列名断言用：空白归一化（规范源文件列名间用对齐多空格，
+    /// 旧内嵌 DDL 是单空格，归一化后两种格式断言一致）。
+    fn flat(schema: &str) -> String {
+        schema.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn test_schema_define_table_columns() {
-        let schema = schema_mysql();
+        let schema = flat(schema_mysql());
         // Check key columns in wf_process_define（规范：type 列 + BLOB content）
         assert!(schema.contains("id BIGINT"));
         assert!(schema.contains("name VARCHAR"));
@@ -1631,7 +1535,7 @@ mod tests {
 
     #[test]
     fn test_schema_instance_table_columns() {
-        let schema = schema_mysql();
+        let schema = flat(schema_mysql());
         assert!(schema.contains("process_define_id BIGINT"));
         assert!(schema.contains("state INT"));
         assert!(schema.contains("operator VARCHAR"));
@@ -1639,7 +1543,7 @@ mod tests {
 
     #[test]
     fn test_schema_task_table_columns() {
-        let schema = schema_mysql();
+        let schema = flat(schema_mysql());
         assert!(schema.contains("task_name VARCHAR"));
         // 规范：wf_process_task 用 task_state/operator/task_parent_id（对齐 mldong-plus DB 镜像）
         assert!(schema.contains("task_state INT"));
