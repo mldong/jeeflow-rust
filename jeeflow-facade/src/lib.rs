@@ -1085,15 +1085,14 @@ impl JeeflowFacade {
         let mut inst = self.repo.find_instance_by_id(id)?
             .ok_or(JeeflowError::InstanceNotFound(id))?;
         inst.withdraw();
-        self.repo.update_instance(&inst)?;
-        // Withdraw all doing tasks
+        // 级联落库判据取 Withdraw(30)：inst.withdraw() 已在内存里把进行中任务翻成 30，
+        // 此处若仍判 Doing 则该循环永不命中，任务会留在库里 10（继续出现在待办）。
         for task in &inst.tasks {
-            if task.task_state == TaskState::Doing.code() {
-                let mut t = task.clone();
-                t.withdraw();
-                self.repo.update_task(&t)?;
+            if task.task_state == TaskState::Withdraw.code() {
+                self.repo.update_task(task)?;
             }
         }
+        self.repo.update_instance(&inst)?;
         Ok(json!({"id": id, "state": inst.state}))
     }
 
@@ -3543,6 +3542,91 @@ mod tests {
         let facade = make_facade();
         let resp = facade.flow("processInstance/withdraw", &HashMap::new()).await;
         assert_eq!(resp["code"], 99999999);
+    }
+
+    /// issues/113 正向：撤回后原进行中任务必须**落库**为 30（WITHDRAW）。
+    /// 改前级联循环判的是 Doing，而 inst.withdraw() 已在内存把任务翻成 30 → 循环永不命中，
+    /// 库里任务停在 10，撤回的单子继续留在办理人待办里。
+    #[tokio::test]
+    async fn test_instance_withdraw_persists_task_state_30() {
+        let facade = make_facade();
+
+        let mut a1 = HashMap::new();
+        a1.insert("name".to_string(), json!("withdraw-persist-flow"));
+        a1.insert("displayName".to_string(), json!("Withdraw Persist Flow"));
+        let r1 = facade.flow("processDesign/save", &a1).await;
+        assert_eq!(r1["code"], 0, "save failed: {:?}", r1);
+        let design_id = r1["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(design_id));
+        a2.insert(
+            "content".to_string(),
+            json!(r#"{
+                "name":"withdraw-persist-flow","displayName":"Withdraw Persist Flow","type":"approval",
+                "nodes":[
+                    {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                    {"id":"apply","type":"snaker:task","text":{"value":"Apply"},
+                     "properties":{"assignee":"applicant"}},
+                    {"id":"approve","type":"snaker:task","text":{"value":"Approve"},
+                     "properties":{"assignee":"user2"}},
+                    {"id":"end","type":"snaker:end","text":{"value":"End"}}
+                ],
+                "edges":[
+                    {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                    {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                    {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+                ]
+            }"#),
+        );
+        assert_eq!(facade.flow("processDesign/updateDefine", &a2).await["code"], 0);
+        let mut a3 = HashMap::new();
+        a3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &a3).await["code"], 0);
+
+        let mut a4 = HashMap::new();
+        a4.insert("name".to_string(), json!("withdraw-persist-flow"));
+        a4.insert("operator".to_string(), json!("applicant"));
+        let r4 = facade.flow("processDefine/startAndExecute", &a4).await;
+        assert_eq!(r4["code"], 0, "startAndExecute failed: {:?}", r4);
+        let inst_id: i64 = r4["data"]["processInstanceId"].as_str().unwrap().parse().unwrap();
+
+        let doing_before = facade.repo().find_doing_tasks(inst_id, &[]).unwrap();
+        assert_eq!(doing_before.len(), 1, "approve 应为唯一进行中任务");
+        let task_id = doing_before[0].task_id;
+        assert_eq!(doing_before[0].task_state, TaskState::Doing.code());
+
+        let mut a5 = HashMap::new();
+        a5.insert("id".to_string(), json!(inst_id));
+        let r5 = facade.flow("processInstance/withdraw", &a5).await;
+        assert_eq!(r5["code"], 0, "withdraw failed: {:?}", r5);
+
+        let stored = facade.repo().find_task_by_id(task_id).unwrap().expect("task exists");
+        assert_eq!(
+            stored.task_state,
+            TaskState::Withdraw.code(),
+            "issues/113：撤回后任务须落库 30，实测库里仍是 {}",
+            stored.task_state
+        );
+        assert!(
+            facade.repo().find_doing_tasks(inst_id, &[]).unwrap().is_empty(),
+            "撤回后不应再有进行中任务"
+        );
+        assert_eq!(
+            facade.repo().find_instance_by_id(inst_id).unwrap().unwrap().state,
+            InstanceState::Withdraw.code()
+        );
+
+        // 待办列表按人复查：撤回的单子不再出现在 user2 待办里
+        let mut a6 = HashMap::new();
+        a6.insert("operator".to_string(), json!("user2"));
+        let r6 = facade.flow("processTask/todoList", &a6).await;
+        assert_eq!(
+            r6["data"]["rows"].as_array().unwrap().iter()
+                .filter(|t| t["processInstanceId"].as_str() == Some(&inst_id.to_string()))
+                .count(),
+            0
+        );
     }
 
     // ─── processInstance action tests ───
