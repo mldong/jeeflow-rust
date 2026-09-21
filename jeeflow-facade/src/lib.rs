@@ -296,7 +296,9 @@ fn define_row_to_json(r: &DefineRow) -> Json {
 fn task_row_to_json(r: &TaskRow) -> Json {
     let instance_ext = parse_json_map(r.instance_variable.as_deref());
     let mut ext = parse_json_map(r.variable.as_deref());
-    if ext.is_empty() {
+    // issues/121 P1：引擎建单必写的控制键不算「任务变量非空」，否则新建任务的 ext
+    // 永远不再回退实例变量（issues/82-3 既有契约）。
+    if ext.is_empty() || (ext.len() == 1 && ext.contains_key("isFirstTaskNode")) {
         ext = instance_ext.clone();
     }
     json!({
