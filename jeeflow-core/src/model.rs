@@ -471,7 +471,11 @@ pub struct ProcessTask {
 
 impl ProcessTask {
     /// Finish this task (state → FINISHED=20).
-    pub fn finish(&mut self, operator: &str, _args: &FlowData) -> Result<(), String> {
+    /// 变量合并序（契约 spec/06 §4.3 第 5 条，转办留痕存活的前置条件）：
+    /// 任务既有变量为底 ← 本次提交参数 args 最高。用 `merge`（args 覆盖同名键，
+    /// 不在 args 里的既有键如 `tf_transferHistory` 原样保留），既不全量替换任务变量，
+    /// 也不让既有变量压过 args（否则转办的 submitType=7 会反噬 B 提交的 1/2/20）。
+    pub fn finish(&mut self, operator: &str, args: &FlowData) -> Result<(), String> {
         if self.task_state != TaskState::Doing.code() {
             return Err(format!("Task {} is not in DOING state (current={})", self.task_id, self.task_state));
         }
@@ -480,7 +484,10 @@ impl ProcessTask {
         }
         self.task_state = TaskState::Finished.code();
         self.actor_id = Some(operator.to_string());
+        self.variables.merge(args);
         self.finish_time = Some(current_time_str());
+        self.update_time = Some(current_time_str());
+        self.update_user = Some(operator.to_string());
         Ok(())
     }
 

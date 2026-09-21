@@ -47,7 +47,8 @@ impl EnumDictRegistry {
             DictItem { value: "4".into(), label: "跳转".into() },
             DictItem { value: "5".into(), label: "重新提交".into() },
             DictItem { value: "6".into(), label: "退回发起人".into() },
-            DictItem { value: "20".into(), label: "拒绝申请(会签)".into() },
+            DictItem { value: "7".into(), label: "转办".into() },
+            DictItem { value: "20".into(), label: "会签拒绝".into() },
         ]);
 
         // 4. wf_process_task_state
@@ -276,7 +277,13 @@ mod tests {
     fn test_submit_type_dict() {
         let reg = EnumDictRegistry::new();
         let items = reg.get_dict("wf_process_submit_type").unwrap();
-        assert_eq!(items.len(), 8);
+        // issues/116：0/1/2/3/4/5/6/7/20 共 9 项（补 7 转办、20 会签拒绝）
+        assert_eq!(items.len(), 9);
+        let find = |v: &str| items.iter().find(|i| i.value == v).map(|i| i.label.clone());
+        assert_eq!(find("7").as_deref(), Some("转办"));
+        assert_eq!(find("20").as_deref(), Some("会签拒绝"));
+        // 2 保持「拒绝申请」不动
+        assert_eq!(find("2").as_deref(), Some("拒绝申请"));
     }
 
     #[test]

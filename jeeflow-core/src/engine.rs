@@ -716,8 +716,10 @@ impl JeeflowEngineImpl {
             full_args.insert_str("countersignDisagreeFlag", "1");
         }
 
-        // 6. Complete task in aggregate
-        instance.complete_task(task_id, operator, &full_args).map_err(|e| JeeflowError::Business(e))?;
+        // 6. Complete task in aggregate.
+        // 传本次提交原始 args（非合并后的 full_args）：契约 spec/06 §4.3 第 5 条要求
+        // 任务变量按「既有变量 ← args」合并，args 最高，full_args 含实例全量变量会污染任务变量。
+        instance.complete_task(task_id, operator, args).map_err(|e| JeeflowError::Business(e))?;
 
         // 6.5. Set countersignDisagreeFlag on the completed task's variables too
         if submit_type == Some(20) {
@@ -918,7 +920,7 @@ impl JeeflowEngineImpl {
             full_args.insert_str("countersignDisagreeFlag", "1");
         }
 
-        instance.complete_task(task_id, operator, &full_args).map_err(|e| JeeflowError::Business(e))?;
+        instance.complete_task(task_id, operator, args).map_err(|e| JeeflowError::Business(e))?;
         // Set flag on completed task's variables
         if submit_type == Some(20) {
             if let Some(t) = instance.tasks.iter_mut().find(|t| t.task_id == task_id) {
@@ -982,7 +984,7 @@ impl JeeflowEngineImpl {
             full_args.insert_str("countersignDisagreeFlag", "1");
         }
 
-        instance.complete_task(task_id, operator, &full_args).map_err(|e| JeeflowError::Business(e))?;
+        instance.complete_task(task_id, operator, args).map_err(|e| JeeflowError::Business(e))?;
         // Set flag on completed task's variables
         if submit_type == Some(20) {
             if let Some(t) = instance.tasks.iter_mut().find(|t| t.task_id == task_id) {

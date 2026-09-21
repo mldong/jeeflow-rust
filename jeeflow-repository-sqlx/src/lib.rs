@@ -531,9 +531,12 @@ impl ProcessRepository for SqlxRepository {
     fn update_instance(&self, instance: &ProcessInstance) -> JeeflowResult<()> {
         self.block_on(async {
             let var_json = flow_data_to_json(&instance.variables);
-            sqlx::query("UPDATE wf_process_instance SET state=?, variable=?, update_time=NOW() WHERE id=?")
+            // update_user 用 COALESCE：仅当调用方显式回写（如撤回人）时才落库，
+            // 其它路径传 None 保持既有值，避免误清（spec/06 withdraw「实例 update_user 回写为撤回人」）。
+            sqlx::query("UPDATE wf_process_instance SET state=?, variable=?, update_user=COALESCE(?, update_user), update_time=NOW() WHERE id=?")
                 .bind(instance.state)
                 .bind(&var_json)
+                .bind(&instance.update_user)
                 .bind(instance.instance_id)
                 .execute(&self.pool)
                 .await
@@ -625,17 +628,17 @@ impl ProcessRepository for SqlxRepository {
     fn update_task(&self, task: &ProcessTask) -> JeeflowResult<()> {
         self.block_on(async {
             let var_json = flow_data_to_json(&task.variables);
-            sqlx::query(
-                "UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, variable=?, update_time=NOW() WHERE id=?"
-            )
-            .bind(task.task_state)
-            .bind(&task.actor_id)
-            .bind(&task.finish_time)
-            .bind(&var_json)
-            .bind(task.task_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            // update_user COALESCE：撤回/转办/办结显式回写操作人时落库，其它路径保持既有值。
+            sqlx::query("UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, variable=?, update_user=COALESCE(?, update_user), update_time=NOW() WHERE id=?")
+                .bind(task.task_state)
+                .bind(&task.actor_id)
+                .bind(&task.finish_time)
+                .bind(&var_json)
+                .bind(&task.update_user)
+                .bind(task.task_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
         })
     }
@@ -2082,6 +2085,188 @@ mod tests {
             assert!(hist[0].is_allowed(handler),
                 "C11: history task must allow real handler via is_allowed");
         }).await;
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/113~116 · withdraw update_user 级联落库 + transfer 留痕落库（真机 SQL 断言）
+    // ═══════════════════════════════════════════════════════
+
+    /// 撤回级联：实例与进行中任务的 update_user 必须真的落库（sqlx update_instance 不级联任务，
+    /// 靠门面逐任务 update_task 那一圈带下去；update_user 列此前根本不写，本轮补 COALESCE）。
+    #[tokio::test]
+    async fn test_mysql_withdraw_cascade_persists_update_user() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        let (define_id, instance_id, task_id) = (900950i64, 900951i64, 900952i64);
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 900950 AND 900999").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900950 AND 900999").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900950 AND 900999").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900950 AND 900999").execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: define_id, name: "wd_cascade".into(), display_name: "WD".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("applicant".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let mut inst = ProcessInstance {
+                instance_id, parent_id: None, define_id, state: 10,
+                parent_node_name: None, business_no: None, operator: "applicant".into(),
+                expire_time: None, variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some("applicant".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut inst).unwrap();
+            let mut task = ProcessTask {
+                task_id, process_instance_id: instance_id,
+                task_name: "approve".into(), display_name: "Approve".into(),
+                task_type: 0, perform_type: 0, task_state: 10, // DOING
+                actor_id: None, actor_ids: vec!["user2".into()],
+                finish_time: None, expire_time: None, form_key: None,
+                parent_task_id: None, variables: jeeflow_core::json::FlowData::new(),
+                create_time: None, create_user: Some("applicant".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_task(&mut task).unwrap();
+            repo.add_task_actor(task_id, &["user2".into()]).unwrap();
+
+            // 模拟门面撤回级联：任务置 30 + update_user 回写，实例置 30 + update_user 回写
+            let mut t = repo.find_task_by_id(task_id).unwrap().unwrap();
+            t.task_state = 30;
+            t.update_user = Some("applicant".into());
+            repo.update_task(&t).unwrap();
+            let mut i = repo.find_instance_by_id(instance_id).unwrap().unwrap();
+            i.state = 30;
+            i.update_user = Some("applicant".into());
+            repo.update_instance(&i).unwrap();
+        }).await;
+
+        // 真机 SQL 断言（读回库列，非内存）
+        let task_row = sqlx::query("SELECT task_state, update_user, operator FROM wf_process_task WHERE id = ?")
+            .bind(task_id).fetch_one(&pool).await.unwrap();
+        let state: i32 = task_row.get("task_state");
+        let tu: Option<String> = task_row.get("update_user");
+        let op: Option<String> = task_row.get("operator");
+        assert_eq!(state, 30, "任务须落库 30");
+        assert_eq!(tu.as_deref(), Some("applicant"), "任务 update_user 须真落库为撤回人");
+        assert!(op.is_none(), "撤回不得给任务 operator(actor 列) 写值，实测 {:?}", op);
+
+        let inst_row = sqlx::query("SELECT state, update_user FROM wf_process_instance WHERE id = ?")
+            .bind(instance_id).fetch_one(&pool).await.unwrap();
+        let istate: i32 = inst_row.get("state");
+        let itu: Option<String> = inst_row.get("update_user");
+        assert_eq!(istate, 30, "实例须落库 30");
+        assert_eq!(itu.as_deref(), Some("applicant"), "实例 update_user 须真落库为撤回人");
+
+        // Cleanup
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+    }
+
+    /// 转办留痕落库：tf_transferHistory（六键 camelCase + time 字符串）经 variable 列往返，
+    /// 且严禁覆写 operator(actor 列)——转办时进行中任务该列仍为 NULL。
+    #[tokio::test]
+    async fn test_mysql_transfer_trace_roundtrip() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        let (define_id, instance_id, task_id) = (900960i64, 900961i64, 900962i64);
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 900960 AND 900999").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900960 AND 900999").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900960 AND 900999").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900960 AND 900999").execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: define_id, name: "tr_trace".into(), display_name: "TR".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("applicant".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let mut inst = ProcessInstance {
+                instance_id, parent_id: None, define_id, state: 10,
+                parent_node_name: None, business_no: None, operator: "applicant".into(),
+                expire_time: None, variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some("applicant".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut inst).unwrap();
+            let mut task = ProcessTask {
+                task_id, process_instance_id: instance_id,
+                task_name: "approve".into(), display_name: "Approve".into(),
+                task_type: 0, perform_type: 0, task_state: 10,
+                actor_id: None, actor_ids: vec!["user2".into()],
+                finish_time: None, expire_time: None, form_key: None,
+                parent_task_id: None, variables: jeeflow_core::json::FlowData::new(),
+                create_time: None, create_user: Some("applicant".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_task(&mut task).unwrap();
+            repo.add_task_actor(task_id, &["user2".into()]).unwrap();
+
+            // 模拟门面转办 user2 → lisi：摘原人 + 加新人 + 三件留痕 + update_user，不动 actor 列
+            repo.remove_task_actor(task_id, &["user2".into()]).unwrap();
+            repo.add_task_actor(task_id, &["lisi".into()]).unwrap();
+            let mut t = repo.find_task_by_id(task_id).unwrap().unwrap();
+            let mut vars = jeeflow_core::json::FlowData::new();
+            let hop = jeeflow_core::json::JsonValue::Object(vec![
+                ("submitType".to_string(), jeeflow_core::json::JsonValue::Number(7.0)),
+                ("fromActor".to_string(), jeeflow_core::json::JsonValue::Str("user2".into())),
+                ("toActor".to_string(), jeeflow_core::json::JsonValue::Str("lisi".into())),
+                ("reason".to_string(), jeeflow_core::json::JsonValue::Str("出差一周".into())),
+                ("time".to_string(), jeeflow_core::json::JsonValue::Str("2026-09-21 08:20:54".into())),
+                ("operator".to_string(), jeeflow_core::json::JsonValue::Str("user2".into())),
+            ]);
+            vars.insert("tf_transferHistory".to_string(), jeeflow_core::json::JsonValue::Array(vec![hop]));
+            vars.insert_i64("submitType", 7);
+            vars.insert_str("tf_transferTo", "lisi");
+            vars.insert_str("tf_approvalComment", "user2 转办给 lisi（出差一周）");
+            t.variables = vars;
+            t.update_user = Some("user2".into());
+            t.actor_ids = repo.find_task_actors(task_id).unwrap();
+            repo.update_task(&t).unwrap();
+
+            // 读回值断言（走 find_task_by_id 的 variable 列解析）
+            let back = repo.find_task_by_id(task_id).unwrap().unwrap();
+            let hist = match back.variables.get("tf_transferHistory") {
+                Some(jeeflow_core::json::JsonValue::Array(a)) => a.clone(),
+                _ => vec![],
+            };
+            assert_eq!(hist.len(), 1, "转办留痕须往返库 variable 列");
+            let obj = hist[0].as_object().expect("hop object");
+            let get = |k: &str| obj.iter().find(|(x, _)| x == k).map(|(_, v)| v.clone());
+            assert_eq!(get("fromActor").and_then(|v| v.as_str().map(String::from)).as_deref(), Some("user2"));
+            assert_eq!(get("toActor").and_then(|v| v.as_str().map(String::from)).as_deref(), Some("lisi"));
+            assert_eq!(get("time").and_then(|v| v.as_str().map(String::from)).as_deref(), Some("2026-09-21 08:20:54"));
+            assert_eq!(back.variables.get_str("tf_transferTo"), Some("lisi"));
+            assert!(back.actor_id.is_none(), "转办严禁覆写 operator 列，读回 {:?}", back.actor_id);
+            // 参与者表：user2 摘走、lisi 加上
+            let actors = repo.find_task_actors(task_id).unwrap();
+            assert!(!actors.contains(&"user2".to_string()) && actors.contains(&"lisi".to_string()), "actors={:?}", actors);
+        }).await;
+
+        // 真机 SQL：operator(actor 列) 恒 NULL
+        let op: Option<String> = sqlx::query("SELECT operator FROM wf_process_task WHERE id = ?")
+            .bind(task_id).fetch_one(&pool).await.unwrap().get("operator");
+        assert!(op.is_none(), "真机 operator 列应为 NULL，实测 {:?}", op);
 
         // Cleanup
         sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ?").bind(task_id).execute(&pool).await.unwrap();

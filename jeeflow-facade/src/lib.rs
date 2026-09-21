@@ -432,6 +432,24 @@ fn arg_str_or(args: &HashMap<String, Json>, key: &str, default: &str) -> String 
     arg_str(args, key).unwrap_or_else(|| default.to_string())
 }
 
+/// 硬必填字符串参数：缺失或 trim 后为空串 → 返回携带统一 msg 的 Business 错误。
+/// 撤回/转办的 operator、fromActor、toActor 一律走它，严禁缺省回落固定账号（issues/114/115）。
+fn require_non_empty(
+    args: &HashMap<String, Json>,
+    key: &str,
+    msg: &str,
+) -> JeeflowResult<String> {
+    match arg_str(args, key) {
+        Some(s) if !s.trim().is_empty() => Ok(s),
+        _ => Err(JeeflowError::Business(msg.to_string())),
+    }
+}
+
+/// 系统代执行（flow.auto）/ 超级管理员（flow.admin）放行——isAllowed 既有约定，撤回/转办共用。
+fn is_privileged_operator(operator: &str) -> bool {
+    operator.eq_ignore_ascii_case("flow.auto") || operator.eq_ignore_ascii_case("flow.admin")
+}
+
 fn arg_i64_or(args: &HashMap<String, Json>, key: &str, default: i64) -> JeeflowResult<i64> {
     Ok(arg_i64(args, key)?.unwrap_or(default))
 }
@@ -767,6 +785,7 @@ impl JeeflowFacade {
             "processTask/candidatePage" => self.process_task_candidate_page(args),
             "processTask/surrogate" => self.process_task_surrogate(args),
             "processTask/addCandidate" => self.process_task_add_candidate(args),
+            "processTask/transfer" => self.process_task_transfer(args),
             "processTask/latest" => self.process_task_latest(args),
 
             // ═══ processDesign (9) ═══
@@ -1082,8 +1101,28 @@ impl JeeflowFacade {
     fn process_instance_withdraw(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let id = arg_id(args, &["processInstanceId", "id"])?
             .ok_or(JeeflowError::Business("缺少id参数".into()))?;
+        // issues/114：operator 硬必填——严禁缺省回落 user1（撤回人被静默记成别人，
+        // update_user 与审计链一起失真且不报错）。缺失/空串统一 msg「operator 必填」。
+        let operator = arg_str(args, "operator")
+            .filter(|s| !s.trim().is_empty())
+            .ok_or(JeeflowError::Business("operator 必填".into()))?;
         let mut inst = self.repo.find_instance_by_id(id)?
             .ok_or(JeeflowError::InstanceNotFound(id))?;
+
+        // 归属判据（命中任一放行）：发起人 / 任一进行中任务参与者 / flow.auto|admin。
+        if !self.can_withdraw(&inst, &operator) {
+            return Err(JeeflowError::Business("无权限撤回该流程实例".into()));
+        }
+
+        // 实例 update_user 回写为撤回人。
+        inst.update_user = Some(operator.clone());
+        // 进行中任务的 update_user 同样回写（withdraw 只翻 Doing→Withdraw，
+        // 已完成(20)/已终止(40) 的行不受影响，其 update_user 保持不动）。
+        for task in &mut inst.tasks {
+            if task.task_state == TaskState::Doing.code() {
+                task.update_user = Some(operator.clone());
+            }
+        }
         inst.withdraw();
         // 级联落库判据取 Withdraw(30)：inst.withdraw() 已在内存里把进行中任务翻成 30，
         // 此处若仍判 Doing 则该循环永不命中，任务会留在库里 10（继续出现在待办）。
@@ -1093,7 +1132,33 @@ impl JeeflowFacade {
             }
         }
         self.repo.update_instance(&inst)?;
-        Ok(json!({"id": id, "state": inst.state}))
+        Ok(Json::Null)
+    }
+
+    /// 撤回归属判据（issues/114，命中任一即放行）：
+    /// 1. operator = 实例发起人（wf_process_instance.operator）；
+    /// 2. operator 是该实例任一「进行中」任务的参与者（wf_process_task_actor.actor_id）；
+    /// 3. operator ∈ {flow.auto, flow.admin}。
+    /// ⚠️ 判据 1 不可复用 `is_allowed`：引擎 is_allowed 只判「在不在该任务 actorIds」+
+    /// auto/admin 放行，从不查发起人，撤回路径必须显式补这一支。
+    fn can_withdraw(&self, inst: &ProcessInstance, operator: &str) -> bool {
+        if is_privileged_operator(operator) {
+            return true;
+        }
+        if operator == inst.operator {
+            return true;
+        }
+        // 以参与者表为准（聚合副本可能滞后于加签/转办的增量写入）
+        if let Ok(doing) = self.repo.find_doing_tasks(inst.instance_id, &[]) {
+            for t in &doing {
+                if let Ok(actors) = self.repo.find_task_actors(t.task_id) {
+                    if actors.iter().any(|a| a == operator) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn process_instance_high_light(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -1278,7 +1343,7 @@ impl JeeflowFacade {
     }
 
     // ═══════════════════════════════════════════════════════
-    // processTask actions (9)
+    // processTask actions (10)
     // ═══════════════════════════════════════════════════════
 
     fn process_task_todo_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -1565,6 +1630,82 @@ impl JeeflowFacade {
 
     fn process_task_add_candidate(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         self.process_task_surrogate(args)
+    }
+
+    /// 转办（issues/115/116）：摘原参与人 + 换新人，沿用同一 taskId，三件留痕。
+    /// 与 surrogate（加签=只追加）语义相反——本 action 会摘走 fromActor 那一行。
+    fn process_task_transfer(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        let task_id = arg_id(args, &["processTaskId", "id"])?
+            .ok_or(JeeflowError::Business("缺少processTaskId参数".into()))?;
+        // operator 硬必填（缺失/空串统一 msg），fromActor/toActor 同口径。
+        let operator = require_non_empty(args, "operator", "operator 必填")?;
+        let from_actor = require_non_empty(args, "fromActor", "fromActor 必填")?;
+        let to_actor = require_non_empty(args, "toActor", "toActor 必填")?;
+        let reason = arg_str(args, "reason").unwrap_or_default();
+
+        let mut task = self
+            .repo
+            .find_task_by_id(task_id)?
+            .ok_or(JeeflowError::Business("任务不存在".into()))?;
+
+        // 归属判据：只能转自己那一条待办（operator==fromActor），flow.auto|admin 例外。
+        if !is_privileged_operator(&operator) && operator != from_actor {
+            return Err(JeeflowError::Business("无权限转办该任务".into()));
+        }
+        // 前置态：仅进行中（DOING=10）任务可转办。
+        if task.task_state != TaskState::Doing.code() {
+            return Err(JeeflowError::Business("任务非进行中，不可转办".into()));
+        }
+        // 以参与者表为判据（聚合副本可能滞后于加签/转办的增量写入）。
+        let actors = self.repo.find_task_actors(task_id)?;
+        if !actors.iter().any(|a| a == &from_actor) {
+            return Err(JeeflowError::Business("原办理人不是该任务参与人".into()));
+        }
+        if actors.iter().any(|a| a == &to_actor) {
+            return Err(JeeflowError::Business("目标人已是该任务参与人".into()));
+        }
+
+        // 摘原人（仅 fromActor 一行）+ 加新人（同一 taskId，不新建任务）。
+        self.repo.remove_task_actor(task_id, &[from_actor.clone()])?;
+        self.repo.add_task_actor(task_id, &[to_actor.clone()])?;
+
+        // 留痕三件（契约第 4 条，缺一不可）——严禁覆写 actor_id/operator 列（进行中任务该列恒无值）。
+        let mut vars = task.variables.clone();
+        // ① 追加式跨跳账本 tf_transferHistory（六键固定 camelCase，只追加不覆盖）。
+        let mut history: Vec<JsonValue> = match vars.get("tf_transferHistory") {
+            Some(JsonValue::Array(arr)) => arr.clone(),
+            _ => Vec::new(),
+        };
+        let time_str = current_time_str();
+        let hop = JsonValue::Object(vec![
+            ("submitType".to_string(), JsonValue::Number(7.0)),
+            ("fromActor".to_string(), JsonValue::Str(from_actor.clone())),
+            ("toActor".to_string(), JsonValue::Str(to_actor.clone())),
+            ("reason".to_string(), JsonValue::Str(reason.clone())),
+            ("time".to_string(), JsonValue::Str(time_str.clone())),
+            ("operator".to_string(), JsonValue::Str(operator.clone())),
+        ]);
+        history.push(hop);
+        vars.insert("tf_transferHistory".to_string(), JsonValue::Array(history));
+        // ② 当前槽位 submitType=7（B 办结时由 args 覆盖，属预期）+ 单跳便捷键。
+        vars.insert_i64("submitType", 7);
+        vars.insert_str("tf_transferTo", to_actor.clone());
+        vars.insert_str("tf_transferReason", reason.clone());
+        // ③ 末跳可读文案写 tf_approvalComment（前端既有读取位）。
+        let transfer_text = if reason.is_empty() {
+            format!("{} 转办给 {}", from_actor, to_actor)
+        } else {
+            format!("{} 转办给 {}（{}）", from_actor, to_actor, reason)
+        };
+        vars.insert_str("tf_approvalComment", transfer_text);
+
+        task.variables = vars;
+        task.update_user = Some(operator.clone());
+        // 同步为摘/加之后的最新参与者集合：内存仓 page_todo 按副本 actor_ids 过滤，
+        // 不同步则待办不会真正挪到 B（sqlx update_task 不写 actor 表，无副作用）。
+        task.actor_ids = self.repo.find_task_actors(task_id)?;
+        self.repo.update_task(&task)?;
+        Ok(Json::Null)
     }
 
     fn process_task_latest(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -3598,6 +3739,8 @@ mod tests {
 
         let mut a5 = HashMap::new();
         a5.insert("id".to_string(), json!(inst_id));
+        // issues/114：operator 硬必填，撤回人=发起人 applicant（命中归属判据 1）。
+        a5.insert("operator".to_string(), json!("applicant"));
         let r5 = facade.flow("processInstance/withdraw", &a5).await;
         assert_eq!(r5["code"], 0, "withdraw failed: {:?}", r5);
 
@@ -4333,7 +4476,7 @@ mod tests {
     // ─── Action count test ───
 
     #[tokio::test]
-    async fn test_all_45_actions_dispatchable() {
+    async fn test_all_46_actions_dispatchable() {
         let facade = make_facade();
         let actions = vec![
             "processDefine/page", "processDefine/detail", "processDefine/startAndExecute",
@@ -4349,7 +4492,7 @@ mod tests {
             "processTask/todoList", "processTask/doneList", "processTask/execute",
             "processTask/detail", "processTask/jumpAbleTaskNameList",
             "processTask/candidatePage", "processTask/surrogate",
-            "processTask/addCandidate", "processTask/latest",
+            "processTask/addCandidate", "processTask/transfer", "processTask/latest",
             "processDesign/page", "processDesign/detail",
             "processDesign/save", "processDesign/update",
             "processDesign/updateDefine", "processDesign/remove",
@@ -4359,7 +4502,7 @@ mod tests {
             "processSurrogate/update", "processSurrogate/detail",
             "processSurrogate/remove",
         ];
-        assert_eq!(actions.len(), 45, "Should have exactly 45 actions");
+        assert_eq!(actions.len(), 46, "Should have exactly 46 actions");
         // All actions should return a response (not panic)
         for action in &actions {
             let resp = facade.flow(action, &HashMap::new()).await;
@@ -4981,5 +5124,372 @@ mod tests {
         let dir = rows.iter().find(|r| r["key"] == "总监审批").unwrap();
         assert_eq!(dir["count"], 1);
         assert_eq!(dir["avgDurationSeconds"], 1800);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/113~116 · withdraw 鉴权 + processTask/transfer（内存仓）
+    // ═══════════════════════════════════════════════════════
+
+    /// 部署两步审批流（apply[applicant] → approve[user2] → end），startAndExecute 自动完成
+    /// apply，返回 (instance_id, 进行中的 approve 任务 id)。任务参与者为 user2。
+    async fn start_two_step_flow(facade: &JeeflowFacade, flow_name: &str) -> (i64, i64) {
+        let mut a1 = HashMap::new();
+        a1.insert("name".to_string(), json!(flow_name));
+        a1.insert("displayName".to_string(), json!(flow_name));
+        let r1 = facade.flow("processDesign/save", &a1).await;
+        assert_eq!(r1["code"], 0, "save failed: {:?}", r1);
+        let design_id = r1["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        let content = format!(
+            r#"{{
+                "name":"{n}","displayName":"{n}","type":"approval",
+                "nodes":[
+                    {{"id":"start","type":"snaker:start","text":{{"value":"Start"}}}},
+                    {{"id":"apply","type":"snaker:task","text":{{"value":"Apply"}},"properties":{{"assignee":"applicant"}}}},
+                    {{"id":"approve","type":"snaker:task","text":{{"value":"Approve"}},"properties":{{"assignee":"user2"}}}},
+                    {{"id":"end","type":"snaker:end","text":{{"value":"End"}}}}
+                ],
+                "edges":[
+                    {{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"}},
+                    {{"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"}},
+                    {{"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}}
+                ]
+            }}"#,
+            n = flow_name
+        );
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(design_id));
+        a2.insert("content".to_string(), json!(content));
+        assert_eq!(facade.flow("processDesign/updateDefine", &a2).await["code"], 0);
+        let mut a3 = HashMap::new();
+        a3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &a3).await["code"], 0);
+
+        let mut a4 = HashMap::new();
+        a4.insert("name".to_string(), json!(flow_name));
+        a4.insert("operator".to_string(), json!("applicant"));
+        let r4 = facade.flow("processDefine/startAndExecute", &a4).await;
+        assert_eq!(r4["code"], 0, "start failed: {:?}", r4);
+        let inst_id: i64 = r4["data"]["processInstanceId"].as_str().unwrap().parse().unwrap();
+
+        let doing = facade.repo().find_doing_tasks(inst_id, &[]).unwrap();
+        assert_eq!(doing.len(), 1, "应有一个进行中任务 approve");
+        assert_eq!(doing[0].task_name, "approve");
+        let task_id = doing[0].task_id;
+        let actors = facade.repo().find_task_actors(task_id).unwrap();
+        assert!(actors.contains(&"user2".to_string()), "task actors={:?}", actors);
+        (inst_id, task_id)
+    }
+
+    /// 从 task.variables（持久 FlowData，非 camelCase HTTP 视图）取 tf_transferHistory 数组。
+    fn history_of(facade: &JeeflowFacade, task_id: i64) -> Vec<JsonValue> {
+        let t = facade.repo().find_task_by_id(task_id).unwrap().expect("task");
+        match t.variables.get("tf_transferHistory") {
+            Some(JsonValue::Array(a)) => a.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn field_str(v: &JsonValue, key: &str) -> String {
+        match v {
+            JsonValue::Object(entries) => entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, val)| val.as_str().map(|s| s.to_string()))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    fn field_i64(v: &JsonValue, key: &str) -> i64 {
+        match v {
+            JsonValue::Object(entries) => entries
+                .iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, val)| val.as_i64())
+                .unwrap_or(-1),
+            _ => -1,
+        }
+    }
+
+    fn transfer_args(task_id: i64, from: &str, to: &str, operator: &str) -> HashMap<String, Json> {
+        let mut m = HashMap::new();
+        m.insert("processTaskId".to_string(), json!(task_id));
+        m.insert("fromActor".to_string(), json!(from));
+        m.insert("toActor".to_string(), json!(to));
+        m.insert("operator".to_string(), json!(operator));
+        m
+    }
+
+    // ─── withdraw：operator 硬必填 + 三判据 + update_user 回写 ───
+
+    #[tokio::test]
+    async fn test_withdraw_operator_required() {
+        let facade = make_facade();
+        let (iid, _) = start_two_step_flow(&facade, "wd-op-flow").await;
+        // 缺 operator
+        let mut a = HashMap::new();
+        a.insert("id".to_string(), json!(iid));
+        let r = facade.flow("processInstance/withdraw", &a).await;
+        assert_eq!(r["code"], 99999999);
+        assert_eq!(r["msg"], "operator 必填", "缺 operator 应报统一文案");
+        // 空串 operator
+        a.insert("operator".to_string(), json!(""));
+        let r2 = facade.flow("processInstance/withdraw", &a).await;
+        assert_eq!(r2["msg"], "operator 必填", "空串 operator 同样必填");
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_no_permission() {
+        let facade = make_facade();
+        let (iid, _) = start_two_step_flow(&facade, "wd-perm-flow").await;
+        // stranger：非发起人(applicant)、非进行中任务参与者(user2)、非 auto/admin
+        let mut a = HashMap::new();
+        a.insert("id".to_string(), json!(iid));
+        a.insert("operator".to_string(), json!("stranger"));
+        let r = facade.flow("processInstance/withdraw", &a).await;
+        assert_eq!(r["code"], 99999999);
+        assert_eq!(r["msg"], "无权限撤回该流程实例");
+        // 拒绝后不许改写：实例仍进行中、任务仍 DOING
+        assert_eq!(
+            facade.repo().find_instance_by_id(iid).unwrap().unwrap().state,
+            InstanceState::Doing.code()
+        );
+        assert_eq!(facade.repo().find_doing_tasks(iid, &[]).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_by_initiator_writeback_update_user() {
+        let facade = make_facade();
+        let (iid, task_id) = start_two_step_flow(&facade, "wd-init-flow").await;
+        let mut a = HashMap::new();
+        a.insert("id".to_string(), json!(iid));
+        a.insert("operator".to_string(), json!("applicant")); // 判据 1：发起人
+        let r = facade.flow("processInstance/withdraw", &a).await;
+        assert_eq!(r["code"], 0, "{:?}", r);
+
+        let inst = facade.repo().find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, InstanceState::Withdraw.code());
+        assert_eq!(inst.update_user.as_deref(), Some("applicant"), "实例 update_user 须回写撤回人");
+
+        let task = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        assert_eq!(task.task_state, TaskState::Withdraw.code(), "进行中任务须落库 30");
+        assert_eq!(task.update_user.as_deref(), Some("applicant"), "任务 update_user 须回写撤回人");
+        assert!(task.actor_id.is_none(), "撤回不得给任务 actor 列写值");
+        assert!(facade.repo().find_doing_tasks(iid, &[]).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_by_participant_and_privileged() {
+        // 判据 2：进行中任务参与者
+        let facade = make_facade();
+        let (iid, _) = start_two_step_flow(&facade, "wd-actor-flow").await;
+        let mut a = HashMap::new();
+        a.insert("id".to_string(), json!(iid));
+        a.insert("operator".to_string(), json!("user2")); // 参与人
+        assert_eq!(facade.flow("processInstance/withdraw", &a).await["code"], 0, "参与者应可撤回");
+
+        // 判据 3：flow.admin 放行（新实例，操作人非发起人/参与者）
+        let facade2 = make_facade();
+        let (iid2, _) = start_two_step_flow(&facade2, "wd-admin-flow").await;
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(iid2));
+        a2.insert("operator".to_string(), json!("flow.admin"));
+        assert_eq!(facade2.flow("processInstance/withdraw", &a2).await["code"], 0, "admin 应放行");
+    }
+
+    // ─── transfer：正向留痕 + 挪待办 ───
+
+    #[tokio::test]
+    async fn test_transfer_positive_moves_todo_and_traces() {
+        let facade = make_facade();
+        let (iid, task_id) = start_two_step_flow(&facade, "tr-pos-flow").await;
+
+        let mut a = transfer_args(task_id, "user2", "lisi", "user2");
+        a.insert("reason".to_string(), json!("出差一周"));
+        let r = facade.flow("processTask/transfer", &a).await;
+        assert_eq!(r["code"], 0, "{:?}", r);
+
+        // 待办从 user2 挪到 lisi
+        assert!(!facade.repo().find_task_actors(task_id).unwrap().contains(&"user2".to_string()));
+        assert!(facade.repo().find_task_actors(task_id).unwrap().contains(&"lisi".to_string()));
+        let mut lisi = HashMap::new();
+        lisi.insert("operator".to_string(), json!("lisi"));
+        let lisi_rows = facade.flow("processTask/todoList", &lisi).await["data"]["rows"]
+            .as_array().unwrap().clone();
+        assert!(lisi_rows.iter().any(|t| t["id"].as_str() == Some(&task_id.to_string())),
+            "lisi 待办应含该任务: {:?}", lisi_rows);
+        let mut u2 = HashMap::new();
+        u2.insert("operator".to_string(), json!("user2"));
+        let u2_rows = facade.flow("processTask/todoList", &u2).await["data"]["rows"]
+            .as_array().unwrap().clone();
+        assert!(!u2_rows.iter().any(|t| t["id"].as_str() == Some(&task_id.to_string())),
+            "user2 待办不应再含该任务");
+
+        // 三件留痕（读持久值 tf_transferHistory，六键 camelCase + time 格式）
+        let hist = history_of(&facade, task_id);
+        assert_eq!(hist.len(), 1, "应恰一跳");
+        let hop = &hist[0];
+        assert_eq!(field_i64(hop, "submitType"), 7);
+        assert_eq!(field_str(hop, "fromActor"), "user2");
+        assert_eq!(field_str(hop, "toActor"), "lisi");
+        assert_eq!(field_str(hop, "reason"), "出差一周");
+        assert_eq!(field_str(hop, "operator"), "user2");
+        let time = field_str(hop, "time");
+        assert!(chrono::NaiveDateTime::parse_from_str(&time, "%Y-%m-%d %H:%M:%S").is_ok(),
+            "time 必须是 yyyy-MM-dd HH:mm:ss，实测: {}", time);
+
+        let task = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        assert_eq!(
+            match task.variables.get("submitType") {
+                Some(JsonValue::Number(n)) => *n as i64,
+                Some(JsonValue::Str(s)) => s.parse::<i64>().unwrap_or(-1),
+                _ => -1,
+            },
+            7,
+            "当前槽位 submitType=7"
+        );
+        assert_eq!(task.variables.get_str("tf_transferTo"), Some("lisi"));
+        assert_eq!(task.variables.get_str("tf_transferReason"), Some("出差一周"));
+        let comment = task.variables.get_str("tf_approvalComment").unwrap_or("");
+        assert!(comment.contains("user2") && comment.contains("转办给") && comment.contains("lisi")
+            && comment.contains("出差一周"), "末跳可读文案异常: {}", comment);
+        // 严禁覆写 actor 列（进行中该列恒无值）；update_user = 转办操作人
+        assert!(task.actor_id.is_none(), "转办严禁写 actor_id 列，实测 {:?}", task.actor_id);
+        assert_eq!(task.update_user.as_deref(), Some("user2"), "update_user 记转办操作人");
+        // 任务不新建：沿用同一 id；实例仍进行中
+        assert_eq!(facade.repo().find_doing_tasks(iid, &[]).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_transfer_history_appends_across_hops() {
+        let facade = make_facade();
+        let (_, task_id) = start_two_step_flow(&facade, "tr-multi-flow").await;
+        // user2 → lisi
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "user2")).await["code"], 0);
+        // lisi → wangwu（第二跳）
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "lisi", "wangwu", "lisi")).await["code"], 0);
+
+        let hist = history_of(&facade, task_id);
+        assert_eq!(hist.len(), 2, "两跳都应留档，实测 {}", hist.len());
+        // 首跳原样保留（追加不覆盖）
+        assert_eq!(field_str(&hist[0], "fromActor"), "user2");
+        assert_eq!(field_str(&hist[0], "toActor"), "lisi");
+        assert_eq!(field_str(&hist[1], "fromActor"), "lisi");
+        assert_eq!(field_str(&hist[1], "toActor"), "wangwu");
+        assert_eq!(field_str(&hist[1], "reason"), "", "无 reason 写空串不写 null");
+        // 便捷键只留末跳
+        let task = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        assert_eq!(task.variables.get_str("tf_transferTo"), Some("wangwu"));
+    }
+
+    #[tokio::test]
+    async fn test_transfer_only_removes_own_actor() {
+        // 加签只追加 + 转办只摘自己那一行、不动其他参与人（会签/多参与人同判据）
+        let facade = make_facade();
+        let (_, task_id) = start_two_step_flow(&facade, "tr-own-flow").await;
+        // 加签 user3（只追加，user2 仍在）
+        let mut s = HashMap::new();
+        s.insert("processTaskId".to_string(), json!(task_id));
+        s.insert("actorIds".to_string(), json!(["user3"]));
+        assert_eq!(facade.flow("processTask/surrogate", &s).await["code"], 0);
+        let after_add = facade.repo().find_task_actors(task_id).unwrap();
+        assert!(after_add.contains(&"user2".to_string()) && after_add.contains(&"user3".to_string()),
+            "加签应只追加: {:?}", after_add);
+
+        // 转办 user2 → lisi：只摘 user2，user3 不动
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "user2")).await["code"], 0);
+        let after_tr = facade.repo().find_task_actors(task_id).unwrap();
+        assert!(!after_tr.contains(&"user2".to_string()));
+        assert!(after_tr.contains(&"user3".to_string()), "转办不得误删其他参与人: {:?}", after_tr);
+        assert!(after_tr.contains(&"lisi".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_transfer_var_merge_order_args_win() {
+        let facade = make_facade();
+        let (_, task_id) = start_two_step_flow(&facade, "tr-merge-flow").await;
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "user2")).await["code"], 0);
+        // lisi 办结提交 submitType=1：args 最高，须覆盖转办留下的 7，且 tf_transferHistory 存活
+        let mut e = HashMap::new();
+        e.insert("processTaskId".to_string(), json!(task_id));
+        e.insert("operator".to_string(), json!("lisi"));
+        e.insert("submitType".to_string(), json!(1));
+        assert_eq!(facade.flow("processTask/execute", &e).await["code"], 0);
+
+        let task = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        let st = match task.variables.get("submitType") {
+            Some(JsonValue::Number(n)) => *n as i64,
+            Some(JsonValue::Str(s)) => s.parse::<i64>().unwrap_or(-1),
+            _ => -1,
+        };
+        assert_eq!(st, 1, "办结 args 须覆盖转办的 submitType=7（否则记录失真）");
+        assert_eq!(history_of(&facade, task_id).len(), 1, "合并语义下 tf_transferHistory 不得被抹掉");
+    }
+
+    #[tokio::test]
+    async fn test_transfer_negative_msgs() {
+        let facade = make_facade();
+        let (_, task_id) = start_two_step_flow(&facade, "tr-neg-flow").await;
+
+        // operator 必填
+        let mut a = transfer_args(task_id, "user2", "lisi", "user2");
+        a.remove("operator");
+        assert_eq!(facade.flow("processTask/transfer", &a).await["msg"], "operator 必填");
+        // fromActor 必填
+        let mut a = transfer_args(task_id, "user2", "lisi", "user2");
+        a.insert("fromActor".to_string(), json!(""));
+        assert_eq!(facade.flow("processTask/transfer", &a).await["msg"], "fromActor 必填");
+        // toActor 必填
+        let mut a = transfer_args(task_id, "user2", "lisi", "user2");
+        a.remove("toActor");
+        assert_eq!(facade.flow("processTask/transfer", &a).await["msg"], "toActor 必填");
+        // 无权限转办该任务：operator 既非 fromActor 也非 auto/admin
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "mallory")).await["msg"], "无权限转办该任务");
+        // 原办理人不是该任务参与人
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "ghost", "lisi", "ghost")).await["msg"], "原办理人不是该任务参与人");
+        // 目标人已是该任务参与人
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "user2", "user2")).await["msg"], "目标人已是该任务参与人");
+        // 任务非进行中：先办结再转
+        let mut e = HashMap::new();
+        e.insert("processTaskId".to_string(), json!(task_id));
+        e.insert("operator".to_string(), json!("user2"));
+        e.insert("submitType".to_string(), json!(1));
+        assert_eq!(facade.flow("processTask/execute", &e).await["code"], 0);
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "user2")).await["msg"], "任务非进行中，不可转办");
+    }
+
+    #[tokio::test]
+    async fn test_transfer_privileged_admin_allowed() {
+        let facade = make_facade();
+        let (_, task_id) = start_two_step_flow(&facade, "tr-admin-flow").await;
+        // flow.admin 可代转他人待办（operator != fromActor 但特权放行）
+        let r = facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "flow.admin")).await;
+        assert_eq!(r["code"], 0, "admin 代转应放行: {:?}", r);
+    }
+
+    // ─── 回归红线（Node 实测坑）：转办不得覆写 actor 列；转办后撤回该单不凭空出现在 fromActor 已办 ───
+
+    #[tokio::test]
+    async fn test_transfer_then_withdraw_not_in_fromactor_done_list() {
+        let facade = make_facade();
+        let (iid, task_id) = start_two_step_flow(&facade, "tr-done-flow").await;
+        assert_eq!(facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "user2")).await["code"], 0);
+        // 撤回整单（发起人）：任务离开 DOING→30
+        let mut w = HashMap::new();
+        w.insert("id".to_string(), json!(iid));
+        w.insert("operator".to_string(), json!("applicant"));
+        assert_eq!(facade.flow("processInstance/withdraw", &w).await["code"], 0);
+
+        // 被摘走的 user2 的已办里绝不能凭空出现这条他没办过的单
+        let mut d = HashMap::new();
+        d.insert("operator".to_string(), json!("user2"));
+        let done = facade.flow("processTask/doneList", &d).await;
+        let rows = done["data"]["rows"].as_array().unwrap();
+        assert!(!rows.iter().any(|t| t["processInstanceId"].as_str() == Some(&iid.to_string())),
+            "user2 未办结却被摘走，不得出现在其已办: {:?}", rows);
+        // 且该任务 actor 列恒无值（转办严禁覆写）
+        let task = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        assert!(task.actor_id.is_none(), "撤回后 actor 列应仍为空，实测 {:?}", task.actor_id);
     }
 }
