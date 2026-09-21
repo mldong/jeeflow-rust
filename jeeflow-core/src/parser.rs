@@ -71,6 +71,29 @@ impl ProcessModel {
         false
     }
 
+    /// 能否退回到 `parent_id` 所在节点——照 mldong-boot2 `NodeModel.canRejected` 的形状：
+    /// 自 current 的入边递归回溯，只穿越 fork/join/start 三类节点，其余节点即"上一步"本身。
+    /// 与 boot2 同样不带 visited 集（保持语义一致；纯任务节点组成的回环理论上会无限回溯，
+    /// 那是 boot2 继承来的性质，不在这里悄悄改掉判据）。
+    pub fn can_rejected(&self, current_id: &str, parent_id: &str) -> bool {
+        for edge in self.get_input_edges(current_id) {
+            let source = &edge.source_node_id;
+            if source == parent_id {
+                return true;
+            }
+            match self.get_node(source) {
+                Some(n) if matches!(n.node_type, NodeType::Fork | NodeType::Join | NodeType::Start) => continue,
+                Some(_) => {
+                    if self.can_rejected(source, parent_id) {
+                        return true;
+                    }
+                }
+                None => {}
+            }
+        }
+        false
+    }
+
     /// Get all end nodes.
     pub fn get_end_nodes(&self) -> Vec<&NodeModel> {
         self.get_nodes_by_type(NodeType::End)

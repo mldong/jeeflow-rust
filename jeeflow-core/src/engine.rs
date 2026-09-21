@@ -36,6 +36,17 @@ pub struct Execution {
     pub gate_vars: FlowData,
 }
 
+/// 跳转落点的三种语义（issues/121 P2：3「退回上一步」与 6「退回发起人」必须分开）
+#[derive(Clone, Copy)]
+enum JumpTarget<'a> {
+    /// submitType=4 跳转到指定节点
+    Node(&'a str),
+    /// submitType=6 退回发起人（start 直接后继）
+    FirstTaskNode,
+    /// submitType=3 退回上一步（血缘版：复活 parent 那条历史行）
+    RollbackLineage,
+}
+
 impl Execution {
     pub fn new(instance: ProcessInstance, model: ProcessModel,
                define: ProcessDefine, operator: &str, args: FlowData) -> Self {
@@ -950,6 +961,16 @@ impl JeeflowEngineImpl {
     pub async fn execute_and_jump_async(&self, task_id: i64, operator: &str,
                                           args: &FlowData, target_name: Option<&str>)
         -> JeeflowResult<Vec<ProcessTask>> {
+        match target_name {
+            Some(name) => self.execute_jump_inner(task_id, operator, args, JumpTarget::Node(name)).await,
+            // issues/121 P2：target 为空＝血缘版「退回上一步」（submitType=3）。
+            // 此前这条分支与「退回发起人」（6）共用 get_first_task_node()，两语义塌成同值（issues/119）。
+            None => self.execute_jump_inner(task_id, operator, args, JumpTarget::RollbackLineage).await,
+        }
+    }
+
+    async fn execute_jump_inner(&self, task_id: i64, operator: &str, args: &FlowData,
+                                mode: JumpTarget<'_>) -> JeeflowResult<Vec<ProcessTask>> {
         // Similar to execute_task_async but jumps to target node
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
@@ -995,17 +1016,20 @@ impl JeeflowEngineImpl {
         let mut exec = Execution::new(instance, model, define, operator, full_args);
         exec.process_task = Some(task);
 
-        // Jump to target node or first task node
-        let target_node = if let Some(name) = target_name {
-            exec.process_model.get_node(name).cloned()
-        } else {
-            // Rollback: go back to previous task node
-            // Find the task that created this task (parent_task_id)
-            exec.process_model.get_first_task_node().cloned()
-        };
-
-        if let Some(node) = target_node {
-            self.execute_node(&mut exec, &node)?;
+        match mode {
+            JumpTarget::Node(name) => {
+                if let Some(node) = exec.process_model.get_node(name).cloned() {
+                    self.execute_node(&mut exec, &node)?;
+                }
+            }
+            // submitType=6 退回发起人：跳 start 直接后继那条节点（形状与原实现一致，已与 3 彻底分开）
+            JumpTarget::FirstTaskNode => {
+                if let Some(node) = exec.process_model.get_first_task_node().cloned() {
+                    self.execute_node(&mut exec, &node)?;
+                }
+            }
+            // submitType=3 退回上一步：复活血缘前驱那条历史行
+            JumpTarget::RollbackLineage => self.rollback_to_parent(&mut exec)?,
         }
 
         self.persist_tasks(&mut exec)?;
@@ -1081,7 +1105,73 @@ impl JeeflowEngineImpl {
     /// Async execute and jump to first task node (return to initiator).
     pub async fn execute_and_jump_to_first_async(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
-        self.execute_and_jump_async(task_id, operator, args, None).await
+        // issues/121 P2：不再借道 execute_and_jump_async(None)——那条现在是血缘回退（3）
+        self.execute_jump_inner(task_id, operator, args, JumpTarget::FirstTaskNode).await
+    }
+
+    /// 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的 parent_task_id，
+    /// 复活那条历史行；不按模型入边拓扑推（拓扑版会回到本实例没走过的节点，且 3 与 6 塌成同值）。
+    ///
+    /// 错码用 `Business(msg)` 前缀表达：本栈 `JeeflowError::code()` 恒 99999999，
+    /// 契约只要求"异常与 msg 可区分、HTTP 出口仍 99999999"。
+    fn rollback_to_parent(&self, exec: &mut Execution) -> JeeflowResult<()> {
+        const NO_LINEAGE: &str = "20010007: 上一步任务ID为空，无法驳回至上一步处理";
+        const GUARD: &str = "20010008: 无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务";
+
+        let current = match exec.process_task.clone() {
+            Some(t) => t,
+            None => return Err(JeeflowError::Business(NO_LINEAGE.to_string())),
+        };
+        let parent_id = match current.parent_task_id {
+            Some(p) if p != 0 => p,
+            _ => return Err(JeeflowError::Business(NO_LINEAGE.to_string())),
+        };
+        let history = match exec.process_instance.tasks.iter().find(|t| t.task_id == parent_id) {
+            Some(t) => t.clone(),
+            None => return Err(JeeflowError::Business(NO_LINEAGE.to_string())),
+        };
+        if !exec.process_model.can_rejected(&current.task_name, &history.task_name) {
+            return Err(JeeflowError::Business(GUARD.to_string()));
+        }
+
+        // 复活行的变量只带数据类键：tf_*（上一次表单提交）与 csv_*/会签簿记都是"上次提交"的残留，
+        // 留着会让新待办显示用户这次没填的东西、或让复活的会签节点从错位的序号继续推进。
+        let mut vars = FlowData::new();
+        for (k, v) in history.variables.iter() {
+            if k == "submitType" || k == "taskName"
+                || k.starts_with("tf_") || k.starts_with("csv_")
+                || k.starts_with("loopCounter") || k.starts_with("nrOfInstances")
+                || k.starts_with("operatorList") {
+                continue;
+            }
+            vars.insert(k.clone(), v.clone());
+        }
+        // 首任务节点那条由发起人提交 ⇒ 参与者取该行 u_userId；其余取该行办结人。
+        // 老行没这个键 ⇒ 按 false 处理（宁可派给该行 actor_id，也不用带"仅进行中"判定的现算值）。
+        let is_first_row = matches!(history.variables.get("isFirstTaskNode"),
+                                    Some(JsonValue::Bool(true)));
+        let operator = if is_first_row {
+            match history.variables.get("u_userId").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => exec.process_instance.operator.clone(),
+            }
+        } else {
+            match history.actor_id.clone() {
+                Some(a) => a,
+                None => return Err(JeeflowError::Business(NO_LINEAGE.to_string())),
+            }
+        };
+        vars.insert("isFirstTaskNode".to_string(), JsonValue::Bool(is_first_row));
+
+        let mut revived = history.clone();
+        revived.task_id = 0;                     // persist_tasks 里统一分配真实 id
+        revived.task_state = TaskState::Doing.code();
+        revived.actor_id = None;                 // 进行中任务该列恒无值
+        revived.actor_ids = vec![operator];
+        revived.finish_time = None;
+        revived.variables = vars;                // parent_task_id 随行拷贝＝"上一步的上一步"
+        exec.new_tasks.push(revived);
+        Ok(())
     }
 }
 
@@ -2443,4 +2533,104 @@ mod tests {
             "ClockScope 作用域结束后不得残留注入值"
         );
     }
+
+    /// 推进到链上第 n 条进行中任务（返回该行的副本），用行上已有的参与者办结前序任务。
+    async fn advance_until_doing(
+        engine: &JeeflowEngineImpl, repo: &std::sync::Arc<crate::memory::MemoryRepository>,
+        iid: i64, name: &str) -> crate::model::ProcessTask {
+        for _ in 0..6 {
+            let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+            if let Some(t) = doing.iter().find(|t| t.task_name == name) {
+                return t.clone();
+            }
+            let t = doing.first().unwrap().clone();
+            let who = t.actor_ids.first().cloned().unwrap_or_else(|| "applicant".to_string());
+            let mut a = FlowData::new();
+            a.insert_i64("submitType", 1);
+            engine.execute_task_async(t.task_id, &who, &a).await.unwrap();
+        }
+        panic!("链上应出现 {}，实得最后一次查询的进行中任务", name);
+    }
+
+    /// issues/121 P2 正向：退回上一步复活血缘前驱那条行——落点、参与者（该行原办结人而非回退人）、
+    /// parent 随行拷贝、控制类残留剔除、实例保持 DOING。夹具 02-multi-task（apply→task1→task2→task3）。
+    #[tokio::test]
+    async fn test_i121_p2_rollback_revives_parent_row() {
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "lineage121c", &load_flow("02-multi-task"));
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+
+        let t1 = advance_until_doing(&engine, &repo, iid, "task1").await;
+        let mut a1 = FlowData::new();
+        a1.insert_i64("submitType", 1);
+        let who1 = t1.actor_ids.first().cloned().unwrap();
+        engine.execute_task_async(t1.task_id, &who1, &a1).await.unwrap();
+        let t2 = advance_until_doing(&engine, &repo, iid, "task2").await;
+
+        let mut rb = FlowData::new();
+        rb.insert_i64("submitType", 3);
+        let who2 = t2.actor_ids.first().cloned().unwrap();
+        engine.execute_and_jump_async(t2.task_id, &who2, &rb, None).await.unwrap();
+
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        let revived = doing.iter().find(|t| t.task_name == "task1")
+            .unwrap_or_else(|| panic!("回退后应在 task1 复出一条待办，实得 {:?}",
+                doing.iter().map(|t| t.task_name.clone()).collect::<Vec<_>>()));
+        assert_ne!(revived.task_id, t1.task_id, "复活应是新行，不是把原行改回进行中");
+        assert_eq!(revived.actor_ids, vec![who1.clone()],
+            "参与者＝task1 的原办结人，不是执行回退的 {}", who2);
+        assert!(!revived.actor_ids.iter().any(|a| a == &who2),
+            "执行回退的人不该被派到自己退出来的待办上");
+        assert_eq!(revived.parent_task_id, t1.parent_task_id,
+            "parent 随行拷贝＝上一步的上一步");
+        assert!(!revived.variables.contains_key("submitType"), "复活行不该带 submitType 残留");
+        assert!(!revived.variables.contains_key("taskName"), "复活行不该带 taskName 残留");
+        for (k, _) in revived.variables.iter() {
+            assert!(!k.starts_with("tf_"), "复活行不该带 tf_* 残留: {}", k);
+            assert!(!k.starts_with("loopCounter"), "复活行不该带会签簿记残留: {}", k);
+        }
+        assert_eq!(revived.variables.get("isFirstTaskNode"), Some(&JsonValue::Bool(false)),
+            "task1 不是首任务节点，标记应随行留档为 false");
+        assert_eq!(revived.task_state, crate::model::TaskState::Doing.code());
+        let after = repo.find_instance_by_id(iid).unwrap().expect("实例");
+        assert_eq!(after.state, crate::model::InstanceState::Doing.code(),
+            "回退后实例必须仍是 DOING");
+        assert_eq!(repo.find_history_tasks(iid).unwrap().iter()
+            .filter(|t| t.task_name == "task1").count(), 2,
+            "原 task1 行应作为历史行保留，加上复活行共两条");
+    }
+
+    /// issues/121 P2 两格负向：
+    /// ① 无血缘（parent 为 0，＝P1 之前落的老行形状）⇒ 20010007，不得静默不建单；
+    /// ② 血缘前驱跨不过 fork/join（boot2 canRejected 遇到 fork/join/start 直接跳过、不深入）
+    ///    ⇒ 20010008。夹具 04-fork-join：分支任务的 parent 是 fork 之前的 apply。
+    #[tokio::test]
+    async fn test_i121_p2_rollback_rejects_no_lineage_and_guard() {
+        // ① 无血缘：02-multi-task 的 apply 行 parent 落 0（发起 execution 无当前任务）
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "lineage121n", &load_flow("02-multi-task"));
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .first().expect("应有 apply 进行中行").clone();
+        assert_eq!(apply.parent_task_id, Some(0), "前置条件：发起那条 parent 应为 0");
+        let mut rb = FlowData::new();
+        rb.insert_i64("submitType", 3);
+        let e = engine.execute_and_jump_async(apply.task_id, "applicant", &rb, None)
+            .await.err().expect("无血缘必须报错，不得静默通过");
+        assert!(e.to_string().contains("20010007"), "错码须体现在 msg，实得 {}", e.to_string());
+
+        // ② 守卫：fork 分支任务的 parent 在 fork 之前 ⇒ boot2 语义下不可回退
+        let (engine2, repo2) = make_surrogate_engine();
+        let did2 = save_define(&repo2, "lineage121f", &load_flow("04-fork-join"));
+        let inst2 = engine2.start_async(did2, "applicant", &FlowData::new()).await.unwrap();
+        let branch = advance_until_doing(&engine2, &repo2, inst2.instance_id, "taskA").await;
+        assert!(branch.parent_task_id.unwrap_or(0) != 0,
+            "前置条件：分支行的 parent 应已由 P1 写入");
+        let who = branch.actor_ids.first().cloned().unwrap_or_else(|| "applicant".to_string());
+        let e2 = engine2.execute_and_jump_async(branch.task_id, &who, &rb, None)
+            .await.err().expect("血缘前驱跨不过 fork 时必须被守卫拦下");
+        assert!(e2.to_string().contains("20010008"), "实得 {}", e2.to_string());
+    }
+
 }
