@@ -5355,6 +5355,22 @@ mod tests {
             actors.contains(&"alice".to_string()) && actors.contains(&"agentJP".to_string()),
             "条款 1「跳转(JUMP)」：跳转新建的 a 任务须并入代理人（原人保留），实得 {:?}", actors
         );
+        // 条款 3「不级联/不追溯」：跳转前那条**已办结**的 a 行（同一个参与者 alice）不得被回写。
+        // 缺这一格时，"把所有 a 行都扩一遍"的错实现照样能过上面那条断言。
+        let hist_a: Vec<i64> = facade
+            .repo()
+            .find_history_tasks(inst)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.task_name == "a" && t.task_id != new_a)
+            .map(|t| t.task_id)
+            .collect();
+        assert_eq!(hist_a.len(), 1, "发起→推进应留下一条历史 a 行，实得 {:?}", hist_a);
+        assert_eq!(
+            persisted_actors_of(&facade, hist_a[0]),
+            vec!["alice".to_string()],
+            "条款 3：委托只对本新建的行生效，历史行的参与者表不得被追溯改写"
+        );
     }
 
     /// 条款 1 · 回退(ROLLBACK，submitType=3) 路径独立用例：委托**在起单之后**才配在
@@ -5423,6 +5439,28 @@ mod tests {
             "条款 1「回退(ROLLBACK)」：回退新建的任务须并入代理人且保留原人，落点节点={}，实得 {:?}",
             rb_task.task_name,
             actors
+        );
+        // 条款 3「不级联/不追溯」：回退前那条**已办结**的 apply 行（同一个参与者 applicant）不得被回写。
+        // 本用例的委托正是配在 applicant 身上的，所以"把该参与者所有行都扩一遍"的错实现
+        // 会被这一格抓住——上面那条断言单独看不出差别。
+        let hist_apply: Vec<i64> = facade
+            .repo()
+            .find_history_tasks(inst)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.task_name == "apply" && t.task_id != rb_task.task_id)
+            .map(|t| t.task_id)
+            .collect();
+        assert_eq!(
+            hist_apply.len(),
+            1,
+            "发起路径应留下一条历史 apply 行，实得 {:?}",
+            hist_apply
+        );
+        assert_eq!(
+            persisted_actors_of(&facade, hist_apply[0]),
+            vec!["applicant".to_string()],
+            "条款 3：委托只对本新建的行生效，历史行的参与者表不得被追溯改写"
         );
     }
 
