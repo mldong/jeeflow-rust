@@ -2374,12 +2374,23 @@ fn stats_filter_finished_tasks(
     }).cloned().collect()
 }
 
+/// 统计口径的"现在"——与引擎时间串**同一出口**（issues/120）。
+///
+/// 此前这两处各取一次 `chrono::Local::now()`，而任务/实例的时间列走
+/// `jeeflow_core::clock::current_time_str()`：宿主注入非本地钟（或没注入、引擎回落 UTC）时，
+/// "最近 30 天"的范围与"今日新增"的当日边界会跟数据基准错开一个时区 —— 表现就是
+/// 统计图/今日新增漏掉凌晨或深夜的单。解析失败才回落 Local，保证不因此 panic。
+fn stats_now() -> chrono::NaiveDateTime {
+    chrono::NaiveDateTime::parse_from_str(&jeeflow_core::clock::current_time_str(), "%Y-%m-%d %H:%M:%S")
+        .unwrap_or_else(|_| chrono::Local::now().naive_local())
+}
+
 fn stats_enumerate_buckets(
     start: Option<chrono::NaiveDateTime>,
     end: Option<chrono::NaiveDateTime>,
     granularity: &str,
 ) -> Vec<String> {
-    let now = chrono::Local::now().naive_local();
+    let now = stats_now();
     let s = start.unwrap_or_else(|| now - chrono::Duration::days(30));
     let e = end.unwrap_or(now);
     let mut buckets = Vec::new();
@@ -2471,7 +2482,7 @@ impl JeeflowFacade {
         let suspended = by_state.get(&50).copied().unwrap_or(0);
 
         // todayNew — server today, ignores start/end
-        let now = chrono::Local::now().naive_local();
+        let now = stats_now();
         let today_start = now.date().and_hms_opt(0, 0, 0).unwrap();
         let today_end = today_start + chrono::Duration::days(1);
         // E：todayNew 恒按服务器当日、不过滤 state / 不受 stateIn 影响（对齐内置线 countTodayNew）
@@ -5038,6 +5049,25 @@ mod tests {
         assert_eq!(resp["completed"], 0);
         // 种子日期 2025-01-x，非当日 → todayNew 恒 0
         assert_eq!(resp["todayNew"], 0);
+    }
+
+    #[test]
+    fn test_i120_stats_window_follows_injected_clock() {
+        // issues/120：统计的"今天"与"最近 30 天"必须跟引擎时间串同一出口。
+        // 种子里落在 2025-01-10 的**实例**只有 1 笔（另有两笔是同日的任务行，不计入今日新增），
+        // 把钟注入成那一刻 ⇒ todayNew = 1、范围末日 = 2025-01-10。
+        // 注回旧写法（各取一次 chrono::Local::now()）时这两条都拿"真实的今天"当锚点 ⇒ 双双变红，
+        // 且不会有任何用例能发现"注入钟改不动统计口径"。
+        let _scope = jeeflow_core::clock::ClockScope::injected(|| "2025-01-10 12:00:00".to_string());
+        let facade = seed_stats_facade();
+        let resp = facade.stats_overview(&HashMap::new()).unwrap();
+        assert_eq!(resp["todayNew"], 1,
+            "注入 2025-01-10 后，当日那一笔种子实例应计入今日新增（实得 {:?}）", resp["todayNew"]);
+
+        let buckets = stats_enumerate_buckets(None, None, "day");
+        assert_eq!(buckets.last().map(|s| s.as_str()), Some("2025-01-10"),
+            "缺省范围末日须随注入钟，实得 {:?}", buckets.last());
+        assert_eq!(buckets.len(), 31, "缺省窗口应是注入日的最近 30 天，实得 {}", buckets.len());
     }
 
     #[test]
