@@ -585,11 +585,27 @@ impl JeeflowEngineImpl {
         let process_name = self.surrogate_process_name(exec);
         // 委托并入后的参与者集合（回写聚合根副本用，循环外统一套用以免借用冲突）
         let mut merged_actors: Vec<(i64, Vec<String>)> = Vec::new();
-        for task in exec.new_tasks.iter_mut() {
+        // issues/121 P1 建单不变量：本方法是本栈新任务落库**唯一收口**（发起/推进/串行会签
+        // 每一步/跳转四条建任务路径全汇入 exec.new_tasks），与 issues/116 的委托并入口同型
+        // ⇒ 挂这一处即全覆盖，只挂"发起"一处会漏掉流转中产生的新单。
+        // parent＝产生这批新任务的那个刚办结任务；发起 execution 没有当前任务 ⇒ 落 0
+        // （对齐 mldong-boot2 `Convert.toLong(execution.getProcessTaskId(), 0L)`）。
+        let lineage_parent = exec.process_task.as_ref().map(|t| t.task_id).unwrap_or(0);
+        let lineage_first: Vec<bool> = exec.new_tasks.iter()
+            .map(|t| exec.process_model.is_first_task_node(&t.task_name)).collect();
+        for (li, task) in exec.new_tasks.iter_mut().enumerate() {
             if task.task_id == 0 {
                 task.task_id = self.next_id();
             }
             task.process_instance_id = instance_id;
+            if task.parent_task_id.is_none() {
+                task.parent_task_id = Some(lineage_parent);
+            }
+            // 行级首任务节点标记：门面出口现算版带"仅进行中"判定，已办结的历史行上恒 false，
+            // 而血缘版回退要读那条历史行决定参与者 ⇒ 必须建单时落库（算法沿用 parser 现成判定）。
+            task.variables.insert(
+                "isFirstTaskNode".to_string(),
+                JsonValue::Bool(lineage_first[li]));
             // issues/116 批次 D：参与者落库前应用生效中的委托（未配置扩展仓储/查询报错
             // 均静默跳过，不打断建单；开关关闭时原样返回）。
             if crate::surrogate::apply_surrogate_to_task(&self.ctx, task, &process_name) {

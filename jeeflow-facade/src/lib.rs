@@ -1078,11 +1078,14 @@ impl JeeflowFacade {
             let mut vo = task_vo(t);
             let mut ext = flow_data_to_object(&t.variables);
             let doing = t.task_state == TaskState::Doing.code();
-            let is_first = doing
+            // issues/121 P1：ext.isFirstTaskNode **行上值优先**（引擎建单时写入，历史行同样有效），
+            // 缺键（存量行）才回退现算。回退那条带"仅进行中"判定 ⇒ 只够展示，不能当引擎判据。
+            let row_first = t.variables.get("isFirstTaskNode").and_then(|v| v.as_bool());
+            let is_first = row_first.unwrap_or_else(|| doing
                 && first_node
                     .as_ref()
                     .map(|n| n == &t.task_name)
-                    .unwrap_or(false);
+                    .unwrap_or(false));
             if let Some(obj) = ext.as_object_mut() {
                 obj.insert("isFirstTaskNode".into(), Json::Bool(is_first));
             }
@@ -1466,9 +1469,11 @@ impl JeeflowFacade {
         }
 
         let doing = task.task_state == TaskState::Doing.code();
+        // 同上：行上值优先、缺键才回退现算（先取键再被出口覆写，否则会丢掉"缺键"这一事实）
+        let t_row_first = task.variables.get("isFirstTaskNode").and_then(|v| v.as_bool());
         let mut t_ext = flow_data_to_object(&task.variables);
         if let Some(obj) = t_ext.as_object_mut() {
-            obj.insert("isFirstTaskNode".into(), Json::Bool(false));
+            obj.insert("isFirstTaskNode".into(), Json::Bool(t_row_first.unwrap_or(false)));
         }
 
         if let Some(inst) = self.repo.find_instance_by_id(task.process_instance_id)? {
@@ -1477,14 +1482,17 @@ impl JeeflowFacade {
                 if let Some(obj) = vo.as_object_mut() {
                     obj.insert("json_object".into(), json_object.clone().unwrap_or(Json::Null));
                 }
-                let is_first = doing
-                    && json_object
-                        .as_ref()
-                        .and_then(first_task_node_id)
-                        .map(|n| n == task.task_name)
-                        .unwrap_or(false);
-                if let Some(obj) = t_ext.as_object_mut() {
-                    obj.insert("isFirstTaskNode".into(), Json::Bool(is_first));
+                if t_row_first.is_none() {
+                    // 存量行没有落库标记 ⇒ 回退现算（仅进行中口径）
+                    let is_first = doing
+                        && json_object
+                            .as_ref()
+                            .and_then(first_task_node_id)
+                            .map(|n| n == task.task_name)
+                            .unwrap_or(false);
+                    if let Some(obj) = t_ext.as_object_mut() {
+                        obj.insert("isFirstTaskNode".into(), Json::Bool(is_first));
+                    }
                 }
                 // taskModel：对齐 Java（name/displayName/type/form/ext）
                 if let Ok(model) = jeeflow_core::parser::ModelParser::parse(&def.content_str()) {
@@ -5943,4 +5951,58 @@ mod tests {
             other => panic!("NOW() 应解析为字符串，实得 {other:?}"),
         }
     }
+    /// issues/121 P1：建单必写 parent_task_id 与行级 isFirstTaskNode，且门面出口"行上值优先"。
+    /// 夹具是 apply→a→b→approve 四节点链（两步流里"上一节点"与"首任务节点"同格＝断言恒真）。
+    #[tokio::test]
+    async fn test_i121_p1_lineage_written_on_create() {
+        let facade = make_facade();
+        let (iid, approve_task) = start_chain_flow(&facade, "lineage121").await;
+        let hist = facade.repo().find_history_tasks(iid).unwrap();
+        let flag_of = |name: &str| -> Option<bool> {
+            hist.iter().find(|t| t.task_name == name)
+                .and_then(|t| t.variables.get("isFirstTaskNode"))
+                .and_then(|v| v.as_bool())
+        };
+        let parent_of = |name: &str| -> Option<i64> {
+            hist.iter().find(|t| t.task_name == name).and_then(|t| t.parent_task_id)
+        };
+        let id_of = |name: &str| -> i64 {
+            hist.iter().find(|t| t.task_name == name).expect(name).task_id
+        };
+
+        // 正向：链式血缘逐条对账（parent＝刚办结的那条）
+        assert_eq!(parent_of("apply"), Some(0), "发起那条 execution 无当前任务 ⇒ parent 落 0");
+        assert_eq!(parent_of("a"), Some(id_of("apply")), "a.parent 应为 apply.id");
+        assert_eq!(parent_of("b"), Some(id_of("a")), "b.parent 应为 a.id");
+        let approve = facade.repo().find_task_by_id(approve_task).unwrap().expect("approve 行");
+        assert_eq!(approve.parent_task_id, Some(id_of("b")), "approve.parent 应为 b.id");
+
+        // 首节点标记随行存活（apply 此刻已办结）
+        assert_eq!(flag_of("apply"), Some(true), "首任务节点行应落 true，且历史行上还在");
+        assert_eq!(flag_of("a"), Some(false), "非首节点必须 false");
+        assert_eq!(flag_of("b"), Some(false));
+        assert_eq!(approve.variables.get("isFirstTaskNode").and_then(|v| v.as_bool()),
+                   Some(false), "进行中行的标记也应随行落库");
+
+        // 门面出口读回：历史行也报 true（行上值优先）
+        let mut detail_args = HashMap::new();
+        detail_args.insert("id".to_string(), json!(iid));
+        let ext_of = |resp: &Json, name: &str| -> Option<bool> {
+            resp["data"]["tasks"].as_array().unwrap().iter()
+                .find(|r| r["taskName"].as_str() == Some(name))
+                .and_then(|r| r["ext"]["isFirstTaskNode"].as_bool())
+        };
+        let resp = facade.flow("processInstance/detail", &detail_args).await;
+        assert_eq!(ext_of(&resp, "apply"), Some(true),
+            "已办结的 apply 行出口应给行上值 true（纯现算版此处恒 false，正是引擎不能靠现算的理由）");
+
+        // 存量行形状：抹掉行上标记 ⇒ 回退现算 ⇒ 历史行只能给 false
+        let mut row = hist.iter().find(|t| t.task_name == "apply").cloned().unwrap();
+        row.variables.remove("isFirstTaskNode");
+        facade.repo().update_task(&row).unwrap();
+        let resp2 = facade.flow("processInstance/detail", &detail_args).await;
+        assert_eq!(ext_of(&resp2, "apply"), Some(false),
+            "缺键的存量历史行回退现算：仅进行中判定 ⇒ false（不报错、不读成未定义）");
+    }
+
 }
