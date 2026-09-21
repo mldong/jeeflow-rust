@@ -454,6 +454,26 @@ fn arg_i64_or(args: &HashMap<String, Json>, key: &str, default: i64) -> JeeflowR
     Ok(arg_i64(args, key)?.unwrap_or(default))
 }
 
+/// 委托 `enabled` 写入侧归一（issues/116 批次 D，判据④的写侧那一半）：
+/// - **未传** → `1`（契约 06 §4.5「enabled 否 int 1 启用/0 停用，默认 1」）；
+/// - 布尔 `true`/`false` → `1`/`0`（前端开关组件偶发传布尔，不落脏值分支）；
+/// - 可解析为整数（`1` / `"1"` / `0` / `"0"` / `2`）→ 原值；
+/// - 传了但不可解析（`null` / `"abc"` / `{}` / `[]`）→ **`0` 停用**。
+///
+/// 修复前两处病：`processSurrogate/save` **根本不读 enabled**（恒落 1，"停用的委托"存进去
+/// 就成启用）；`update` 走 `arg_i64` 把脏值判成 `非法id: abc` 直接报错。默认方向按契约
+/// canonical 取"脏值停用"（Go `parseSurrogateEnabled` / Java `03474fe` 同侧；
+/// C# 回落 1 是相反侧，见 issues/116 §8.4）。读侧判据见
+/// `jeeflow_core::surrogate::surrogate_hit`——写侧若把脏值落成 1，读侧再严也白搭。
+fn parse_surrogate_enabled(args: &HashMap<String, Json>) -> i32 {
+    match args.get("enabled") {
+        None | Some(Json::Null) => 1,
+        Some(Json::Bool(b)) => i32::from(*b),
+        Some(Json::String(s)) => s.trim().parse::<i32>().unwrap_or(0),
+        Some(v) => v.as_i64().map(|n| n as i32).unwrap_or(0),
+    }
+}
+
 /// First present i64 among preferred Java/UI keys.
 fn arg_id(args: &HashMap<String, Json>, keys: &[&str]) -> JeeflowResult<Option<i64>> {
     for k in keys {
@@ -2062,7 +2082,7 @@ impl JeeflowFacade {
             surrogate: arg_str_or(args, "surrogate", ""),
             start_time: arg_str(args, "startTime"),
             end_time: arg_str(args, "endTime"),
-            enabled: 1,
+            enabled: parse_surrogate_enabled(args),
             create_time: None, create_user: arg_str(args, "createUser"),
             update_time: None, update_user: None,
         };
@@ -2079,7 +2099,13 @@ impl JeeflowFacade {
             surrogate: arg_str(args, "surrogate").unwrap_or(sg.surrogate),
             start_time: arg_str(args, "startTime").or(sg.start_time),
             end_time: arg_str(args, "endTime").or(sg.end_time),
-            enabled: arg_i64(args, "enabled")?.map(|v| v as i32).unwrap_or(sg.enabled),
+            // enabled：未传保持原值，传了走写侧归一（脏值 → 0 停用，见 parse_surrogate_enabled）。
+            // 原先用 arg_i64，脏值（"abc"）会被判成「非法id: abc」整条 update 报错。
+            enabled: if args.contains_key("enabled") {
+                parse_surrogate_enabled(args)
+            } else {
+                sg.enabled
+            },
             update_user: arg_str(args, "updateUser"),
             ..sg
         };
@@ -5491,5 +5517,144 @@ mod tests {
         // 且该任务 actor 列恒无值（转办严禁覆写）
         let task = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
         assert!(task.actor_id.is_none(), "撤回后 actor 列应仍为空，实测 {:?}", task.actor_id);
+        // ⚠️ 本用例从 issues/117 起才**真的打在判据上**：本栈 doneList 原为
+        // `task_state = 20`，撤回行（30）根本不进集合，"冒不冒单"无从判定；
+        // 改成 `<> 10` 后这条 30 行进入候选，只剩 `t.operator` 归属判据在挡——
+        // 若谁把 operator 写脏（如转办覆写 actor 列），这里就会当场冒出来。
+        assert_eq!(task.task_state, 30, "前置核对：撤回行状态须为 30（<>10 家族才认它为已办候选）");
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/116 批次 D · 委托自动生效（门面端到端：台账 → 建单并入参与者）
+    // issues/117 · 「我已办」判据（门面路；仓储路见 memory.rs 与 sqlx 同名用例）
+    // ═══════════════════════════════════════════════════════
+
+    /// 走 `processSurrogate/save` 配台账（时间串按契约 `yyyy-MM-dd HH:mm:ss`），
+    /// 再发起流程 → **参与者表真行**里必须同时有授权人与代理人（原人保留、任一可办）。
+    #[tokio::test]
+    async fn test_surrogate_ledger_then_auto_apply_through_facade() {
+        let facade = make_facade();
+        let args = args_of(vec![
+            ("operator", json!("user2")),
+            ("surrogate", json!("agent2")),
+            ("processName", json!("surr-facade-flow")),
+            ("startTime", json!("2000-01-01 00:00:00")),
+            ("endTime", json!("2999-12-31 23:59:59")),
+            ("createUser", json!("admin")),
+        ]);
+        let saved = facade.flow("processSurrogate/save", &args).await;
+        assert_eq!(saved["code"], 0, "配委托应成功: {}", saved);
+
+        let (_iid, approve_task) = start_two_step_flow(&facade, "surr-facade-flow").await;
+        let mut actors = facade.repo().find_task_actors(approve_task).unwrap();
+        actors.sort();
+        assert_eq!(
+            actors,
+            vec!["agent2".to_string(), "user2".to_string()],
+            "台账配好后建单即自动并入代理人（读 wf_process_task_actor 真行，不是返回码）"
+        );
+    }
+
+    /// 写侧 `enabled`：0 停用 → 不并入；缺省 → 1；脏值（"abc"）→ **0 停用**，
+    /// 不得折叠成启用（判据④的写侧那一半，修复前 save 根本不读该参数、恒落 1）。
+    #[tokio::test]
+    async fn test_surrogate_enabled_write_side_dirty_value_lands_zero() {
+        for (given, want, note) in [
+            (Json::Null, 1, "未传 enabled 默认 1"),
+            (json!(0), 0, "显式 0 停用"),
+            (json!("abc"), 0, "脏值不得当启用"),
+            (json!(true), 1, "布尔 true → 1"),
+        ] {
+            let facade = make_facade();
+            let mut pairs = vec![
+                ("operator", json!("user2")),
+                ("surrogate", json!("agent2")),
+                ("processName", json!("surr-enabled-flow")),
+            ];
+            if !given.is_null() {
+                pairs.push(("enabled", given.clone()));
+            }
+            assert_eq!(
+                facade.flow("processSurrogate/save", &args_of(pairs)).await["code"],
+                0,
+                "{} save 应成功", note
+            );
+            // 回读台账 enabled 值
+            let detail_id = {
+                let page = facade.flow("processSurrogate/page", &args_of(vec![])).await;
+                page["data"]["rows"].as_array().unwrap().first()
+                    .and_then(|r| r["id"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| panic!("{} 台账应能查到", note))
+            };
+            let detail = facade
+                .flow("processSurrogate/detail", &args_of(vec![("id", json!(detail_id))]))
+                .await;
+            assert_eq!(
+                detail["data"]["enabled"].as_i64(),
+                Some(want),
+                "{}（回读台账 enabled 应为 {}，实得 {:?}）",
+                note, want, detail["data"]["enabled"]
+            );
+            // 建单是否并入代理人 = enabled 判据的最终结论
+            let (_iid, approve_task) = start_two_step_flow(&facade, "surr-enabled-flow").await;
+            let actors = facade.repo().find_task_actors(approve_task).unwrap();
+            if want == 1 {
+                assert!(actors.contains(&"agent2".to_string()), "{} 生效时应并入代理人: {:?}", note, actors);
+            } else {
+                assert!(!actors.contains(&"agent2".to_string()), "{} 不该并入代理人: {:?}", note, actors);
+            }
+        }
+    }
+
+    /// `processTask/doneList` 取回已办行的 id 集（op=None 即不传 operator）。
+    async fn done_list_ids(facade: &JeeflowFacade, op: Option<&str>) -> Vec<String> {
+        let mut d = HashMap::new();
+        if let Some(o) = op {
+            d.insert("operator".to_string(), json!(o));
+        }
+        let resp = facade.flow("processTask/doneList", &d).await;
+        assert_eq!(resp["code"], 0, "doneList 应成功: {}", resp);
+        let rows = resp["data"]["rows"].as_array().unwrap();
+        assert_eq!(
+            resp["data"]["recordCount"].as_i64(),
+            Some(rows.len() as i64),
+            "recordCount 与行数须自洽"
+        );
+        rows.iter().filter_map(|r| r["id"].as_str().map(str::to_string)).collect()
+    }
+
+    /// issues/117 门面路：空 operator 不泄漏全库 + 发起人不得因 create_user 沾到
+    /// "我发起但非我办理"的行 + 我真正办结的行必须在（正向对照，防"恒空假绿"）。
+    #[tokio::test]
+    async fn test_i117_done_list_ownership_and_empty_operator() {
+        let facade = make_facade();
+        let (iid, approve_task) = start_two_step_flow(&facade, "i117-done-flow").await;
+        // 撤回整单：approve 行 Doing→Withdraw(30)，它的 create_user 是发起人 applicant、
+        // operator 空（没被人办过）。旧 `=20` 判据下这行不进集合 → create_user 偏宽被掩盖；
+        // 现 `<>10` 承认经手态，正是它暴露的时刻。
+        let w = args_of(vec![("id", json!(iid.to_string())), ("operator", json!("applicant"))]);
+        assert_eq!(facade.flow("processInstance/withdraw", &w).await["code"], 0);
+        let withdrawn = facade.repo().find_task_by_id(approve_task).unwrap().unwrap();
+        assert_eq!(withdrawn.task_state, 30, "前置核对：撤回行应为 30");
+        assert_eq!(withdrawn.create_user.as_deref(), Some("applicant"),
+            "前置核对：该行创建人是发起人（诱饵成立）");
+
+        // ① operator 为空 → 空页（不得返回全库已办）
+        assert!(done_list_ids(&facade, None).await.is_empty(),
+            "operator 缺省必须空页，不得泄漏全库");
+        assert!(done_list_ids(&facade, Some("   ")).await.is_empty(),
+            "operator 全空白同空值");
+
+        // ② 发起人不得因 create_user 沾上他从没办过的 approve 行
+        let applicant_rows = done_list_ids(&facade, Some("applicant")).await;
+        assert!(!applicant_rows.contains(&approve_task.to_string()),
+            "「我发起但非我办理」不得进我的已办（契约 §2.5 点名禁止 create_user 偏宽）：{:?}",
+            applicant_rows);
+
+        // ③ 正向对照：applicant 真正办结的 apply 行必须在他的已办里（防恒空假绿）
+        let apply_task = facade.repo().find_history_tasks(iid).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").expect("应有 apply 行");
+        assert!(applicant_rows.contains(&apply_task.task_id.to_string()),
+            "已办结的 apply 行应在 applicant 已办里：{:?}", applicant_rows);
     }
 }

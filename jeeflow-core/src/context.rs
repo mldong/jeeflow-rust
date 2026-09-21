@@ -32,6 +32,14 @@ pub struct ServiceContext {
     pub interceptors: Vec<Arc<dyn FlowInterceptor>>,
     /// Event listeners.
     pub event_listeners: Vec<Arc<dyn ProcessEventListener>>,
+    /// 委托代理自动生效开关（issues/116 批次 D，**默认开启**）。
+    ///
+    /// 开启时引擎在新任务落库前把生效中的被委托人并入参与者集合
+    /// （见 [`crate::surrogate::apply_surrogate_to_task`]，契约 06 §4.5 运行期语义）。
+    /// 关闭一行：`ServiceContext::new().with_surrogate_auto_apply(false)`
+    /// ——关闭后 `processSurrogate/*` 回到"仅台账"语义（配了委托也不会追加到任务参与者）。
+    /// 依赖 `ext_repository`：未配置扩展仓储时本来就静默跳过（条款 4）。
+    pub surrogate_auto_apply: bool,
 }
 
 impl ServiceContext {
@@ -53,6 +61,9 @@ impl ServiceContext {
             decision_handlers: HashMap::new(),
             interceptors: Vec::new(),
             event_listeners: Vec::new(),
+            // 委托自动生效默认开启（issues/116 批次 D）——集成方零配置即生效，
+            // 对齐内置版 mldong-wf `SurrogateInterceptor` 标 @Component 的"白拿"体验。
+            surrogate_auto_apply: true,
         }
     }
 
@@ -63,6 +74,16 @@ impl ServiceContext {
 
     pub fn with_ext_repository(mut self, repo: Arc<dyn ProcessExtRepository>) -> Self {
         self.ext_repository = Some(repo);
+        self
+    }
+
+    /// 开/关**委托代理自动生效**（issues/116 批次 D；契约 06 §4.5 条款 3）。
+    ///
+    /// 引擎内置该行为且**默认开启**，集成方零配置即生效；本方法是显式关闭的入口
+    /// （`with_surrogate_auto_apply(false)`），关闭后回到"仅台账"行为。
+    /// 等价关闭姿势：装配一个 `get_surrogate` 恒返回 `None` 的扩展仓储。
+    pub fn with_surrogate_auto_apply(mut self, on: bool) -> Self {
+        self.surrogate_auto_apply = on;
         self
     }
 

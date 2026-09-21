@@ -72,6 +72,54 @@ impl SqlxRepository {
         &self.pool
     }
 
+    /// 委托查询单腿 SQL（四判据，契约 06 §4.5 条款 5；与内存仓
+    /// `jeeflow-core/src/memory.rs::get_surrogate` 共用同一套判据语义，条款 6）：
+    ///
+    /// - 判据①：`process_name` 为空即"全部流程"兜底腿 → `IS NULL OR = ''`
+    ///   （修复前本栈只有 `process_name = ?` 精确查，NULL 行永远查不到）；
+    /// - 判据②：`start_time <= now <= end_time`，列值 NULL = 该侧不限；
+    ///   `time` 传空串 = 不判窗（与内存仓 `normalize_time_text(None)` 同语义）；
+    /// - 判据③：`surrogate <> operator` 自委托过滤（修复前缺失，会命中"自己委托给自己"）；
+    /// - 判据④：`enabled = 1`（只有 1 生效）；
+    /// - 条款 1.4：多条同时命中取 **id 最大**（`ORDER BY id DESC LIMIT 1`）。
+    async fn query_surrogate(
+        &self,
+        operator: &str,
+        process_name: &str,
+        time: &str,
+    ) -> JeeflowResult<Option<ProcessSurrogate>> {
+        let with_name = !process_name.is_empty();
+        let with_time = !time.trim().is_empty();
+        let mut sql = String::from(
+            "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
+                    create_time, create_user, update_time, update_user \
+             FROM wf_process_surrogate \
+             WHERE operator = ? AND enabled = 1 AND surrogate <> operator",
+        );
+        if with_name {
+            sql.push_str(" AND process_name = ?");
+        } else {
+            sql.push_str(" AND (process_name IS NULL OR process_name = '')");
+        }
+        if with_time {
+            sql.push_str(" AND (start_time IS NULL OR start_time <= ?) AND (end_time IS NULL OR end_time >= ?)");
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT 1");
+
+        let mut q = sqlx::query(&sql).bind(operator);
+        if with_name {
+            q = q.bind(process_name);
+        }
+        if with_time {
+            q = q.bind(time).bind(time);
+        }
+        let row = q
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+        Ok(row.map(|r| map_surrogate(&r)))
+    }
+
     /// Block on an async future using the current tokio runtime handle.
     ///
     /// 必须用 `block_in_place` 包裹：本结构体的同步 SPI 方法会被引擎 facade 从
@@ -337,12 +385,18 @@ fn map_design(r: &sqlx::mysql::MySqlRow) -> ProcessDesign {
 fn map_surrogate(r: &sqlx::mysql::MySqlRow) -> ProcessSurrogate {
     ProcessSurrogate {
         id: r.get("id"),
-        process_name: r.get("process_name"),
+        // `process_name` 列可空（规范注释"为空=全部流程"），而全流程兜底腿**必然**会读到
+        // NULL 行（契约 06 §4.5 条款 5 判据① `process_name IS NULL OR = ''`）：
+        // 原先的 `r.get::<String,_>` 遇 NULL 直接 panic（sqlx `get` 不容 NULL）。
+        // 统一归一为空串，与内存仓 `ProcessSurrogate.process_name: String` 同形状（条款 6）。
+        process_name: get_opt_string(r, "process_name").unwrap_or_default(),
         operator: r.get("operator"),
         surrogate: r.get("surrogate"),
         start_time: get_opt_datetime(r, "start_time"),
         end_time: get_opt_datetime(r, "end_time"),
-        enabled: r.try_get::<Option<i32>, _>("enabled").ok().flatten().unwrap_or(1),
+        // 判据④（条款 5）：`enabled` **只有 1 生效**，NULL/脏值不得折叠成 1（原 `unwrap_or(1)`
+        // = "读不出来就当启用"，与内存仓 `enabled != 1 → 不命中` 相反，同栈双仓分叉）。
+        enabled: r.try_get::<Option<i32>, _>("enabled").ok().flatten().unwrap_or(0),
         create_time: get_opt_datetime(r, "create_time"),
         create_user: get_opt_string(r, "create_user"),
         update_time: get_opt_datetime(r, "update_time"),
@@ -819,8 +873,23 @@ impl ProcessRepository for SqlxRepository {
     fn page_done_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
-            let op = query.operator.clone();
-            // m_ 过滤下推（issues/106）：白名单条件拼进 COUNT 与 SELECT，bind 顺序 operator×3 → filters → limit
+            // 「我已办」三处判据（issues/117，owner 2026-09-21 拍板；内存仓
+            // `jeeflow-core/src/memory.rs::page_done_tasks` 同判据，不得"换仓储就换答案"）：
+            // ① 状态集合 `t.task_state <> 10`（六栈家族口径）＝"我经手过且不再是我待办"，
+            //    含撤回 30 / 终止 40 / 废弃 99。原 `= 20` 会让撤回单从待办与已办两头同时
+            //    消失（issues/113 刚把撤回态统一成 30），并掩盖 issues/114 §6.2 那条
+            //    "转办覆写 actor_id → 撤回后冒单"在本栈的复现面。
+            // ② 归属只按 `t.operator = ?`：原实现多一条 `OR t.create_user = ?`，是契约 §2.5
+            //    **点名禁止**的偏宽写法（"我发起但非我办理"被算进我的已办）。
+            // ③ 删掉原 `? IS NULL OR …` 空值旁路：operator 为空 → **返回空页**（原来会把
+            //    全库已办摊给调用方）。本轮只堵泄漏，不改硬必填（另轮收紧）。
+            let op = query.operator.as_deref().map(str::trim).unwrap_or("");
+            if op.is_empty() {
+                // 与内存仓同一姿势：空值直接空页，不下推 SQL（SQL 里 `= ''` 会漏匹配 NULL、
+                // 却可能命中脏空串行，两边答案就分叉了）。
+                return Ok(PageResult::new(page_num, page_size, 0, Vec::new()));
+            }
+            // m_ 过滤下推（issues/106）：白名单条件拼进 COUNT 与 SELECT，bind 顺序 operator → filters → limit
             let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_task_col);
             let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
             let count_sql = format!(
@@ -828,9 +897,9 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_task t \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.task_state = 20 AND (? IS NULL OR t.operator = ? OR t.create_user = ?){where_extra}"
+                 WHERE t.task_state <> 10 AND t.operator = ?{where_extra}"
             );
-            let mut count_q = sqlx::query(&count_sql).bind(op.clone()).bind(op.clone()).bind(op.clone());
+            let mut count_q = sqlx::query(&count_sql).bind(op);
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
                 .fetch_one(&self.pool)
@@ -850,10 +919,10 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_task t \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.task_state = 20 AND (? IS NULL OR t.operator = ? OR t.create_user = ?){where_extra} \
+                 WHERE t.task_state <> 10 AND t.operator = ?{where_extra} \
                  ORDER BY t.id DESC LIMIT ? OFFSET ?"
             );
-            let mut rows_q = sqlx::query(&select_sql).bind(op.clone()).bind(op.clone()).bind(op);
+            let mut rows_q = sqlx::query(&select_sql).bind(op);
             for v in &fvals { rows_q = rows_q.bind(v); }
             let rows = rows_q
                 .bind(page_size)
@@ -1324,40 +1393,17 @@ impl ProcessExtRepository for SqlxRepository {
         })
     }
 
+    /// 委托查询（两步查，契约 06 §4.5 条款 5 判据①）：先按当前流程名精确查，
+    /// 未命中再查"全流程委托"（`process_name IS NULL OR process_name = ''`）兜底。
+    /// 单腿 SQL 见 [`Self::query_surrogate`]（四判据 + `ORDER BY id DESC LIMIT 1`）。
     fn get_surrogate(&self, operator: &str, process_name: &str, time: &str) -> JeeflowResult<Option<ProcessSurrogate>> {
         self.block_on(async {
-            let row = if time.is_empty() {
-                sqlx::query(
-                    "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
-                            create_time, create_user, update_time, update_user \
-                     FROM wf_process_surrogate \
-                     WHERE operator = ? AND process_name = ? AND enabled = 1 \
-                     ORDER BY id DESC LIMIT 1"
-                )
-                .bind(operator)
-                .bind(process_name)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            } else {
-                sqlx::query(
-                    "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
-                            create_time, create_user, update_time, update_user \
-                     FROM wf_process_surrogate \
-                     WHERE operator = ? AND process_name = ? AND enabled = 1 \
-                       AND (start_time IS NULL OR start_time <= ?) \
-                       AND (end_time IS NULL OR end_time >= ?) \
-                     ORDER BY id DESC LIMIT 1"
-                )
-                .bind(operator)
-                .bind(process_name)
-                .bind(time)
-                .bind(time)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?
-            };
-            Ok(row.map(|r| map_surrogate(&r)))
+            if !process_name.is_empty() {
+                if let Some(hit) = self.query_surrogate(operator, process_name, time).await? {
+                    return Ok(Some(hit));
+                }
+            }
+            self.query_surrogate(operator, "", time).await
         })
     }
 }
@@ -2106,10 +2152,13 @@ mod tests {
         setup_schema(&pool).await;
 
         let (define_id, instance_id, task_id) = (900950i64, 900951i64, 900952i64);
-        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 900950 AND 900999").execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900950 AND 900999").execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900950 AND 900999").execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900950 AND 900999").execute(&pool).await.unwrap();
+        // ⚠️ 预清理段必须**只覆盖本用例自己的 10 个 id**：原写作 `BETWEEN 900950 AND 900999`
+        // 与 transfer_trace 用例（900960~900962）重叠，两条用例并行时互相删走对方的行
+        // （表现为 find_task_by_id 突然查空，与本仓改动无关的时序假红）。
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 900950 AND 900959").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900950 AND 900959").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900950 AND 900959").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900950 AND 900959").execute(&pool).await.unwrap();
 
         let pool2 = pool.clone();
         run_sync(move || {
@@ -2186,10 +2235,11 @@ mod tests {
         setup_schema(&pool).await;
 
         let (define_id, instance_id, task_id) = (900960i64, 900961i64, 900962i64);
-        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 900960 AND 900999").execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900960 AND 900999").execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900960 AND 900999").execute(&pool).await.unwrap();
-        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900960 AND 900999").execute(&pool).await.unwrap();
+        // ⚠️ 同上：本用例独占 900960~900969，不与 withdraw_cascade（900950~900959）互删。
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 900960 AND 900969").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900960 AND 900969").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900960 AND 900969").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900960 AND 900969").execute(&pool).await.unwrap();
 
         let pool2 = pool.clone();
         run_sync(move || {
@@ -2273,5 +2323,365 @@ mod tests {
         sqlx::query("DELETE FROM wf_process_task WHERE id = ?").bind(task_id).execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/116 批次 D（委托自动生效 + 四判据双仓对拍）
+    // issues/117（「我已办」三判据）· 160 真机 MySQL，库 jeeflow
+    //   ID 段：定义/实例/任务 9011xx，委托台账 911101~911199
+    //   ⚠️ 必须避开本模块既有用例的**批量 DELETE 段**（900950~900999 被 withdraw/transfer
+    //   两条用例按区间预清理，撞上去就是并发时序性假红：任务行被隔壁删走 → 已办查空）；
+    //   910xxx 留给 Go 栈的委托用例，911xxx 是本栈自有段。
+    // ═══════════════════════════════════════════════════════
+
+    /// 引擎用 multi_thread 运行时（`SqlxRepository` 的同步 SPI 内部是
+    /// `block_in_place` + `Handle::block_on`，在 current_thread 运行时上会直接 panic，
+    /// 故本组用 `Runtime::new()`（multi-thread）自建，不再套 `run_sync`）。
+    fn mysql_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().expect("tokio runtime")
+    }
+
+    /// 直插一条委托台账行——**为的是能造出 NULL 列**（门面写入只会给空串），
+    /// 而判据①明确要求 `process_name IS NULL OR process_name = ''` 同答案。
+    async fn seed_surrogate(
+        pool: &MySqlPool,
+        id: i64,
+        process_name: Option<&str>,
+        operator: &str,
+        surrogate: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        enabled: Option<i32>,
+    ) {
+        sqlx::query(
+            "INSERT INTO wf_process_surrogate (id, process_name, operator, surrogate, \
+                    start_time, end_time, enabled, create_time, create_user) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(id).bind(process_name).bind(operator).bind(surrogate)
+        .bind(start).bind(end).bind(enabled)
+        .bind("2026-09-21 00:00:00").bind("rust_test")
+        .execute(pool).await.unwrap();
+    }
+
+    /// 按定义 id 级联清掉本组用例造的实例/任务/参与者（引擎生成的 id 是雪花，不可预知）。
+    async fn clean_by_define(pool: &MySqlPool, define_id: i64) {
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id IN \
+                     (SELECT id FROM wf_process_task WHERE process_instance_id IN \
+                      (SELECT id FROM wf_process_instance WHERE process_define_id = ?))")
+            .bind(define_id).execute(pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_task WHERE process_instance_id IN \
+                     (SELECT id FROM wf_process_instance WHERE process_define_id = ?)")
+            .bind(define_id).execute(pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE process_define_id = ?")
+            .bind(define_id).execute(pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = ?")
+            .bind(define_id).execute(pool).await.unwrap();
+    }
+
+    /// 读某任务在 `wf_process_task_actor` 里的参与者（排序后对账）。
+    async fn actor_rows(pool: &MySqlPool, task_id: i64) -> Vec<String> {
+        let rows = sqlx::query("SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ?")
+            .bind(task_id).fetch_all(pool).await.unwrap();
+        let mut v: Vec<String> = rows.iter().map(|r| r.get::<String, _>("actor_id")).collect();
+        v.sort();
+        v
+    }
+
+    /// **双仓对拍**（契约 06 §4.5 条款 6）：真机 SQL 仓跑与内存仓
+    /// （`jeeflow-core/src/memory.rs::test_get_surrogate_parity_matrix_i116`）**同一张**
+    /// 判据矩阵 `jeeflow_core::surrogate::parity`（14 行 × 15 组期望）。
+    /// 修复前本栈 SQL 侧缺"空 processName 全流程兜底"与"自委托过滤"两条判据。
+    #[test]
+    fn test_mysql_i116_surrogate_query_parity() {
+        if skip_mysql() { return; }
+        use jeeflow_core::surrogate::parity;
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911101 AND 911199")
+                .execute(&pool).await.unwrap();
+            for row in parity::ROWS {
+                seed_surrogate(&pool, row.id, row.process_name, row.operator, row.surrogate,
+                    row.start_time, row.end_time, row.enabled).await;
+            }
+
+            let repo = SqlxRepository::new(pool.clone());
+            for exp in parity::EXPECT {
+                let got = repo
+                    .get_surrogate(exp.operator, exp.process_name, exp.time)
+                    .unwrap()
+                    .map(|h| h.id);
+                assert_eq!(
+                    got, exp.hit_id,
+                    "SQL 仓判据矩阵[{}] operator={} process_name={:?} time={:?} → 期望 {:?} 实得 {:?}",
+                    exp.note, exp.operator, exp.process_name, exp.time, exp.hit_id, got
+                );
+            }
+
+            // 直读库列自证兜底腿真的读到了 NULL 行（不是"恰好空串相等"）
+            let pn: Option<String> = sqlx::query("SELECT process_name FROM wf_process_surrogate WHERE id = 911104")
+                .fetch_one(&pool).await.unwrap().get("process_name");
+            assert!(pn.is_none(), "911104 的 process_name 必须真的是库内 NULL（实得 {:?}）", pn);
+
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911101 AND 911199")
+                .execute(&pool).await.unwrap();
+        });
+    }
+
+    /// 条款 2 ⚠️ 真机铁证：引擎建单后**代理人必须出现在 `wf_process_task_actor` 真行里**
+    /// （Java 首版把补写挂在 taskId 分配前 → 打在空 id 上静默无效，只看返回码发现不了）。
+    /// 同时钉住条款 1.1（取流程模型 name 而非 define.name）与判据① 的库里 NULL 兜底腿。
+    #[test]
+    fn test_mysql_i116_surrogate_agent_lands_in_task_actor() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            let define_id = 901101i64;
+            clean_by_define(&pool, define_id).await;
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911201 AND 911219")
+                .execute(&pool).await.unwrap();
+
+            // 流程 JSON 的 name = "rust_i116_model"；定义行故意叫 "rust_i116_decoy_define"
+            let mut define = ProcessDefine {
+                id: define_id, name: "rust_i116_decoy_define".into(),
+                display_name: "i116 委托".into(), define_type: "approval".into(), state: 1,
+                content: r#"{"name":"rust_i116_model","displayName":"i116","type":"approval",
+                    "nodes":[{"id":"start","type":"snaker:start","text":{"value":"s"}},
+                             {"id":"apply","type":"snaker:task","text":{"value":"申请"},"properties":{"assignee":"applicant"}},
+                             {"id":"task1","type":"snaker:task","text":{"value":"上级审批"},"properties":{"assignee":"leader"}},
+                             {"id":"end","type":"snaker:end","text":{"value":"e"}}],
+                    "edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                             {"id":"e2","sourceNodeId":"apply","targetNodeId":"task1"},
+                             {"id":"e3","sourceNodeId":"task1","targetNodeId":"end"}]}"#
+                    .as_bytes().to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            repo.save_define(&mut define).unwrap();
+            assert_eq!(define.id, define_id);
+
+            // ① 精确腿（模型名）② 全流程兜底腿（库里 process_name = NULL）
+            // ③ define.name 侧诱饵（不得命中）④ 停用（不得命中）
+            seed_surrogate(&pool, 911201, Some("rust_i116_model"), "leader", "agentOnModelName",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+            seed_surrogate(&pool, 911202, None, "applicant", "agentAllFlow",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+            seed_surrogate(&pool, 911203, Some("rust_i116_decoy_define"), "leader", "agentOnDefineName",
+                None, None, Some(1)).await;
+            seed_surrogate(&pool, 911204, Some("rust_i116_model"), "leader", "agentDisabled",
+                None, None, Some(0)).await;
+
+            let mk_engine = |auto_on: bool| {
+                let ctx = jeeflow_core::context::ServiceContext::new()
+                    .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+                    .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+                    .with_id_generator(Arc::new(jeeflow_core::id_gen::DefaultIdGenerator::new(1)))
+                    .with_surrogate_auto_apply(auto_on);
+                jeeflow_core::engine::JeeflowEngineImpl::new(ctx)
+            };
+
+            // ── 默认开启：发起 + 推进两条路径都要落进参与者表 ──
+            let engine = mk_engine(true);
+            let inst = engine
+                .start_async(define_id, "applicant", &jeeflow_core::json::FlowData::new())
+                .await
+                .expect("建单不得因委托能力被打断");
+            let apply_task = repo.find_doing_tasks(inst.instance_id, &[])
+                .unwrap().into_iter().find(|t| t.task_name == "apply").expect("应有 apply 任务");
+            assert_eq!(
+                actor_rows(&pool, apply_task.task_id).await,
+                vec!["agentAllFlow".to_string(), "applicant".to_string()],
+                "① 发起路径：库里 process_name 为 NULL 的全流程委托必须命中并落进 wf_process_task_actor"
+            );
+            engine.execute_task_async(apply_task.task_id, "applicant", &jeeflow_core::json::FlowData::new())
+                .await.unwrap();
+            let task1 = repo.find_doing_tasks(inst.instance_id, &[])
+                .unwrap().into_iter().find(|t| t.task_name == "task1").expect("推进应建 task1");
+            let actors = actor_rows(&pool, task1.task_id).await;
+            assert_eq!(
+                actors,
+                vec!["agentOnModelName".to_string(), "leader".to_string()],
+                "② 推进路径新单同样落库，且取的是**流程模型 name**（命中 define.name 侧即取错列）"
+            );
+            // 真机列自证：进行中任务的 operator 列仍为 NULL（并入只落在参与者表）
+            let op: Option<String> = sqlx::query("SELECT operator FROM wf_process_task WHERE id = ?")
+                .bind(task1.task_id).fetch_one(&pool).await.unwrap().get("operator");
+            assert!(op.is_none(), "进行中任务 operator 列应恒无值，实得 {:?}", op);
+
+            // ── 显式关闭：回到"仅台账"，参与者表只有原人 ──
+            let engine_off = mk_engine(false);
+            let inst2 = engine_off
+                .start_async(define_id, "applicant", &jeeflow_core::json::FlowData::new())
+                .await.unwrap();
+            let apply2 = repo.find_doing_tasks(inst2.instance_id, &[])
+                .unwrap().into_iter().find(|t| t.task_name == "apply").unwrap();
+            assert_eq!(
+                actor_rows(&pool, apply2.task_id).await,
+                vec!["applicant".to_string()],
+                "③ with_surrogate_auto_apply(false) 后不得并入代理人（关闭位真的接进了建单路径）"
+            );
+
+            // Cleanup
+            clean_by_define(&pool, define_id).await;
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911201 AND 911219")
+                .execute(&pool).await.unwrap();
+        });
+    }
+
+    /// issues/117 三判据的 **sqlx 路**（内存路见 `memory.rs::test_page_done_tasks_predicates_i117`）：
+    /// 20/30/40/99 全进、`create_user=我` 但 `operator≠我` 的行不进、operator 传空 → 空页。
+    #[test]
+    fn test_mysql_i117_done_list_predicates() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            let (define_id, instance_id) = (901121i64, 901122i64);
+            clean_by_define(&pool, define_id).await;
+
+            let repo = SqlxRepository::new(pool.clone());
+            let mut define = ProcessDefine {
+                id: define_id, name: "rust_i117".into(), display_name: "i117".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let mut inst = ProcessInstance {
+                instance_id, parent_id: None, define_id, state: 20, parent_node_name: None,
+                business_no: None, operator: "me".into(), expire_time: None,
+                variables: jeeflow_core::json::FlowData::new(), tasks: vec![],
+                create_time: None, create_user: Some("me".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut inst).unwrap();
+
+            let put = |id: i64, state: i32, operator: Option<&str>, create_user: &str| {
+                let mut task = ProcessTask {
+                    task_id: id, process_instance_id: instance_id,
+                    task_name: format!("n{}", id), display_name: "N".into(),
+                    task_type: 0, perform_type: 0, task_state: state,
+                    actor_id: operator.map(str::to_string),
+                    actor_ids: operator.map(str::to_string).into_iter().collect(),
+                    finish_time: None, expire_time: None, form_key: None, parent_task_id: None,
+                    variables: jeeflow_core::json::FlowData::new(), create_time: None,
+                    create_user: Some(create_user.to_string()), update_time: None, update_user: None,
+                };
+                repo.save_task(&mut task).unwrap();
+                task.task_id
+            };
+            // 我经手过的四种非待办态 + 进行中（不该进）+ 他人办结（诱饵：create_user=me）
+            // + 脏空串办理人（诱饵：钉住"空值查询须短路成空页"——少了那道短路，SQL 的
+            //   `t.operator = ''` 会把这行摊给一个 operator 传空白的调用方，内存仓则不会）
+            for (id, state, op, cu) in [
+                (901123i64, TaskState::Finished.code(), Some("me"), "me"),
+                (901124, TaskState::Withdraw.code(), Some("me"), "me"),
+                (901125, TaskState::Interrupt.code(), Some("me"), "other"),
+                (901126, TaskState::Abandon.code(), Some("me"), "me"),
+                (901127, TaskState::Doing.code(), Some("me"), "me"),
+                (901128, TaskState::Finished.code(), Some("other"), "me"),
+                (901129, TaskState::Finished.code(), Some(""), "me"),
+            ] {
+                put(id, state, op, cu);
+            }
+
+            let ids_for = |op: Option<&str>| {
+                let mut q = PageQuery::new(1, 50);
+                q.operator = op.map(str::to_string);
+                let page = repo.page_done_tasks(&q).unwrap();
+                assert_eq!(page.record_count as usize, page.rows.len(), "recordCount 与行数须自洽");
+                let mut ids: Vec<i64> = page.rows.iter().filter(|r| r.process_instance_id == instance_id)
+                    .map(|r| r.id).collect();
+                ids.sort();
+                ids
+            };
+            assert_eq!(
+                ids_for(Some("me")),
+                vec![901123i64, 901124, 901125, 901126],
+                "SQL 仓须与内存仓同判据：20/30/40/99 全进，进行中与被他人办理的行不进"
+            );
+            assert_eq!(ids_for(Some("other")), vec![901128], "办理人口径不受影响");
+            assert!(ids_for(None).is_empty(), "operator 缺省不得返回全库已办");
+            assert!(ids_for(Some("   ")).is_empty(), "operator 全空白同空值：空页");
+
+            clean_by_define(&pool, define_id).await;
+        });
+    }
+
+    /// issues/114 §6.2 同尺子回归（sqlx 路）：转办**严禁覆写 operator 列** + 撤回后
+    /// 该单不得凭空出现在被摘走人的已办里。本栈 doneList 原为 `=20`，撤回行（30）根本不进
+    /// 集合，这条冒单路径显不出来；issues/117 改 `<> 10` 后与另六栈同判据，用例才真的打在它上。
+    #[test]
+    fn test_mysql_i114_transfer_then_withdraw_not_in_fromactor_done_list() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            let (define_id, instance_id, task_id, done_task_id) = (901141i64, 901142i64, 901143i64, 901144i64);
+            clean_by_define(&pool, define_id).await;
+
+            let repo = SqlxRepository::new(pool.clone());
+            let mut define = ProcessDefine {
+                id: define_id, name: "rust_i114tr".into(), display_name: "i114tr".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let mut inst = ProcessInstance {
+                instance_id, parent_id: None, define_id, state: 10, parent_node_name: None,
+                business_no: None, operator: "applicant".into(), expire_time: None,
+                variables: jeeflow_core::json::FlowData::new(), tasks: vec![],
+                create_time: None, create_user: Some("applicant".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut inst).unwrap();
+            let mk = |id: i64, name: &str, state: i32, operator: Option<&str>| {
+                let mut t = ProcessTask {
+                    task_id: id, process_instance_id: instance_id, task_name: name.into(),
+                    display_name: name.into(), task_type: 0, perform_type: 0, task_state: state,
+                    actor_id: operator.map(str::to_string),
+                    actor_ids: operator.map(str::to_string).into_iter().collect(),
+                    finish_time: None, expire_time: None, form_key: None, parent_task_id: None,
+                    variables: jeeflow_core::json::FlowData::new(), create_time: None,
+                    create_user: Some("applicant".into()), update_time: None, update_user: None,
+                };
+                repo.save_task(&mut t).unwrap();
+                t
+            };
+            let mut doing = mk(task_id, "approve", TaskState::Doing.code(), None);
+            repo.add_task_actor(task_id, &["user2".into()]).unwrap();
+            // 正向对照行：user2 真办结过的一行（20 + operator=user2）必须在已办里
+            mk(done_task_id, "handled", TaskState::Finished.code(), Some("user2"));
+
+            // 转办 user2 → lisi：只动参与者表，绝不写 operator 列
+            repo.remove_task_actor(task_id, &["user2".into()]).unwrap();
+            repo.add_task_actor(task_id, &["lisi".into()]).unwrap();
+            doing.update_user = Some("user2".into());
+            repo.update_task(&doing).unwrap();
+            // 撤回：Doing→Withdraw(30)，operator 仍空
+            let mut t = repo.find_task_by_id(task_id).unwrap().unwrap();
+            t.task_state = TaskState::Withdraw.code();
+            t.update_user = Some("applicant".into());
+            repo.update_task(&t).unwrap();
+
+            let op: Option<String> = sqlx::query("SELECT operator FROM wf_process_task WHERE id = ?")
+                .bind(task_id).fetch_one(&pool).await.unwrap().get("operator");
+            assert!(op.is_none(), "转办/撤回后 operator 列必须仍为 NULL（冒单的唯一入口），实得 {:?}", op);
+
+            let mut q = PageQuery::new(1, 50);
+            q.operator = Some("user2".to_string());
+            let page = repo.page_done_tasks(&q).unwrap();
+            let ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
+            assert!(!ids.contains(&task_id),
+                "user2 被转办摘走、从没办过的单不得冒进其已办：{:?}", ids);
+            assert!(ids.contains(&done_task_id),
+                "正向对照：user2 真办结的 {} 应在其已办里（防恒空假绿），实得 {:?}", done_task_id, ids);
+
+            clean_by_define(&pool, define_id).await;
+        });
     }
 }

@@ -16,6 +16,7 @@ pub mod parser;
 pub mod engine;
 pub mod handler;
 pub mod interceptor;
+pub mod surrogate;
 pub mod memory;
 pub mod filter_sql;
 #[cfg(any(test, feature = "dev-flows"))]

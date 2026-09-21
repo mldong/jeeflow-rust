@@ -546,7 +546,33 @@ impl JeeflowEngineImpl {
         }
     }
 
+    /// 委托查询用的流程名（契约 06 §4.5 条款 1.1）：**以流程模型的 `name` 为准**
+    /// （`ProcessModel.name`，即流程 JSON 的 name），模型未带时回落 `wf_process_define.name`。
+    ///
+    /// 依据是**迁移基线**：内置版 mldong-wf 的 `SurrogateInterceptor` 用的正是
+    /// `execution.getProcessModel().getName()`，Java 参考实现与之同构；用户在内置版配的
+    /// 委托，迁到本栈后必须命中同一条。正常 deploy 会 `def.setName(model.getName())`
+    /// 使两者恒等，但**测试里保留"define.name ≠ model.name"的诱饵行**钉住取值（见
+    /// `tests_surrogate_*` 用例）。
+    fn surrogate_process_name(&self, exec: &Execution) -> String {
+        let model_name = exec.process_model.name.as_str();
+        if !model_name.trim().is_empty() {
+            return model_name.to_string();
+        }
+        exec.process_define.name.clone()
+    }
+
     /// Persist new tasks (assigns IDs in-place for tasks with id=0).
+    ///
+    /// **本栈新任务落库唯一收口**（对齐 Java/Go 的 `saveNewTask`）：发起 / 办理推进 /
+    /// **串行会签每一步推进** / 跳转四条建任务路径全部经此落库（9 处 `create_task` 调用点
+    /// 都汇入 `exec.new_tasks`），故委托自动生效只挂这一处即全覆盖
+    /// （契约 06 §4.5 条款 1；只挂"发起"一处会漏掉流转中产生的新单——实测易犯）。
+    ///
+    /// 时序（条款 2 ⚠️）：并入发生在 `save_task` **之前**，落在参与者集合本身，
+    /// 随后由同一次收口把"原人 + 代理人"整体写入 `wf_process_task_actor`；
+    /// **不做**"事后再补写一次 `add_task_actor`"（Java 首版挂在 taskId 分配前 → 打在空 id
+    /// 上静默无效，本栈同样不引第二条写路径）。
     ///
     /// TASK_START 时机（issues/13 salvo 栈根因闭环，对齐 Java jeeflow-java 1.8.20
     /// 「notifyTaskStart 移到 saveTask 之后」）：`create_node_tasks` 里 create_task 只置
@@ -554,20 +580,39 @@ impl JeeflowEngineImpl {
     /// 立即提交（autocommit，无显式事务）。故 TASK_START 必须在 `save_task` 之后 fire——
     /// 监听器 `find_task(source_id)` 此时才查得到该任务。若在 create 阶段 fire（id=0/未落库），
     /// 监听器 find_task 查空 → 静默 return → TODO 待办丢失（messagePage 恒空）。
-    fn persist_tasks(&self, instance: &ProcessInstance, new_tasks: &mut [ProcessTask]) -> JeeflowResult<()> {
-        for task in new_tasks.iter_mut() {
+    fn persist_tasks(&self, exec: &mut Execution) -> JeeflowResult<()> {
+        let instance_id = exec.process_instance.instance_id;
+        let process_name = self.surrogate_process_name(exec);
+        // 委托并入后的参与者集合（回写聚合根副本用，循环外统一套用以免借用冲突）
+        let mut merged_actors: Vec<(i64, Vec<String>)> = Vec::new();
+        for task in exec.new_tasks.iter_mut() {
             if task.task_id == 0 {
                 task.task_id = self.next_id();
             }
-            task.process_instance_id = instance.instance_id;
+            task.process_instance_id = instance_id;
+            // issues/116 批次 D：参与者落库前应用生效中的委托（未配置扩展仓储/查询报错
+            // 均静默跳过，不打断建单；开关关闭时原样返回）。
+            if crate::surrogate::apply_surrogate_to_task(&self.ctx, task, &process_name) {
+                merged_actors.push((task.task_id, task.actor_ids.clone()));
+            }
             self.repo().save_task(task)?;
-            // Save actors
+            // Save actors（集合已含代理人，与任务同批落库）
             if !task.actor_ids.is_empty() {
                 self.repo().add_task_actor(task.task_id, &task.actor_ids)?;
             }
             // 落库后 fire TASK_START（此时 task_id 已分配且行已提交，监听器 find_task 可查）
             let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, task.task_id);
             ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+        }
+        // 聚合根内的任务副本同步并入后的参与者（否则 update_instance 落库的副本仍是
+        // "只有原人"，且 is_allowed/详情读聚合副本时会漏判代理人——同 issues/114 §6
+        // Java 那条"内存仓 addTaskActor 不回写任务副本"的病根）。
+        if !merged_actors.is_empty() {
+            for t in &mut exec.process_instance.tasks {
+                if let Some((_, actors)) = merged_actors.iter().find(|(id, _)| *id == t.task_id) {
+                    t.actor_ids = actors.clone();
+                }
+            }
         }
         Ok(())
     }
@@ -660,7 +705,7 @@ impl JeeflowEngineImpl {
         }
 
         // 10. Persist new tasks (sync) — assigns IDs in-place
-        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+        self.persist_tasks(&mut exec)?;
 
         // 11. Update instance (sync)
         self.repo().update_instance(&exec.process_instance)?;
@@ -797,7 +842,7 @@ impl JeeflowEngineImpl {
                         node_ref.form_key(), None);
                     exec.new_tasks.extend(new_task);
                     // Persist + return (no edge follow)
-                    self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                    self.persist_tasks(&mut exec)?;
                     self.repo().update_instance(&exec.process_instance)?;
                     return Ok(exec.new_tasks);
                 } else {
@@ -832,7 +877,7 @@ impl JeeflowEngineImpl {
                         // Fall through to 10b (follow output edges)
                     } else {
                         // Not merged → return without following edges
-                        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                        self.persist_tasks(&mut exec)?;
                         self.repo().update_instance(&exec.process_instance)?;
                         return Ok(exec.new_tasks);
                     }
@@ -845,7 +890,7 @@ impl JeeflowEngineImpl {
                         // Fall through to 10b (follow output edges)
                     } else {
                         // Not all finished → return without following edges
-                        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+                        self.persist_tasks(&mut exec)?;
                         self.repo().update_instance(&exec.process_instance)?;
                         return Ok(exec.new_tasks);
                     }
@@ -879,7 +924,7 @@ impl JeeflowEngineImpl {
         }
 
         // 12. Persist new tasks + update instance (sync) — assigns IDs in-place
-        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+        self.persist_tasks(&mut exec)?;
         self.repo().update_instance(&exec.process_instance)?;
 
         Ok(exec.new_tasks)
@@ -947,7 +992,7 @@ impl JeeflowEngineImpl {
             self.execute_node(&mut exec, &node)?;
         }
 
-        self.persist_tasks(&exec.process_instance, &mut exec.new_tasks)?;
+        self.persist_tasks(&mut exec)?;
         self.repo().update_instance(&exec.process_instance)?;
 
         Ok(exec.new_tasks)
@@ -2053,6 +2098,267 @@ mod tests {
             after.iter().any(|t| t.actor_ids.iter().any(|a| a == "u0011")),
             "c31: approver task should be created for u0011 from f_approver on resume; doing={:?}",
             after.iter().map(|t| (t.task_name.clone(), t.actor_ids.clone())).collect::<Vec<_>>()
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/116 批次 D · 委托代理自动生效（引擎内置、默认开启；内存仓路）
+    //   断言一律打在**参与者表读回值**上（find_task_actors），不是内存集合自嗨；
+    //   sqlx 真机对应用例：test_mysql_i116_surrogate_agent_lands_in_task_actor
+    // ═══════════════════════════════════════════════════════
+
+    /// 带扩展仓储的引擎（MemoryRepository 同时实现 ProcessRepository + ProcessExtRepository，
+    /// 与 salvo 集成壳的装配姿势一致）。
+    fn make_surrogate_engine() -> (JeeflowEngineImpl, Arc<MemoryRepository>) {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_user_provider(Arc::new(ComplianceUserProvider))
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        (JeeflowEngineImpl::new(ctx), repo)
+    }
+
+    /// **显式关闭**委托自动生效的引擎（条款 3；关闭后回到"仅台账"行为）。
+    /// 也是正向用例的回退自证姿势：把开关换成它，上面的并入断言必须变红。
+    fn make_surrogate_engine_off() -> (JeeflowEngineImpl, Arc<MemoryRepository>) {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_user_provider(Arc::new(ComplianceUserProvider))
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)))
+            .with_surrogate_auto_apply(false);
+        (JeeflowEngineImpl::new(ctx), repo)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_surrogate_row(
+        repo: &MemoryRepository,
+        operator: &str,
+        process_name: &str,
+        agent: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        enabled: i32,
+    ) -> i64 {
+        let mut sg = ProcessSurrogate {
+            id: 0,
+            process_name: process_name.into(),
+            operator: operator.into(),
+            surrogate: agent.into(),
+            start_time: start.map(str::to_string),
+            end_time: end.map(str::to_string),
+            enabled,
+            create_time: None, create_user: Some("admin".into()),
+            update_time: None, update_user: None,
+        };
+        repo.save_surrogate(&mut sg).unwrap();
+        sg.id
+    }
+
+    /// 落一条"窗口宽到与时区/时钟无关"的生效委托（引擎按 `current_time_str()` 判窗）。
+    fn add_surrogate(repo: &MemoryRepository, operator: &str, process_name: &str, agent: &str) -> i64 {
+        add_surrogate_row(repo, operator, process_name, agent,
+            Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), 1)
+    }
+
+    /// 从参与者表读回并按人排序（HashMap 遍历序随机，对账需稳定）。
+    fn persisted_actors(repo: &MemoryRepository, task_id: i64) -> Vec<String> {
+        let mut v = repo.find_task_actors(task_id).unwrap();
+        v.sort();
+        v
+    }
+
+    /// 条款 1 + 1.1 + 2 ⚠️：发起与**办理推进**两条建任务路径都要并入代理人，
+    /// 且落在参与者表真行上；`processName` 取**流程模型 name**，不取 define.name。
+    #[tokio::test]
+    async fn test_surrogate_applies_on_start_and_advance_with_model_name() {
+        let (engine, repo) = make_surrogate_engine();
+        // 01-simple 的流程 JSON 里 name = "simple"；故意把定义行命名成 "decoy-define-name"
+        // ——若实现取的是 wf_process_define.name，define 侧那条诱饵委托就会命中而露馅。
+        let flow = load_flow("01-simple");
+        let did = save_define(&repo, "decoy-define-name", &flow);
+        add_surrogate(&repo, "applicant", "simple", "agentOfApplicant");
+        add_surrogate(&repo, "leader", "simple", "agentOfModelName");
+        add_surrogate(&repo, "leader", "decoy-define-name", "agentOfDefineName");
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let doing = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
+        let apply = doing.iter().find(|t| t.task_name == "apply").expect("发起应建 apply 任务");
+        assert_eq!(
+            persisted_actors(&repo, apply.task_id),
+            vec!["agentOfApplicant".to_string(), "applicant".to_string()],
+            "① 发起路径：代理人须与原授权人一起落进 wf_process_task_actor（授权人保留、任一可办）"
+        );
+
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+        let doing = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
+        let task1 = doing.iter().find(|t| t.task_name == "task1").expect("推进应建 task1");
+        let actors = persisted_actors(&repo, task1.task_id);
+        assert_eq!(
+            actors,
+            vec!["agentOfModelName".to_string(), "leader".to_string()],
+            "② 推进路径新单同样要并入代理人（只挂发起一处就会漏掉这一手）"
+        );
+        assert!(
+            !actors.contains(&"agentOfDefineName".to_string()),
+            "③ 命中了 define.name 侧的委托＝取的是 wf_process_define.name，条款 1.1 要求取流程模型 name"
+        );
+    }
+
+    /// 条款 1.2（不级联）+ 1.4（多命中取 id 最大）。
+    #[tokio::test]
+    async fn test_surrogate_no_cascade_and_takes_max_id() {
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "surr-nocascade", &load_flow("01-simple"));
+        // leader 两条同时生效：后落库的 id 更大 → 只能取 agentNew
+        add_surrogate(&repo, "leader", "simple", "agentOld");
+        add_surrogate(&repo, "leader", "simple", "agentNew");
+        // 级联诱饵：agentNew 自己又把单子委托给 agentDeep（不得展开）
+        add_surrogate(&repo, "agentNew", "simple", "agentDeep");
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+
+        let task1 = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "task1").unwrap();
+        assert_eq!(
+            persisted_actors(&repo, task1.task_id),
+            vec!["agentNew".to_string(), "leader".to_string()],
+            "多条命中只取 id 最大的一条，且代理人自身的委托不再展开（A→B、B→C 时 C 不收单）"
+        );
+    }
+
+    /// 条款 1.3 串行会签：代理人只进**当一步**任务的参与者，不扩投票名册。
+    #[tokio::test]
+    async fn test_surrogate_sequential_countersign_step_only() {
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "surr-seq", &load_flow("08-countersign-sequential-approve"));
+        add_surrogate(&repo, "userA", "cs-seq-approve", "agentA");
+        add_surrogate(&repo, "userB", "cs-seq-approve", "agentB");
+
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let roster_key = "csv_task1_operatorList";
+        let step1 = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(step1.len(), 1, "串行会签一步只有一个在办任务");
+        assert_eq!(
+            persisted_actors(&repo, step1[0].task_id),
+            vec!["agentA".to_string(), "userA".to_string()],
+            "第一步任务的参与者 = 当步人 + 其代理人"
+        );
+        assert_eq!(
+            repo.find_instance_by_id(iid).unwrap().unwrap().variables.get_str(roster_key),
+            Some("userA,userB"),
+            "投票名册 operatorList 不得被代理人扩写（改了就是改了票数）"
+        );
+
+        engine.execute_task_async(step1[0].task_id, "userA", &FlowData::new()).await.unwrap();
+        let step2 = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(step2.len(), 1);
+        assert_eq!(
+            persisted_actors(&repo, step2[0].task_id),
+            vec!["agentB".to_string(), "userB".to_string()],
+            "第二步推进出的任务同样并入当步代理人"
+        );
+        assert_eq!(
+            repo.find_instance_by_id(iid).unwrap().unwrap().variables.get_str(roster_key),
+            Some("userA,userB"),
+            "推进后名册仍不变"
+        );
+        let node_rows: Vec<i64> = repo.find_history_tasks(iid).unwrap()
+            .iter().filter(|t| t.task_name == "task1").map(|t| t.task_id).collect();
+        assert_eq!(node_rows.len(), 2, "串行会签的任务行数只随步数增长，不因委托新增");
+    }
+
+    /// 条款 1.3 并行会签：不新增任务行、不改票数；代理人只共享那一行。
+    #[tokio::test]
+    async fn test_surrogate_parallel_countersign_no_extra_task_rows() {
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "surr-parallel", &load_flow("05-countersign-parallel"));
+        add_surrogate(&repo, "userA", "countersign-parallel", "agentX");
+
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(doing.len(), 3, "并行会签 3 人 3 行，委托不得新增任务行");
+        let a_task = doing.iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+        assert_eq!(
+            persisted_actors(&repo, a_task.task_id),
+            vec!["agentX".to_string(), "userA".to_string()],
+            "代理人并入 userA 那一行（任一可办），不是再开一行"
+        );
+
+        // 票数不变：agentX 代办 userA 那一行 + userB 办结后，userC 仍在办（未提前 merge）
+        engine.execute_task_async(a_task.task_id, "agentX", &FlowData::new()).await.unwrap();
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(doing.len(), 2, "agentX 办掉 userA 那一行后应只剩 2 行在办");
+        let b_task = doing.iter().find(|t| t.actor_ids.contains(&"userB".to_string())).unwrap();
+        engine.execute_task_async(b_task.task_id, "userB", &FlowData::new()).await.unwrap();
+        let still_doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(still_doing.len(), 1, "票数没被代理人扩大的话，仍差 userC 一票");
+        assert_eq!(repo.find_instance_by_id(iid).unwrap().unwrap().state, 10,
+            "会签未齐不得提前结束实例");
+    }
+
+    /// 条款 3（可显式关闭）+ 条款 4（未配置扩展仓储静默跳过，不打断建单）。
+    #[tokio::test]
+    async fn test_surrogate_switch_off_and_missing_ext_repository() {
+        // ① 显式关闭：回到"仅台账"——委托记录照存照查，参与者集合不再并入
+        let (engine, repo) = make_surrogate_engine_off();
+        let did = save_define(&repo, "surr-off", &load_flow("01-simple"));
+        let sid = add_surrogate(&repo, "applicant", "simple", "agentOff");
+        assert!(repo.find_surrogate_by_id(sid).unwrap().is_some(), "关闭不影响台账可查");
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+        assert_eq!(
+            persisted_actors(&repo, apply.task_id),
+            vec!["applicant".to_string()],
+            "开关关闭后不得并入代理人（正向用例的回退自证即改这一行）"
+        );
+
+        // ② 未配置扩展仓储：建单照常、不抛"未配置扩展仓储"
+        let (engine2, repo2) = make_compliance_engine();
+        assert!(engine2.context().ext_repository.is_none(), "该引擎应未装配扩展仓储");
+        let did2 = save_define(&repo2, "surr-noext", &load_flow("01-simple"));
+        let inst2 = engine2.start_async(did2, "applicant", &FlowData::new()).await.unwrap();
+        let apply2 = repo2.find_doing_tasks(inst2.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+        assert_eq!(
+            persisted_actors(&repo2, apply2.task_id),
+            vec!["applicant".to_string()],
+            "缺扩展仓储属正常部署形态：静默跳过、建单不被打断"
+        );
+    }
+
+    /// 条款 5 四判据的引擎侧负例（防"引擎绕过判据直接取一条"）：
+    /// 窗外（已过期/未开始）/ enabled≠1 / 非本人委托 → 一律不并入。
+    #[tokio::test]
+    async fn test_surrogate_negative_predicates_not_applied() {
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "surr-neg", &load_flow("01-simple"));
+        add_surrogate_row(&repo, "leader", "simple", "agentExpired",
+            Some("2000-01-01 00:00:00"), Some("2001-01-01 00:00:00"), 1);
+        add_surrogate_row(&repo, "leader", "simple", "agentNotStarted",
+            Some("2999-01-01 00:00:00"), Some("2999-12-31 23:59:59"), 1);
+        add_surrogate_row(&repo, "leader", "simple", "agentDisabled", None, None, 0);
+        // 判据④「只有 1 生效」：2 这种脏值也不生效
+        add_surrogate_row(&repo, "leader", "simple", "agentDirtyTwo", None, None, 2);
+        // 别人的委托不得串到 leader 身上
+        add_surrogate_row(&repo, "someoneelse", "simple", "agentOther", None, None, 1);
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+        let task1 = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "task1").unwrap();
+        assert_eq!(
+            persisted_actors(&repo, task1.task_id),
+            vec!["leader".to_string()],
+            "窗外 / enabled=0 / enabled 脏值 / 他人委托 都不该被并入"
         );
     }
 }

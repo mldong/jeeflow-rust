@@ -371,13 +371,24 @@ impl ProcessRepository for MemoryRepository {
         let instances = self.instances.lock().unwrap();
         let defines = self.defines.lock().unwrap();
 
+        // 「我已办」三处判据（issues/117，owner 2026-09-21 拍板；与 sqlx 仓**同判据**，
+        // 否则"换仓储就换答案"——正是 issues/116 §5 给委托查询立过的那条病）：
+        // ① 状态集合 `task_state <> 10`（六栈家族口径）：语义 = 我经手过且不再是我待办，
+        //    含撤回 30 / 终止 40 / 废弃 99。原 `== Finished(20)` 会让撤回单从待办、已办
+        //    两头同时消失（issues/113 刚把撤回态从 99 统一成 30）。
+        // ② 归属只认 `t.operator`（即 actor_id 列，办结时写入）：契约 §2.5 点名
+        //    "不含发起人 create_user，我发起但非我办理不算我的已办"，原实现多认一条
+        //    `create_user = operator` 属**偏宽违约**（同一份数据 Java 栈看不到、本栈看得到）。
+        // ③ operator 为空（None 或全空白）→ **返回空页**：原 `query.operator.is_none()`
+        //    短路会放行全库已办（旁路型缺口，比缺过滤器更隐蔽）。本轮只堵泄漏，
+        //    不把 doneList 的 operator 改成硬必填（前端四入口 + drift_gate 待另一轮统一收紧）。
+        let op = query.operator.as_deref().map(str::trim).unwrap_or("");
         let mut rows: Vec<TaskRow> = tasks
             .values()
             .filter(|t| {
-                t.task_state == TaskState::Finished.code()
-                    && (query.operator.is_none()
-                        || t.actor_id.as_ref() == query.operator.as_ref()
-                        || t.create_user.as_ref() == query.operator.as_ref())
+                t.task_state != TaskState::Doing.code()
+                    && !op.is_empty()
+                    && t.actor_id.as_deref() == Some(op)
             })
             .map(|t| {
                 let inst = instances.get(&t.process_instance_id);
@@ -665,11 +676,24 @@ impl ProcessExtRepository for MemoryRepository {
         Ok(PageResult::new(query.page_num, query.page_size, total, page_rows))
     }
 
-    fn get_surrogate(&self, operator: &str, process_name: &str, _time: &str) -> JeeflowResult<Option<ProcessSurrogate>> {
+    /// 委托查询（四判据见 `crate::surrogate`，与 sqlx 仓必须同答案，契约 06 §4.5 条款 5/6）。
+    ///
+    /// 修复前本方法的三处欠账（issues/116 §5）：
+    /// - 形参 `_time` **直接忽略时间窗** → 同一份数据 SQL 仓判窗外、内存仓判命中，
+    ///   换仓储就换答案（现改为把 `time` 传给判据，按 `yyyy-MM-dd HH:mm:ss` 归一比较）；
+    /// - 无自委托过滤 `surrogate <> operator` → 会命中"自己委托给自己"；
+    /// - 多条命中按 `HashMap` **随机遍历序取首条** → 违条款 1.4（SQL 侧 `ORDER BY id DESC`），
+    ///   现统一由 [`crate::surrogate::pick_surrogate`] 取 id 最大者；
+    /// - 缺空 processName 全流程兜底（只认 `process_name == process_name` 精确相等）→
+    ///   现"先精确、未命中再兜底全流程"两步查。
+    fn get_surrogate(&self, operator: &str, process_name: &str, time: &str) -> JeeflowResult<Option<ProcessSurrogate>> {
         let s = self.surrogates.lock().unwrap();
-        Ok(s.values().find(|sg| {
-            sg.operator == operator && sg.process_name == process_name && sg.enabled == 1
-        }).cloned())
+        Ok(crate::surrogate::pick_surrogate(
+            s.values(),
+            operator,
+            process_name,
+            time,
+        ))
     }
 }
 
@@ -797,5 +821,76 @@ mod tests {
         let found = repo.get_surrogate("user1", "test", "NOW").unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().surrogate, "user2");
+    }
+
+    /// issues/116 条款 6：**双仓对拍**——内存仓跑与 sqlx 真机仓完全同一张判据矩阵
+    /// （`crate::surrogate::parity`，14 行数据 × 15 组期望）。
+    /// sqlx 侧用例：`jeeflow-repository-sqlx/src/lib.rs::test_mysql_i116_surrogate_query_parity`。
+    /// 两侧各写一套断言迟早漂移，故共用一份"数据 + 期望"。
+    #[test]
+    fn test_get_surrogate_parity_matrix_i116() {
+        use crate::surrogate::parity;
+        let repo = MemoryRepository::new();
+        for row in parity::ROWS {
+            let mut sg = parity::memory_row(row);
+            repo.save_surrogate(&mut sg).unwrap();
+            assert_eq!(sg.id, row.id, "预置 id 必须保留（判据期望按 id 对账）");
+        }
+        for exp in parity::EXPECT {
+            let got = repo
+                .get_surrogate(exp.operator, exp.process_name, exp.time)
+                .unwrap()
+                .map(|h| h.id);
+            assert_eq!(
+                got, exp.hit_id,
+                "判据矩阵[{}] operator={} process_name={:?} time={:?} → 期望 {:?} 实得 {:?}",
+                exp.note, exp.operator, exp.process_name, exp.time, exp.hit_id, got
+            );
+        }
+    }
+
+    /// 「我已办」判据（issues/117，owner 2026-09-21 拍板三处一起改）：
+    /// ① 状态集合 `task_state <> 10`（20/30/40/99 全进，10 不进）；
+    /// ② 只按 `operator` 归属，**不认 create_user**（契约 §2.5 点名禁止偏宽）；
+    /// ③ operator 为空（None / 全空白）→ 空页（原 `is_none()` 短路会放行全库已办）。
+    /// sqlx 同判据用例：`test_mysql_i117_done_list_predicates`。
+    #[test]
+    fn test_page_done_tasks_predicates_i117() {
+        let repo = MemoryRepository::new();
+        let mk = |id: i64, state: i32, operator: Option<&str>, create_user: &str| ProcessTask {
+            task_id: id, process_instance_id: 7001, task_name: format!("t{}", id),
+            display_name: "T".into(), task_type: 0, perform_type: 0, task_state: state,
+            actor_id: operator.map(str::to_string), actor_ids: vec![operator.unwrap_or("me").to_string()],
+            finish_time: None, expire_time: None, form_key: None, parent_task_id: None,
+            variables: FlowData::new(), create_time: None,
+            create_user: Some(create_user.to_string()), update_time: None, update_user: None,
+        };
+        // me 经手的四种非待办态：20 已完成 / 30 已撤回 / 40 已终止 / 99 已废弃
+        repo.save_task(&mut mk(8001, TaskState::Finished.code(), Some("me"), "me")).unwrap();
+        repo.save_task(&mut mk(8002, TaskState::Withdraw.code(), Some("me"), "me")).unwrap();
+        repo.save_task(&mut mk(8003, TaskState::Interrupt.code(), Some("me"), "me")).unwrap();
+        repo.save_task(&mut mk(8004, TaskState::Abandon.code(), Some("me"), "other")).unwrap();
+        // 诱饵 1：me 是发起人但**不是办理人** → 不得进 me 的已办（原 create_user 旁路会捞进来）
+        repo.save_task(&mut mk(8005, TaskState::Finished.code(), Some("other"), "me")).unwrap();
+        // 诱饵 2：me 名下的进行中任务 → 属待办不属已办
+        repo.save_task(&mut mk(8006, TaskState::Doing.code(), Some("me"), "me")).unwrap();
+        // 诱饵 3：脏空串办理人 → operator 传空白时不得被 `= ''` 摊给调用方（sqlx 同尺子 901129）
+        repo.save_task(&mut mk(8007, TaskState::Finished.code(), Some(""), "me")).unwrap();
+
+        let ids_for = |op: Option<&str>| {
+            let mut q = PageQuery::new(1, 50);
+            q.operator = op.map(str::to_string);
+            let page = repo.page_done_tasks(&q).unwrap();
+            assert_eq!(page.record_count as usize, page.rows.len(), "total 须与本页行数自洽");
+            let mut ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(ids_for(Some("me")), vec![8001, 8002, 8003, 8004],
+            "20/30/40/99 都算我已办，且发起人诱饵 8005 / 进行中 8006 不得混入");
+        assert_eq!(ids_for(Some("other")), vec![8005], "办理人口径不受影响");
+        assert_eq!(ids_for(None), Vec::<i64>::new(), "operator 缺省不得返回全库已办");
+        assert_eq!(ids_for(Some("   ")), Vec::<i64>::new(), "operator 全空白同空值：空页");
     }
 }
