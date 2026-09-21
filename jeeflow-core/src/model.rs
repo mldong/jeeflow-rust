@@ -781,35 +781,11 @@ pub struct UserInfo {
 // Utility
 // ═══════════════════════════════════════════════════════
 
-/// Current time as string (yyyy-MM-dd HH:mm:ss, UTC).
-/// Core stays chrono-free; UTC is enough for demo/契约展示（与占位符 NOW() 不同，UI 可解析）。
+/// Current time as string (yyyy-MM-dd HH:mm:ss).
+/// 基准由宿主注入的时钟决定，引擎不自取（issues/120）；未注入时回落 UTC
+/// —— core 保持 chrono-free，`std` 只有 epoch、拿不到本地时区偏移。
 pub fn current_time_str() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    format_unix_utc(secs)
-}
-
-/// Format unix seconds (UTC) as `yyyy-MM-dd HH:mm:ss`.
-fn format_unix_utc(secs: i64) -> String {
-    // civil_from_days (Howard Hinnant) — days since 1970-01-01
-    let z = secs.div_euclid(86400) + 719468;
-    let era = if z >= 0 { z } else { z - 146096 }.div_euclid(146097);
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    let tod = secs.rem_euclid(86400) as u32;
-    let hh = tod / 3600;
-    let mm = (tod % 3600) / 60;
-    let ss = tod % 60;
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, hh, mm, ss)
+    crate::clock::current_time_str()
 }
 
 /// Format time to spec format (yyyy-MM-dd HH:mm:ss).
@@ -929,8 +905,6 @@ mod tests {
         assert_eq!(&t[10..11], " ");
         assert_eq!(&t[13..14], ":");
         assert_eq!(&t[16..17], ":");
-        assert_eq!(format_unix_utc(0), "1970-01-01 00:00:00");
-        assert_eq!(format_unix_utc(1_704_067_200), "2024-01-01 00:00:00");
     }
 
     #[test]

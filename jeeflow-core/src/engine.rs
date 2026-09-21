@@ -2361,4 +2361,70 @@ mod tests {
             "窗外 / enabled=0 / enabled 脏值 / 他人委托 都不该被并入"
         );
     }
+
+    fn clock120_fixed() -> String {
+        crate::clock::testclock::at(48)
+    }
+
+    /// issues/120：注入的时钟是引擎**唯一**时间出口——写库审计列与委托生效窗必须同时跟着走。
+    /// 此前两者都是 UTC，而门面 `NOW()` 是本地，同一次响应里两套基准。
+    /// 委托窗改用**注入钟为基准的真窗**（±1h，基准取本 UTC 日 +48h ⇒ 真实 UTC 必落窗外），
+    /// 不再铺 2000~2999 那种与时区无关的宽窗（台账 §4 点名的假绿源头）。
+    #[tokio::test]
+    async fn test_i120_engine_clock_drives_columns_and_window() {
+        use crate::clock::testclock::at;
+        // 注入即独占时钟作用域（`ClockScope` 持进程级互斥，防止别的用例的注入值串进来）
+        let _scope = crate::clock::ClockScope::injected(clock120_fixed);
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "clock120", &load_flow("01-simple"));
+        // 正向窗：注入钟 12:00 的 ±1h
+        add_surrogate_row(&repo, "leader", "simple", "agentInWindow",
+            Some(&at(47)), Some(&at(49)), 1);
+        // 负向窗：start 落在注入钟之后 ⇒ 不得生效
+        add_surrogate_row(&repo, "applicant", "simple", "agentOutOfWindow",
+            Some(&at(49)), None, 1);
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        assert_eq!(
+            inst.create_time.as_deref(),
+            Some(at(48).as_str()),
+            "实例 create_time 必须取注入钟"
+        );
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").expect("发起应建 apply 任务");
+        assert_eq!(
+            apply.create_time.as_deref(),
+            Some(at(48).as_str()),
+            "任务 create_time 必须取注入钟"
+        );
+        assert_eq!(
+            persisted_actors(&repo, apply.task_id),
+            vec!["applicant".to_string()],
+            "负向：start 在注入钟之后的委托不得并入"
+        );
+
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+        let task1 = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "task1").expect("推进应建 task1");
+        assert_eq!(
+            persisted_actors(&repo, task1.task_id),
+            vec!["agentInWindow".to_string(), "leader".to_string()],
+            "正向：以注入钟为基准的真窗（±1h）内委托必须生效"
+        );
+        let done = repo.find_task_by_id(apply.task_id).unwrap().expect("apply 行");
+        assert_eq!(
+            done.finish_time.as_deref(),
+            Some(at(48).as_str()),
+            "finish_time 必须与 create_time 同一时钟出口"
+        );
+        drop(_scope);
+        // 出作用域必须恢复默认基准，否则注入值会漏给同 binary 的其他用例（假绿源头）；
+        // 断言前先取独占权，确保此刻无人注入。
+        let _idle = crate::clock::lock_scope();
+        assert_ne!(
+            crate::clock::current_time_str(),
+            at(48),
+            "ClockScope 作用域结束后不得残留注入值"
+        );
+    }
 }

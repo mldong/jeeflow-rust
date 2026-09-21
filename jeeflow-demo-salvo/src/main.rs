@@ -350,6 +350,12 @@ async fn api_reset(res: &mut Response) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // 时间串基准交给宿主（issues/120）：引擎默认 UTC，本地基准由注入的时钟供给，
+    // 与框架壳（mldong-salvo-jeeflow）同一行做法 ⇒ demo 里写库的时间列与前端展示的墙钟一致。
+    jeeflow_core::clock::set_clock(Some(|| {
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    }));
+
     let cors = salvo::cors::Cors::new()
         .allow_origin(salvo::cors::Any)
         .allow_methods(salvo::cors::Any)

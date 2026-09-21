@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod model;
+pub mod clock;
 pub mod json;
 pub mod spi;
 pub mod context;

@@ -161,7 +161,9 @@ fn format_time_fields(val: &Json) -> Json {
 fn format_time_value(v: &Json) -> Json {
     match v {
         Json::String(s) if s == "NOW()" || s == "NOW" => {
-            Json::String(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
+            // 与写库审计列同一时钟出口（issues/120）——此前此处直接吃 chrono::Local，
+            // 而同一次响应里的 create_time 走 UTC，同栈两个基准。
+            Json::String(current_time_str())
         }
         Json::String(s) => {
             // ISO-like → yyyy-MM-dd HH:mm:ss when easily parseable
@@ -5913,5 +5915,32 @@ mod tests {
             .into_iter().find(|t| t.task_name == "apply").expect("应有 apply 行");
         assert!(applicant_rows.contains(&apply_task.task_id.to_string()),
             "已办结的 apply 行应在 applicant 已办里：{:?}", applicant_rows);
+    }
+
+    /// issues/120：门面 `NOW()` 占位符与写库审计列必须是**同一个时钟出口**。
+    /// 此前此处吃 `chrono::Local`、而 create_time 走 UTC ⇒ 同一次响应里两套基准。
+    #[test]
+    fn test_i120_facade_now_follows_engine_clock() {
+        const SENTINEL: &str = "2099-12-31 23:59:59";
+        let ph = Json::String("NOW()".to_string());
+        {
+            let _scope = jeeflow_core::clock::ClockScope::injected(|| SENTINEL.to_string());
+            assert_eq!(
+                format_time_value(&ph),
+                Json::String(SENTINEL.to_string()),
+                "注入时钟后 NOW() 必须给注入值，不得自己吃 chrono::Local"
+            );
+        }
+        let _idle = jeeflow_core::clock::lock_scope();
+        match format_time_value(&ph) {
+            Json::String(s) => {
+                assert!(
+                    chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").is_ok(),
+                    "出作用域后 NOW() 仍应解析为 yyyy-MM-dd HH:mm:ss，实得 {s}"
+                );
+                assert_ne!(s, SENTINEL, "ClockScope 作用域结束后不得残留注入值");
+            }
+            other => panic!("NOW() 应解析为字符串，实得 {other:?}"),
+        }
     }
 }
