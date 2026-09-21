@@ -5207,6 +5207,225 @@ mod tests {
         (inst_id, task_id)
     }
 
+    /// 四节点链式流：`start → apply[applicant] → a[alice] → b[bob] → approve[user2] → end`。
+    /// 三段审批依次办结后停在 approve，返回 `(实例 id, approve 任务 id)`。
+    ///
+    /// 存在的唯一理由：给**跳转(JUMP)** 与**回退(ROLLBACK)** 两条建任务路径各留一条独立委托用例
+    /// （规范 06 §4.5 条款 1「每条路径各留一条独立用例」）。两条路径的**落点节点不同**
+    /// （JUMP 指定 `a`/alice，回退自动落到上一节点 `b`/bob），于是"只有一条路径漏挂委托"
+    /// 时只红自己那一条——不需要为了取证去改引擎做条件注入。
+    async fn start_chain_flow(facade: &JeeflowFacade, flow_name: &str) -> (i64, i64) {
+        let mut a1 = HashMap::new();
+        a1.insert("name".to_string(), json!(flow_name));
+        a1.insert("displayName".to_string(), json!(flow_name));
+        let r1 = facade.flow("processDesign/save", &a1).await;
+        assert_eq!(r1["code"], 0, "design save failed: {:?}", r1);
+        let design_id = r1["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        let content = format!(
+            r#"{{
+                "name":"{n}","displayName":"{n}","type":"approval",
+                "nodes":[
+                    {{"id":"start","type":"snaker:start","text":{{"value":"Start"}}}},
+                    {{"id":"apply","type":"snaker:task","text":{{"value":"Apply"}},"properties":{{"assignee":"applicant"}}}},
+                    {{"id":"a","type":"snaker:task","text":{{"value":"A"}},"properties":{{"assignee":"alice"}}}},
+                    {{"id":"b","type":"snaker:task","text":{{"value":"B"}},"properties":{{"assignee":"bob"}}}},
+                    {{"id":"approve","type":"snaker:task","text":{{"value":"Approve"}},"properties":{{"assignee":"user2"}}}},
+                    {{"id":"end","type":"snaker:end","text":{{"value":"End"}}}}
+                ],
+                "edges":[
+                    {{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"}},
+                    {{"id":"e2","sourceNodeId":"apply","targetNodeId":"a"}},
+                    {{"id":"e3","sourceNodeId":"a","targetNodeId":"b"}},
+                    {{"id":"e4","sourceNodeId":"b","targetNodeId":"approve"}},
+                    {{"id":"e5","sourceNodeId":"approve","targetNodeId":"end"}}
+                ]
+            }}"#,
+            n = flow_name
+        );
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(design_id));
+        a2.insert("content".to_string(), json!(content));
+        assert_eq!(facade.flow("processDesign/updateDefine", &a2).await["code"], 0);
+        let mut a3 = HashMap::new();
+        a3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &a3).await["code"], 0);
+
+        let mut a4 = HashMap::new();
+        a4.insert("name".to_string(), json!(flow_name));
+        a4.insert("operator".to_string(), json!("applicant"));
+        let r4 = facade.flow("processDefine/startAndExecute", &a4).await;
+        assert_eq!(r4["code"], 0, "start failed: {:?}", r4);
+        let inst_id: i64 = r4["data"]["processInstanceId"].as_str().unwrap().parse().unwrap();
+
+        // 依次办结 a(alice) → b(bob)，停在 approve(user2)
+        for (node, who) in [("a", "alice"), ("b", "bob")] {
+            let tid = doing_task_of(facade, inst_id, node);
+            assert_eq!(
+                exec_task(facade, tid, who, vec![]).await["code"],
+                0,
+                "办结 {} 应成功", node
+            );
+        }
+        let approve_task = doing_task_of(facade, inst_id, "approve");
+        (inst_id, approve_task)
+    }
+
+    /// 该实例里指定节点当前的进行中任务 id（不存在即 panic，避免"节点名写错→空集合→假绿"）。
+    fn doing_task_of(facade: &JeeflowFacade, inst_id: i64, node: &str) -> i64 {
+        let hit: Vec<i64> = facade
+            .repo()
+            .find_doing_tasks(inst_id, &[])
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.task_name == node)
+            .map(|t| t.task_id)
+            .collect();
+        assert_eq!(hit.len(), 1, "节点 {} 应恰有 1 个进行中任务，实得 {:?}", node, hit);
+        hit[0]
+    }
+
+    /// 办理提交：默认 submitType=1（同意），`extra` 可覆盖同名键（如 submitType/taskName）。
+    async fn exec_task(facade: &JeeflowFacade, task_id: i64, operator: &str, extra: Vec<(&str, Json)>) -> Json {
+        let mut m = HashMap::new();
+        m.insert("processTaskId".to_string(), json!(task_id));
+        m.insert("operator".to_string(), json!(operator));
+        m.insert("submitType".to_string(), json!(1));
+        for (k, v) in extra {
+            m.insert(k.to_string(), v);
+        }
+        facade.flow("processTask/execute", &m).await
+    }
+
+    /// 该任务在参与者表里的当前成员（排序后对账）。
+    fn persisted_actors_of(facade: &JeeflowFacade, task_id: i64) -> Vec<String> {
+        let mut v = facade.repo().find_task_actors(task_id).unwrap();
+        v.sort();
+        v
+    }
+
+    /// 条款 1 · 跳转(JUMP) 路径独立用例：委托**在起单之后**才配，且只配在跳转落点节点的参与者
+    /// (alice) 身上 ⇒ 全实例唯一可能带上 `agentJP` 的行，就是 JUMP 新建出来的那条 a 任务。
+    /// 漏挂时该用例必红，而回退用例（另一个参与者 + 另一个代理名）不受影响。
+    #[tokio::test]
+    async fn test_surrogate_applies_on_jump_path() {
+        let facade = make_facade();
+        let (inst, approve_task) = start_chain_flow(&facade, "surr-jump-flow").await;
+
+        assert_eq!(
+            facade
+                .flow(
+                    "processSurrogate/save",
+                    &args_of(vec![
+                        ("operator", json!("alice")),
+                        ("surrogate", json!("agentJP")),
+                        ("processName", json!("surr-jump-flow")),
+                    ])
+                )
+                .await["code"],
+            0,
+            "委托台账应保存成功"
+        );
+        // 配完委托**还没跳转**：此刻任何进行中任务都不得带 agentJP（排除"配台账就生效"的假绿）
+        let before: Vec<String> = facade
+            .repo()
+            .find_doing_tasks(inst, &[])
+            .unwrap()
+            .into_iter()
+            .flat_map(|t| persisted_actors_of(&facade, t.task_id))
+            .collect();
+        assert!(
+            !before.contains(&"agentJP".to_string()),
+            "配委托后、建单前应没有任何代理人，实得 {:?}", before
+        );
+
+        // JUMP：submitType=4 + taskName=a
+        let r = exec_task(
+            &facade,
+            approve_task,
+            "user2",
+            vec![("submitType", json!(4)), ("taskName", json!("a"))],
+        )
+        .await;
+        assert_eq!(r["code"], 0, "跳转应成功: {:?}", r);
+
+        let new_a = doing_task_of(&facade, inst, "a");
+        let actors = persisted_actors_of(&facade, new_a);
+        assert!(
+            actors.contains(&"alice".to_string()) && actors.contains(&"agentJP".to_string()),
+            "条款 1「跳转(JUMP)」：跳转新建的 a 任务须并入代理人（原人保留），实得 {:?}", actors
+        );
+    }
+
+    /// 条款 1 · 回退(ROLLBACK，submitType=3) 路径独立用例：委托**在起单之后**才配在
+    /// 回退落点节点的参与者 (applicant) 身上 ⇒ 全实例唯一可能带上 `agentRB` 的行，
+    /// 就是回退新建出来的那条任务。漏挂时本用例必红，而 JUMP 用例（另一个参与者 + 另一个
+    /// 代理名）不受影响，反之亦然。
+    ///
+    /// ⚠️ 用两步流而非四步流：本栈 `submitType=3` 实际落到**第一个任务节点**而不是上一节点
+    /// （`jeeflow-core/src/engine.rs` 的 `execute_and_jump_async` 里 `target_name=None` 走
+    /// `get_first_task_node()`，而注释写的是 "go back to previous task node"）——
+    /// 该语义错位已单独立账 issues/119，**不在本用例的职责内**：本格只钉"这条建单路径有没有挂委托"。
+    #[tokio::test]
+    async fn test_surrogate_applies_on_rollback_path() {
+        let facade = make_facade();
+        let (inst, approve_task) = start_two_step_flow(&facade, "surr-rb-flow").await;
+
+        assert_eq!(
+            facade
+                .flow(
+                    "processSurrogate/save",
+                    &args_of(vec![
+                        ("operator", json!("applicant")),
+                        ("surrogate", json!("agentRB")),
+                        ("processName", json!("surr-rb-flow")),
+                    ])
+                )
+                .await["code"],
+            0,
+            "委托台账应保存成功"
+        );
+        // 配完委托还没回退：任何进行中任务都不该带代理人（排除"配台账即生效"的假绿）
+        let before: Vec<String> = facade
+            .repo()
+            .find_doing_tasks(inst, &[])
+            .unwrap()
+            .into_iter()
+            .flat_map(|t| persisted_actors_of(&facade, t.task_id))
+            .collect();
+        assert!(
+            !before.contains(&"agentRB".to_string()),
+            "配委托后、建单前应没有任何代理人，实得 {:?}", before
+        );
+
+        // ROLLBACK：submitType=3，不传 taskName（落点由引擎决定）
+        let r = exec_task(&facade, approve_task, "user2", vec![("submitType", json!(3))]).await;
+        assert_eq!(r["code"], 0, "回退应成功: {:?}", r);
+
+        let mut rb_tasks: Vec<_> = facade
+            .repo()
+            .find_doing_tasks(inst, &[])
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.task_id != approve_task)
+            .collect();
+        assert_eq!(
+            rb_tasks.len(),
+            1,
+            "回退后应恰有 1 条新建的进行中任务（原 approve 任务已办结），实得任务 id {:?}",
+            rb_tasks.iter().map(|t| t.task_id).collect::<Vec<_>>()
+        );
+        let rb_task = rb_tasks.pop().unwrap();
+        let actors = persisted_actors_of(&facade, rb_task.task_id);
+        assert!(
+            // 落点是 apply 节点，其参与者解析为发起人 applicant；原人必须保留（委托是"加人"不是"换人"）
+            actors.contains(&"applicant".to_string()) && actors.contains(&"agentRB".to_string()),
+            "条款 1「回退(ROLLBACK)」：回退新建的任务须并入代理人且保留原人，落点节点={}，实得 {:?}",
+            rb_task.task_name,
+            actors
+        );
+    }
+
     /// 从 task.variables（持久 FlowData，非 camelCase HTTP 视图）取 tf_transferHistory 数组。
     fn history_of(facade: &JeeflowFacade, task_id: i64) -> Vec<JsonValue> {
         let t = facade.repo().find_task_by_id(task_id).unwrap().expect("task");
