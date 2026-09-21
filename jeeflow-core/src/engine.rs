@@ -2620,6 +2620,28 @@ mod tests {
             .await.err().expect("无血缘必须报错，不得静默通过");
         assert!(e.to_string().contains("20010007"), "错码须体现在 msg，实得 {}", e.to_string());
 
+        // ①′ 老行形状 A：parent 为 None（P1 之前建的数据该列是 NULL）——本栈它与 Some(0) 走的是
+        //     两个 match 分支，故必须单独钉一次
+        let inst_b = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let mut apply_b = repo.find_doing_tasks(inst_b.instance_id, &[]).unwrap()
+            .first().expect("应有 apply 进行中行").clone();
+        apply_b.parent_task_id = None;
+        repo.update_task(&apply_b).unwrap();
+        let eb = engine.execute_and_jump_async(apply_b.task_id, "applicant", &rb, None)
+            .await.err().expect("parent=None 的老行必须报错，不得静默不建单");
+        assert!(eb.to_string().contains("20010007"), "实得 {}", eb.to_string());
+
+        // ①″ 老行形状 B：parent 是非 0 但仓储里查不到行（老数据被清过 / 跨库迁移来的样子）
+        //     ⇒ 走"取不到历史行"那条分支，同样必须 20010007
+        let inst_c = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let mut apply_c = repo.find_doing_tasks(inst_c.instance_id, &[]).unwrap()
+            .first().expect("应有 apply 进行中行").clone();
+        apply_c.parent_task_id = Some(i64::MAX);
+        repo.update_task(&apply_c).unwrap();
+        let ec = engine.execute_and_jump_async(apply_c.task_id, "applicant", &rb, None)
+            .await.err().expect("parent 指不到真实行时必须报错");
+        assert!(ec.to_string().contains("20010007"), "实得 {}", ec.to_string());
+
         // ② 守卫：fork 分支任务的 parent 在 fork 之前 ⇒ boot2 语义下不可回退
         let (engine2, repo2) = make_surrogate_engine();
         let did2 = save_define(&repo2, "lineage121f", &load_flow("04-fork-join"));
