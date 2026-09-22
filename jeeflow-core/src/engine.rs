@@ -1112,11 +1112,11 @@ impl JeeflowEngineImpl {
     /// 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的 parent_task_id，
     /// 复活那条历史行；不按模型入边拓扑推（拓扑版会回到本实例没走过的节点，且 3 与 6 塌成同值）。
     ///
-    /// 错码用 `Business(msg)` 前缀表达：本栈 `JeeflowError::code()` 恒 99999999，
-    /// 契约只要求"异常与 msg 可区分、HTTP 出口仍 99999999"。
+    /// 对外 msg 用固定中文文案、不含引擎内部码：本栈 `JeeflowError::code()` 恒 99999999，
+    /// 两格语义由文案区分（引擎内部码 20010007、20010008 只留在规范与本注释，HTTP 出口仍 99999999）。
     fn rollback_to_parent(&self, exec: &mut Execution) -> JeeflowResult<()> {
-        const NO_LINEAGE: &str = "20010007: 上一步任务ID为空，无法驳回至上一步处理";
-        const GUARD: &str = "20010008: 无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务";
+        const NO_LINEAGE: &str = "上一步任务ID为空，无法驳回至上一步处理";
+        const GUARD: &str = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务";
 
         let current = match exec.process_task.clone() {
             Some(t) => t,
@@ -2667,7 +2667,8 @@ mod tests {
         rb.insert_i64("submitType", 3);
         let e = engine.execute_and_jump_async(apply.task_id, "applicant", &rb, None)
             .await.err().expect("无血缘必须报错，不得静默通过");
-        assert!(e.to_string().contains("20010007"), "错码须体现在 msg，实得 {}", e.to_string());
+        assert!(e.to_string().contains("上一步任务ID为空，无法驳回至上一步处理") && !e.to_string().contains("2001000"),
+            "msg 应为固定文案且不含内部码，实得 {}", e.to_string());
 
         // ①′ 老行形状 A：parent 为 None（P1 之前建的数据该列是 NULL）——本栈它与 Some(0) 走的是
         //     两个 match 分支，故必须单独钉一次
@@ -2678,7 +2679,7 @@ mod tests {
         repo.update_task(&apply_b).unwrap();
         let eb = engine.execute_and_jump_async(apply_b.task_id, "applicant", &rb, None)
             .await.err().expect("parent=None 的老行必须报错，不得静默不建单");
-        assert!(eb.to_string().contains("20010007"), "实得 {}", eb.to_string());
+        assert!(eb.to_string().contains("上一步任务ID为空，无法驳回至上一步处理") && !eb.to_string().contains("2001000"), "实得 {}", eb.to_string());
 
         // ①″ 老行形状 B：parent 是非 0 但仓储里查不到行（老数据被清过 / 跨库迁移来的样子）
         //     ⇒ 走"取不到历史行"那条分支，同样必须 20010007
@@ -2689,7 +2690,7 @@ mod tests {
         repo.update_task(&apply_c).unwrap();
         let ec = engine.execute_and_jump_async(apply_c.task_id, "applicant", &rb, None)
             .await.err().expect("parent 指不到真实行时必须报错");
-        assert!(ec.to_string().contains("20010007"), "实得 {}", ec.to_string());
+        assert!(ec.to_string().contains("上一步任务ID为空，无法驳回至上一步处理") && !ec.to_string().contains("2001000"), "实得 {}", ec.to_string());
 
         // ② 守卫：fork 分支任务的 parent 在 fork 之前 ⇒ boot2 语义下不可回退
         let (engine2, repo2) = make_surrogate_engine();
@@ -2701,7 +2702,7 @@ mod tests {
         let who = branch.actor_ids.first().cloned().unwrap_or_else(|| "applicant".to_string());
         let e2 = engine2.execute_and_jump_async(branch.task_id, &who, &rb, None)
             .await.err().expect("血缘前驱跨不过 fork 时必须被守卫拦下");
-        assert!(e2.to_string().contains("20010008"), "实得 {}", e2.to_string());
+        assert!(e2.to_string().contains("无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务") && !e2.to_string().contains("2001000"), "实得 {}", e2.to_string());
     }
 
 }
