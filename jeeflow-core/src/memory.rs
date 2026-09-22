@@ -678,6 +678,10 @@ impl ProcessExtRepository for MemoryRepository {
 
     /// 委托查询（四判据见 `crate::surrogate`，与 sqlx 仓必须同答案，契约 06 §4.5 条款 5/6）。
     ///
+    /// 判序（条款 1.4 的正确形状，issues/123）：由 [`crate::surrogate::pick_surrogate`] 完成——
+    /// **每个作用域各自先按主键 id 取最新一条，再交四判据裁决那一条**；不得"先按 enabled/窗口/
+    /// 自委托滤掉候选、再从剩下的取最新"（那等于上一条窗内委托把用户后续设置永久盖掉）。
+    ///
     /// 修复前本方法的三处欠账（issues/116 §5）：
     /// - 形参 `_time` **直接忽略时间窗** → 同一份数据 SQL 仓判窗外、内存仓判命中，
     ///   换仓储就换答案（现改为把 `time` 传给判据，按 `yyyy-MM-dd HH:mm:ss` 归一比较）；
@@ -685,7 +689,7 @@ impl ProcessExtRepository for MemoryRepository {
     /// - 多条命中按 `HashMap` **随机遍历序取首条** → 违条款 1.4（SQL 侧 `ORDER BY id DESC`），
     ///   现统一由 [`crate::surrogate::pick_surrogate`] 取 id 最大者；
     /// - 缺空 processName 全流程兜底（只认 `process_name == process_name` 精确相等）→
-    ///   现"先精确、未命中再兜底全流程"两步查。
+    ///   现"精确作用域取最新一条交裁决，判否/无记录再看全流程作用域的最新一条"两腿查。
     fn get_surrogate(&self, operator: &str, process_name: &str, time: &str) -> JeeflowResult<Option<ProcessSurrogate>> {
         let s = self.surrogates.lock().unwrap();
         Ok(crate::surrogate::pick_surrogate(
@@ -847,6 +851,106 @@ mod tests {
                 exp.note, exp.operator, exp.process_name, exp.time, exp.hit_id, got
             );
         }
+    }
+
+    /// issues/123 A 格（内存仓）：同一 operator+processName 先落"窗内+enabled=1"，
+    /// 再落一条更"新"的无效记录（窗外已过期 / 窗外未开始 / enabled=0 / 脏值 2 / 自委托）
+    /// ⇒ 判否，**旧的那条有效记录不得复活**。sqlx 侧同数据同期望：
+    /// `jeeflow-repository-sqlx::test_mysql_i123_*`；共用矩阵见 `surrogate::parity`。
+    #[test]
+    fn test_get_surrogate_i123_newest_invalid_beats_older_valid() {
+        let repo = MemoryRepository::new();
+        let now = "2026-09-21 12:00:00";
+        let base = ProcessSurrogate {
+            id: 0, process_name: "leave".into(), operator: "zs".into(),
+            surrogate: "agent_old_valid".into(),
+            start_time: Some("2026-09-01 00:00:00".into()),
+            end_time: Some("2026-09-30 23:59:59".into()),
+            enabled: 1, create_time: None, create_user: None, update_time: None, update_user: None,
+        };
+        let mut older_valid = base.clone();
+        repo.save_surrogate(&mut older_valid).unwrap();
+
+        let cases: Vec<(ProcessSurrogate, &str)> = vec![
+            {
+                let mut s = base.clone();
+                s.surrogate = "agent_new_expired".into();
+                s.start_time = Some("2020-01-01 00:00:00".into());
+                s.end_time = Some("2020-12-31 23:59:59".into());
+                (s, "窗外（已过期）")
+            },
+            {
+                let mut s = base.clone();
+                s.surrogate = "agent_new_notstarted".into();
+                s.start_time = Some("2030-01-01 00:00:00".into());
+                s.end_time = Some("2030-12-31 23:59:59".into());
+                (s, "窗外（未开始）")
+            },
+            {
+                let mut s = base.clone();
+                s.surrogate = "agent_new_off".into();
+                s.enabled = 0;
+                (s, "enabled=0")
+            },
+            {
+                let mut s = base.clone();
+                s.surrogate = "agent_new_dirty".into();
+                s.enabled = 2;
+                (s, "enabled 脏值 2（只认 1）")
+            },
+            {
+                let mut s = base.clone();
+                s.surrogate = "zs".into();
+                (s, "自委托")
+            },
+        ];
+        for (mut fresh, why) in cases {
+            repo.save_surrogate(&mut fresh).unwrap();
+            assert!(fresh.id > older_valid.id, "新行 id 必须更大（用例前提：它是最新一条）");
+            let got = repo.get_surrogate("zs", "leave", now).unwrap().map(|h| h.id);
+            assert_eq!(
+                got, None,
+                "内存仓：最新一条{}（agent={} enabled={}）不生效时不得命中，旧的有效行（id={}）不得复活",
+                why, fresh.surrogate, fresh.enabled, older_valid.id,
+            );
+            repo.remove_surrogate(fresh.id).unwrap();
+        }
+    }
+
+    /// issues/123 B 格（内存仓）：作用域内**只有一条**"窗内+enabled=1" ⇒ 必须命中
+    /// （防 A 格的修法被写成恒不并入）。
+    #[test]
+    fn test_get_surrogate_i123_sole_valid_row_still_hits() {
+        let repo = MemoryRepository::new();
+        let mut only = ProcessSurrogate {
+            id: 0, process_name: "leave".into(), operator: "zs2".into(),
+            surrogate: "agent_only".into(),
+            start_time: Some("2026-09-01 00:00:00".into()),
+            end_time: Some("2026-09-30 23:59:59".into()),
+            enabled: 1, create_time: None, create_user: None, update_time: None, update_user: None,
+        };
+        repo.save_surrogate(&mut only).unwrap();
+        let hit = repo.get_surrogate("zs2", "leave", "2026-09-21 12:00:00").unwrap();
+        assert_eq!(
+            hit.as_ref().map(|h| h.surrogate.as_str()),
+            Some("agent_only"),
+            "唯一一条有效委托必须命中（内存仓精确腿）"
+        );
+
+        // 全流程腿同样要接住：唯一一条空 processName 的有效委托
+        let repo2 = MemoryRepository::new();
+        let mut only_all = only.clone();
+        only_all.id = 0;
+        only_all.operator = "zs3".into();
+        only_all.process_name = String::new();
+        only_all.surrogate = "agent_all_only".into();
+        repo2.save_surrogate(&mut only_all).unwrap();
+        let hit = repo2.get_surrogate("zs3", "leave", "2026-09-21 12:00:00").unwrap();
+        assert_eq!(
+            hit.as_ref().map(|h| h.surrogate.as_str()),
+            Some("agent_all_only"),
+            "唯一一条全流程有效委托必须命中（内存仓兜底腿）"
+        );
     }
 
     /// 「我已办」判据（issues/117，owner 2026-09-21 拍板三处一起改）：

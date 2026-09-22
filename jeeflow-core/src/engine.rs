@@ -2473,6 +2473,94 @@ mod tests {
         );
     }
 
+    /// issues/123 · 规范 06 §4.5 条款 1.4 的引擎侧 A 格：
+    /// 同一授权人先配"窗内+enabled=1"，再配一条更"新"的无效记录（四种无效形状各一格）
+    /// ⇒ 建单时代理人**不**并入，且旧的那条有效记录**不得复活**。
+    ///
+    /// 缺这条，把实现改回"先滤生效、再从剩下的取最新"也不会红——而那个写法正是
+    /// 13 栈在 L2-17/L2-18 上恒并入的根因（上一条窗内委托会把用户后续设置永久盖掉）。
+    #[tokio::test]
+    async fn test_surrogate_i123_newest_invalid_beats_older_valid() {
+        // (新那条的形状说明, 代理人, start, end, enabled)
+        let shapes: Vec<(&str, &str, Option<&str>, Option<&str>, i32)> = vec![
+            ("窗外（已过期）", "agentNewExpired",
+                Some("2000-01-01 00:00:00"), Some("2001-01-01 00:00:00"), 1),
+            ("窗外（未开始）", "agentNewNotStarted",
+                Some("2999-01-01 00:00:00"), Some("2999-12-31 23:59:59"), 1),
+            ("enabled=0", "agentNewDisabled", None, None, 0),
+            ("enabled 脏值 2（契约：只认 1）", "agentNewDirty", None, None, 2),
+            ("自委托（代理人就是授权人本人）", "leader", None, None, 1),
+        ];
+        for (why, agent, start, end, enabled) in shapes {
+            let (engine, repo) = make_surrogate_engine();
+            let did = save_define(&repo, "i123-old", &load_flow("01-simple"));
+            // 旧：窗内 + enabled=1（宽窗，与时区/时钟基准无关）
+            add_surrogate_row(&repo, "leader", "simple", "agentOldValid",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), 1);
+            // 新：id 更大 ⇒ 由它裁决
+            let new_id = add_surrogate_row(&repo, "leader", "simple", agent, start, end, enabled);
+            assert!(new_id > 0, "新行须落库（用例前提：它是该作用域的最新一条）");
+
+            let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+            let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+                .into_iter().find(|t| t.task_name == "apply").unwrap();
+            engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+            let task1 = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+                .into_iter().find(|t| t.task_name == "task1").unwrap();
+            assert_eq!(
+                persisted_actors(&repo, task1.task_id),
+                vec!["leader".to_string()],
+                "{why} ⇒ 最新一条不生效时不得并入，更不得复活旧的那条 agentOldValid"
+            );
+        }
+    }
+
+    /// issues/123 · B 格：作用域内**只有一条**"窗内 + enabled=1" ⇒ 代理人必须并入
+    /// （防 A 格的修法被写成恒不并入）。
+    #[tokio::test]
+    async fn test_surrogate_i123_sole_valid_row_still_applied() {
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "i123-only", &load_flow("01-simple"));
+        add_surrogate_row(&repo, "leader", "simple", "agentOnly",
+            Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), 1);
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+        let task1 = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "task1").unwrap();
+        assert_eq!(
+            persisted_actors(&repo, task1.task_id),
+            vec!["agentOnly".to_string(), "leader".to_string()],
+            "唯一一条窗内 enabled=1 的委托必须并入（授权人保留）"
+        );
+    }
+
+    /// issues/123 · 精确作用域最新一条判否后**仍要看全流程作用域的最新一条**（不得判否即止）：
+    /// 精确那条已过期 ⇒ 兜底到全流程委托的代理人。
+    #[tokio::test]
+    async fn test_surrogate_i123_exact_invalid_still_falls_back_to_global_scope() {
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "i123-fb", &load_flow("01-simple"));
+        add_surrogate_row(&repo, "leader", "simple", "agentExpiredExact",
+            Some("2000-01-01 00:00:00"), Some("2001-01-01 00:00:00"), 1);
+        add_surrogate_row(&repo, "leader", "", "agentGlobalFallback",
+            Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), 1);
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+        let task1 = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "task1").unwrap();
+        assert_eq!(
+            persisted_actors(&repo, task1.task_id),
+            vec!["agentGlobalFallback".to_string(), "leader".to_string()],
+            "精确作用域判否后必须落到全流程作用域（Java 同名用例 testSurrogateCrudAndGet 的形状）"
+        );
+    }
+
     fn clock120_fixed() -> String {
         crate::clock::testclock::at(48)
     }

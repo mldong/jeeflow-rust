@@ -72,46 +72,42 @@ impl SqlxRepository {
         &self.pool
     }
 
-    /// 委托查询单腿 SQL（四判据，契约 06 §4.5 条款 5；与内存仓
-    /// `jeeflow-core/src/memory.rs::get_surrogate` 共用同一套判据语义，条款 6）：
+    /// 委托查询单腿 SQL（规范 06 §4.5 条款 1.4 的正确判序，issues/123）：
+    /// **只按 `operator` + 作用域取主键 id 最新的一条**（`ORDER BY id DESC LIMIT 1`），
+    /// 不带任何生效判据过滤——enabled / 时间窗 / 自委托一律不参与择优，
+    /// 全部交给 `jeeflow_core::surrogate::surrogate_hit` 在**那一条**上裁决
+    /// （见 [`Self::get_surrogate`]）。
     ///
-    /// - 判据①：`process_name` 为空即"全部流程"兜底腿 → `IS NULL OR = ''`
-    ///   （修复前本栈只有 `process_name = ?` 精确查，NULL 行永远查不到）；
-    /// - 判据②：`start_time <= now <= end_time`，列值 NULL = 该侧不限；
-    ///   `time` 传空串 = 不判窗（与内存仓 `normalize_time_text(None)` 同语义）；
-    /// - 判据③：`surrogate <> operator` 自委托过滤（修复前缺失，会命中"自己委托给自己"）；
-    /// - 判据④：`enabled = 1`（只有 1 生效）；
-    /// - 条款 1.4：多条同时命中取 **id 最大**（`ORDER BY id DESC LIMIT 1`）。
-    async fn query_surrogate(
+    /// ⚠️ 反例（修复前的形状，也是 13 栈 L2-17/L2-18 恒并入的成因）：
+    /// SQL 里先写 `AND enabled = 1 AND surrogate <> operator` + 窗口条件，剩下的才排序取最新。
+    /// 那等价于"同一授权人历史上只要留过一条窗内且 enabled=1 的记录，之后用户新建的
+    /// 窗外 / enabled=0 / 脏值 / 自委托记录全都判不动它"⇒ 代理人被永久并入。
+    ///
+    /// 保留的判据只有作用域（条款 5 判据①）：
+    /// - `process_name` 非空 → 精确腿 `process_name = ?`；
+    /// - `process_name` 为空 → 全流程兜底腿 `process_name IS NULL OR = ''`。
+    async fn query_newest_surrogate(
         &self,
         operator: &str,
         process_name: &str,
-        time: &str,
     ) -> JeeflowResult<Option<ProcessSurrogate>> {
         let with_name = !process_name.is_empty();
-        let with_time = !time.trim().is_empty();
         let mut sql = String::from(
             "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
                     create_time, create_user, update_time, update_user \
              FROM wf_process_surrogate \
-             WHERE operator = ? AND enabled = 1 AND surrogate <> operator",
+             WHERE operator = ?",
         );
         if with_name {
             sql.push_str(" AND process_name = ?");
         } else {
             sql.push_str(" AND (process_name IS NULL OR process_name = '')");
         }
-        if with_time {
-            sql.push_str(" AND (start_time IS NULL OR start_time <= ?) AND (end_time IS NULL OR end_time >= ?)");
-        }
         sql.push_str(" ORDER BY id DESC LIMIT 1");
 
         let mut q = sqlx::query(&sql).bind(operator);
         if with_name {
             q = q.bind(process_name);
-        }
-        if with_time {
-            q = q.bind(time).bind(time);
         }
         let row = q
             .fetch_optional(&self.pool)
@@ -1393,17 +1389,34 @@ impl ProcessExtRepository for SqlxRepository {
         })
     }
 
-    /// 委托查询（两步查，契约 06 §4.5 条款 5 判据①）：先按当前流程名精确查，
-    /// 未命中再查"全流程委托"（`process_name IS NULL OR process_name = ''`）兜底。
-    /// 单腿 SQL 见 [`Self::query_surrogate`]（四判据 + `ORDER BY id DESC LIMIT 1`）。
+    /// 委托查询（规范 06 §4.5 条款 1.4 + issues/123 的正确判序）：
+    /// **每个作用域各自先按主键 id 取最新一条**（[`Self::query_newest_surrogate`]，
+    /// SQL 不带任何生效判据过滤），**再由四判据裁决那一条**
+    /// （[`jeeflow_core::surrogate::surrogate_hit`]，与内存仓共用同一份判据 ⇒ 条款 6 双仓同答案）。
+    ///
+    /// 精确作用域那条判否（或该作用域压根没有记录）时**仍要看全流程作用域的最新一条**，
+    /// 不得判否即止（Java 参考实现 `JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet`
+    /// 钉的正是"精确已过期 → 兜底全流程委托"）。
     fn get_surrogate(&self, operator: &str, process_name: &str, time: &str) -> JeeflowResult<Option<ProcessSurrogate>> {
         self.block_on(async {
             if !process_name.is_empty() {
-                if let Some(hit) = self.query_surrogate(operator, process_name, time).await? {
-                    return Ok(Some(hit));
+                if let Some(newest) = self.query_newest_surrogate(operator, process_name).await? {
+                    if jeeflow_core::surrogate::surrogate_hit(
+                        &newest, operator, process_name, false, time,
+                    ) {
+                        return Ok(Some(newest));
+                    }
                 }
             }
-            self.query_surrogate(operator, "", time).await
+            let global = match self.query_newest_surrogate(operator, "").await? {
+                Some(g) => g,
+                None => return Ok(None),
+            };
+            if jeeflow_core::surrogate::surrogate_hit(&global, operator, process_name, true, time) {
+                Ok(Some(global))
+            } else {
+                Ok(None)
+            }
         })
     }
 }
@@ -2464,15 +2477,23 @@ mod tests {
             assert_eq!(define.id, define_id);
 
             // ① 精确腿（模型名）② 全流程兜底腿（库里 process_name = NULL）
-            // ③ define.name 侧诱饵（不得命中）④ 停用（不得命中）
-            seed_surrogate(&pool, 911201, Some("rust_i116_model"), "leader", "agentOnModelName",
-                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+            // ③ define.name 侧诱饵（不得命中）④ 停用
+            //
+            // ⚠️ issues/123 后 id 序**有语义**：同一 operator+processName 作用域内由
+            // **最新一条（id 最大）**交四判据裁决。停用行 ④ 与有效行 ① 同属
+            // `leader`@`rust_i116_model`，所以停用行必须落在**更小 id**（911201）上——
+            // 它是"旧的一条停用"，被更新的有效设置正确盖住；若把它排成最新一条，按规范本用例
+            // 的 ①② 两条主断言必然读成"不并入"（那才是修好后的正确行为，见
+            // `test_mysql_i123_newest_invalid_beats_older_valid`）。
+            // "停用不生效"本身由判据矩阵（`surrogate::parity` 的 zhouqi@off / n9off 两格）钉。
+            seed_surrogate(&pool, 911201, Some("rust_i116_model"), "leader", "agentDisabled",
+                None, None, Some(0)).await;
             seed_surrogate(&pool, 911202, None, "applicant", "agentAllFlow",
                 Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
             seed_surrogate(&pool, 911203, Some("rust_i116_decoy_define"), "leader", "agentOnDefineName",
                 None, None, Some(1)).await;
-            seed_surrogate(&pool, 911204, Some("rust_i116_model"), "leader", "agentDisabled",
-                None, None, Some(0)).await;
+            seed_surrogate(&pool, 911204, Some("rust_i116_model"), "leader", "agentOnModelName",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
 
             let mk_engine = |auto_on: bool| {
                 let ctx = jeeflow_core::context::ServiceContext::new()
@@ -2527,6 +2548,192 @@ mod tests {
             // Cleanup
             clean_by_define(&pool, define_id).await;
             sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911201 AND 911219")
+                .execute(&pool).await.unwrap();
+        });
+    }
+
+    /// issues/123 · 规范 06 §4.5 条款 1.4 的 **sqlx 路**（内存路见
+    /// `jeeflow-core/src/memory.rs::test_get_surrogate_i123_*`；共用判据矩阵见
+    /// `jeeflow_core::surrogate::parity`，两侧同跑见 `test_mysql_i116_surrogate_query_parity`）。
+    ///
+    /// A 格：同一 operator+processName 先落"窗内+enabled=1"，再落一条更"新"的无效记录
+    /// （窗外已过期 / 窗外未开始 / enabled=0 / enabled 脏值 2 / 自委托 五形）⇒ 建单时代理人
+    /// **不**并入，且旧的那条有效记录**不得复活**。
+    ///
+    /// 旧形状（SQL 里先 `AND enabled = 1 AND surrogate <> operator` + 窗口条件，剩下的才
+    /// `ORDER BY id DESC`）在这五格上全部读成"命中旧的那条"⇒ 本用例必红；
+    /// 那正是 13 张交付物在 L2-17/L2-18 上恒并入的成因。
+    #[test]
+    fn test_mysql_i123_newest_invalid_beats_older_valid() {
+        if skip_mysql() { return; }
+        const SEG: &str = "id BETWEEN 911301 AND 911309";
+        const PROC: &str = "rust_i123";
+        const OLD_VALID_AGENT: &str = "i123OldValidAgent";
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            sqlx::query(&format!("DELETE FROM wf_process_surrogate WHERE {}", SEG))
+                .execute(&pool).await.unwrap();
+
+            // (operator, 新行的 surrogate, start, end, enabled, 说明)
+            // 时间基准走引擎钟 `current_time_str()`（issues/120），窗宽 2000~2999 与时区无关。
+            let now = jeeflow_core::model::current_time_str();
+            let wide = (Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"));
+            let cases: Vec<(&str, &str, Option<&str>, Option<&str>, Option<i32>, &str)> = vec![
+                ("i123out",     "i123NewExpired", Some("2020-01-01 00:00:00"), Some("2020-12-31 23:59:59"), Some(1), "窗外（已过期）"),
+                ("i123future",  "i123NewFuture",  Some("2030-01-01 00:00:00"), Some("2030-12-31 23:59:59"), Some(1), "窗外（未开始）"),
+                ("i123off",     "i123NewOff",     wide.0, wide.1, Some(0), "enabled=0"),
+                ("i123dirty",   "i123NewDirty",   wide.0, wide.1, Some(2), "enabled 脏值 2（契约：只认 1）"),
+                ("i123self",    "i123self",       wide.0, wide.1, Some(1), "自委托（surrogate = operator）"),
+            ];
+            for (op, agent, start, end, enabled, why) in cases {
+                // 旧：窗内 + enabled=1（宽窗，与时区/时钟基准无关）
+                seed_surrogate(&pool, 911301, Some(PROC), op, OLD_VALID_AGENT,
+                    wide.0, wide.1, Some(1)).await;
+                // 新：id 更大 ⇒ 由它裁决
+                seed_surrogate(&pool, 911302, Some(PROC), op, agent, start, end, enabled).await;
+
+                let repo = SqlxRepository::new(pool.clone());
+                let got = repo.get_surrogate(op, PROC, &now).unwrap().map(|h| h.id);
+                assert_eq!(
+                    got, None,
+                    "SQL 仓：最新一条 {} ⇒ 不得命中，更不得复活旧的窗内有效行（id=911301 agent={}）",
+                    why, OLD_VALID_AGENT,
+                );
+
+                sqlx::query(&format!("DELETE FROM wf_process_surrogate WHERE {}", SEG))
+                    .execute(&pool).await.unwrap();
+            }
+        });
+    }
+
+    /// ↑ 的窗口腿（判据②）单独一条：SQL 侧不判窗时窗内行**必须**命中，
+    /// 钉住"最新一条判否"不是因为我把窗口条件整个删掉。
+    #[test]
+    fn test_mysql_i123_newest_out_of_window_beats_older_valid_with_time() {
+        if skip_mysql() { return; }
+        const PROC: &str = "rust_i123";
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911311 AND 911319")
+                .execute(&pool).await.unwrap();
+            // 旧：窗内有效（宽窗）；新：整扇窗在过去
+            seed_surrogate(&pool, 911311, Some(PROC), "i123win", "i123OldValidAgent",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+            seed_surrogate(&pool, 911312, Some(PROC), "i123win", "i123NewExpired",
+                Some("2020-01-01 00:00:00"), Some("2020-12-31 23:59:59"), Some(1)).await;
+
+            let repo = SqlxRepository::new(pool.clone());
+            let now = jeeflow_core::model::current_time_str();
+            assert_eq!(
+                repo.get_surrogate("i123win", PROC, &now).unwrap().map(|h| h.id),
+                None,
+                "SQL 仓：最新一条窗外 ⇒ 判否，旧窗内行不得复活",
+            );
+            // B 格：作用域内只有一条窗内 enabled=1 ⇒ 必须命中（防修成恒不并）
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911312 AND 911312")
+                .execute(&pool).await.unwrap();
+            assert_eq!(
+                repo.get_surrogate("i123win", PROC, &now).unwrap().map(|h| h.id),
+                Some(911311),
+                "SQL 仓 B 格：唯一一条窗内有效委托必须命中",
+            );
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911311 AND 911319")
+                .execute(&pool).await.unwrap();
+        });
+    }
+
+    /// issues/123 A/B 格的**建单落库铁证**（真机 `wf_process_task_actor` 行）：
+    /// 最新一条无效 ⇒ 参与者表只有原人；只有一条窗内 enabled=1 ⇒ 代理人在参与者表里。
+    /// 走 `test_mysql_i116_surrogate_agent_lands_in_task_actor` 同一条引擎收口路径。
+    #[test]
+    fn test_mysql_i123_newest_invalid_not_merged_into_task_actor() {
+        if skip_mysql() { return; }
+        const DEFINE_ID: i64 = 901151;
+        const PROC: &str = "rust_i123_model";
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            clean_by_define(&pool, DEFINE_ID).await;
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911321 AND 911339")
+                .execute(&pool).await.unwrap();
+
+            let mut define = ProcessDefine {
+                id: DEFINE_ID, name: PROC.into(), display_name: "i123 委托判序".into(),
+                define_type: "approval".into(), state: 1,
+                content: format!(r#"{{"name":"{}","displayName":"i123","type":"approval",
+                    "nodes":[{{"id":"start","type":"snaker:start","text":{{"value":"s"}}}},
+                             {{"id":"apply","type":"snaker:task","text":{{"value":"申请"}},"properties":{{"assignee":"applicant"}}}},
+                             {{"id":"task1","type":"snaker:task","text":{{"value":"上级审批"}},"properties":{{"assignee":"leader"}}}},
+                             {{"id":"end","type":"snaker:end","text":{{"value":"e"}}}}],
+                    "edges":[{{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"}},
+                             {{"id":"e2","sourceNodeId":"apply","targetNodeId":"task1"}},
+                             {{"id":"e3","sourceNodeId":"task1","targetNodeId":"end"}}]}}"#, PROC)
+                    .into_bytes(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            repo.save_define(&mut define).unwrap();
+
+            let mk_engine = || {
+                let ctx = jeeflow_core::context::ServiceContext::new()
+                    .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+                    .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+                    .with_id_generator(Arc::new(jeeflow_core::id_gen::DefaultIdGenerator::new(1)));
+                jeeflow_core::engine::JeeflowEngineImpl::new(ctx)
+            };
+
+            // 发起 + 办结 apply ⇒ 返回推进建出的 task1（参与者 = leader）
+            async fn i123_advance_to_task1(
+                engine: &jeeflow_core::engine::JeeflowEngineImpl,
+                repo: &Arc<SqlxRepository>,
+                define_id: i64,
+            ) -> i64 {
+                let inst = engine
+                    .start_async(define_id, "applicant", &jeeflow_core::json::FlowData::new())
+                    .await
+                    .expect("建单不得因委托能力被打断");
+                let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+                    .into_iter().find(|t| t.task_name == "apply").expect("应有 apply 任务");
+                engine.execute_task_async(apply.task_id, "applicant", &jeeflow_core::json::FlowData::new())
+                    .await.unwrap();
+                repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+                    .into_iter().find(|t| t.task_name == "task1").expect("推进应建 task1").task_id
+            }
+
+            // ── A：先窗内有效，再一条更"新"的停用 ⇒ 参与者表只有 leader ──
+            seed_surrogate(&pool, 911321, Some(PROC), "leader", "i123OldValidAgent",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+            seed_surrogate(&pool, 911322, Some(PROC), "leader", "i123NewOff",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(0)).await;
+            let engine_a = mk_engine();
+            let task_id = i123_advance_to_task1(&engine_a, &repo, DEFINE_ID).await;
+            assert_eq!(
+                actor_rows(&pool, task_id).await,
+                vec!["leader".to_string()],
+                "123 A 格：最新一条 enabled=0 ⇒ 建单不并入，旧的窗内有效行也不得复活",
+            );
+            clean_by_define(&pool, DEFINE_ID).await;
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911321 AND 911339")
+                .execute(&pool).await.unwrap();
+            // clean_by_define 把定义行也删了 ⇒ B 段重新落一次（同 id 同内容）
+            repo.save_define(&mut define).unwrap();
+
+            // ── B：作用域内只有一条窗内 enabled=1 ⇒ 代理人必须真的落进参与者表 ──
+            seed_surrogate(&pool, 911331, Some(PROC), "leader", "i123OnlyAgent",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+            let engine_b = mk_engine();
+            let task_id = i123_advance_to_task1(&engine_b, &repo, DEFINE_ID).await;
+            assert_eq!(
+                actor_rows(&pool, task_id).await,
+                vec!["i123OnlyAgent".to_string(), "leader".to_string()],
+                "123 B 格：唯一一条窗内 enabled=1 的委托必须并入（防修成恒不并）",
+            );
+
+            clean_by_define(&pool, DEFINE_ID).await;
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 911321 AND 911339")
                 .execute(&pool).await.unwrap();
         });
     }

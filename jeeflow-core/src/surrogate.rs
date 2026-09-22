@@ -27,14 +27,22 @@
 //!    不得抛"未配置扩展仓储"打断建单；仓储自身报错（表未建等）同样只记 stderr 后跳过。
 //!
 //! 另含**委托查询四判据**（条款 5）的本栈共用谓词 [`surrogate_hit`] /
-//! [`normalize_time_text`] / [`pick_surrogate`]——内存仓（`memory.rs`）与 sqlx 仓
-//! 对同一份数据必须给出同一结论（条款 6），两条路径共用一份判据即本模块存在的另一半理由：
+//! [`surrogate_effective`] / [`newest_in_scope`] / [`normalize_time_text`] / [`pick_surrogate`]
+//! ——内存仓（`memory.rs`）与 sqlx 仓对同一份数据必须给出同一结论（条款 6），
+//! 两条路径共用一份判据即本模块存在的另一半理由：
 //!
-//! - 判据① 空 `processName` 全流程兜底：先按当前流程名精确查，未命中再查
-//!   `process_name IS NULL OR process_name = ''`；
+//! - 判据① 空 `processName` 全流程兜底：作用域分两腿——精确流程名一腿、
+//!   `process_name IS NULL OR process_name = ''` 一腿；
 //! - 判据② 时间窗 `start_time <= now <= end_time`，边界为 NULL/空/不可解析 → 该侧不限；
 //! - 判据③ 自委托过滤 `surrogate <> operator`；
 //! - 判据④ `enabled` 只有 1 生效，脏值/NULL 不得当启用。
+//!
+//! ⚠️ **判序**（条款 1.4 的正确形状，issues/123）：**每个作用域各自先按主键 id 取「最新一条」**
+//! （[`newest_in_scope`]，不带任何生效判据过滤），**再由四判据裁决这一条**
+//! （[`surrogate_effective`]）。反过来写——先按 enabled/窗口/自委托把候选滤掉、剩下的才取最新——
+//! 等价于「同一授权人历史上只要留过一条窗内且 enabled=1 的记录，之后新建的窗外/停用/脏值/
+//! 自委托记录全都判不动它」⇒ 代理人被**永久并入**，用户随后改设置一律不算数。
+//! 精确作用域那条判否后**仍要看全流程作用域的最新一条**（不得判否即止）。
 //!
 //! 修复前本栈的欠账（issues/116 §5）：sqlx 仓缺判据①兜底与判据③；内存仓形参 `_time`
 //! 直接忽略判据②、无判据③，且多条命中按 `HashMap` 随机序取"遍历首条"（违条款 1.4）。
@@ -83,7 +91,11 @@ pub fn normalize_time_text(s: &str) -> Option<String> {
     Some(format!("{} {}:{}", date, hms, sec))
 }
 
-/// 委托是否命中「四判据」（条款 5）。
+/// 委托是否命中「四判据」（条款 5）+ 判据① 的作用域归属。
+///
+/// 单条裁决口径见 [`surrogate_effective`]（四判据本体）与 [`surrogate_in_scope`]（作用域腿）。
+/// ⚠️ 调用方**不得**把本谓词当作"候选过滤器"再从中取最新——那是 issues/123 点名的错形状；
+/// 正确顺序是 [`newest_in_scope`] 先取该作用域的最新一条，再用本谓词裁决那一条。
 ///
 /// - `operator`：待查授权人；
 /// - `process_name`：当前流程名（判据①精确腿）；
@@ -100,23 +112,39 @@ pub fn surrogate_hit(
     all_flows: bool,
     time: &str,
 ) -> bool {
-    if sg.operator != operator {
-        return false;
+    sg.operator == operator
+        && surrogate_in_scope(sg, process_name, all_flows)
+        && surrogate_effective(sg, operator, time)
+}
+
+/// 判据① 的作用域归属：精确腿认 `process_name == 当前流程名`；
+/// 兜底腿只认 `process_name` 为空（库里 NULL 已由 sqlx 侧 `map_surrogate` 归一成 ""）。
+pub fn surrogate_in_scope(sg: &ProcessSurrogate, process_name: &str, all_flows: bool) -> bool {
+    if all_flows {
+        sg.process_name.is_empty()
+    } else {
+        sg.process_name == process_name
     }
+}
+
+/// 四判据（条款 5 + issues/123 §1）的**单条裁决**：本条委托此刻对该授权人是否生效。
+///
+/// ① `enabled` **严格等于整数 1**（0 / 2 等脏值 / NULL 折成的 0 都算不生效）；
+/// ② 被委托人非空且不等于授权人本人（自委托不新增、不重复）；
+/// ③ `time` 不可解析（空串）⇒ 不比窗；否则 `start_time` 缺失 = 下界不限、
+///    `end_time` 缺失 = 上界不限，需 `start <= time <= end`。
+///
+/// ⚠️ 本方法只裁决**单条**，不做多条择优——调用方必须先按 id 选出「最新一条」再问它
+/// （规范 06 §4.5 条款 1.4，[`newest_in_scope`]）。SQL 仓与内存仓必须走同一份判据
+/// （条款 6 要求双仓同答案）。
+pub fn surrogate_effective(sg: &ProcessSurrogate, operator: &str, time: &str) -> bool {
     // 判据④：只有 1 生效（脏值/0/其它整数都算停用）
     if sg.enabled != 1 {
         return false;
     }
-    // 判据③：自委托过滤（自己委托给自己不生效）
-    if sg.surrogate == sg.operator || sg.surrogate.is_empty() {
-        return false;
-    }
-    // 判据①：精确腿 vs 全流程兜底腿（NULL 归一为 ""，见 sqlx map_surrogate）
-    if all_flows {
-        if !sg.process_name.is_empty() {
-            return false;
-        }
-    } else if sg.process_name != process_name {
+    // 判据③：自委托过滤（自己委托给自己不生效；空代理人同判否——SQL 侧 `surrogate <> operator`
+    // 对 NULL 求值为 UNKNOWN，也不参与命中）
+    if sg.surrogate.is_empty() || sg.surrogate == operator {
         return false;
     }
     // 判据②：时间窗，边界缺失/不可解析 → 该侧不限
@@ -135,10 +163,33 @@ pub fn surrogate_hit(
     true
 }
 
-/// 条款 1.4：多条同时命中**取主键 id 最大**（最新一条）。
+/// 条款 1.4（issues/123 修正后的判序）：在**一个作用域内**按主键 id 取**最新一条**，
+/// 只排序取首行，**不带任何生效判据过滤**（enabled / 时间窗 / 自委托都不参与择优）。
 ///
 /// 内存仓底层是 `HashMap`，遍历序随机——不显式取最大就会出现"同一份数据两次调用返回
 /// 不同行"，且与 SQL 侧 `ORDER BY id DESC LIMIT 1` 分叉。
+pub fn newest_in_scope<'a, I>(
+    candidates: I,
+    operator: &str,
+    process_name: &str,
+    all_flows: bool,
+) -> Option<ProcessSurrogate>
+where
+    I: Iterator<Item = &'a ProcessSurrogate>,
+{
+    candidates
+        .filter(|sg| sg.operator == operator)
+        .filter(|sg| surrogate_in_scope(sg, process_name, all_flows))
+        .max_by_key(|sg| sg.id)
+        .cloned()
+}
+
+/// 委托查询主漏斗（规范 06 §4.5 条款 1.4 + issues/123）：
+/// **每个作用域各自先按 id 取最新一条，再由四判据裁决这一条**。
+///
+/// 精确作用域那条记录判否（或该作用域压根没有记录）时，**仍要看全流程作用域的最新一条**——
+/// 不得判否即止（Java 参考实现 `JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet`
+/// 钉的正是"精确已过期 → 兜底全流程委托"）。
 pub fn pick_surrogate<'a, I>(
     candidates: I,
     operator: &str,
@@ -148,22 +199,17 @@ pub fn pick_surrogate<'a, I>(
 where
     I: Iterator<Item = &'a ProcessSurrogate> + Clone,
 {
-    // 判据①：先按当前流程名精确查
+    // 判据① 精确腿：该流程名作用域内的最新一条交裁决
     if !process_name.is_empty() {
-        let exact = candidates
-            .clone()
-            .filter(|sg| surrogate_hit(sg, operator, process_name, false, time))
-            .max_by_key(|sg| sg.id)
-            .cloned();
-        if exact.is_some() {
-            return exact;
+        if let Some(newest) = newest_in_scope(candidates.clone(), operator, process_name, false) {
+            if surrogate_hit(&newest, operator, process_name, false, time) {
+                return Some(newest);
+            }
         }
     }
-    // 未命中 → 全流程委托兜底（process_name 为空）
-    candidates
-        .filter(|sg| surrogate_hit(sg, operator, process_name, true, time))
-        .max_by_key(|sg| sg.id)
-        .cloned()
+    // 全流程委托腿（process_name 为空）：同样只认自己作用域里的最新一条
+    let global = newest_in_scope(candidates, operator, process_name, true)?;
+    surrogate_hit(&global, operator, process_name, true, time).then_some(global)
 }
 
 /// 对**参与者快照**逐个查生效委托，返回并入被委托人后的集合（顺序稳定：原人原序在前，
@@ -240,9 +286,11 @@ pub fn apply_surrogate_to_task(
 /// 内存仓（`memory.rs` 测试）与 sqlx 真机仓（`jeeflow-repository-sqlx` 测试）跑
 /// **同一张判据矩阵**——两侧各写一套断言迟早漂移（Go 栈同思路建了 `internal/surrparity`）。
 ///
-/// 覆盖四判据（条款 5）+ "多条命中取 id 最大"（条款 1.4）。
+/// 覆盖四判据（条款 5）+ "每作用域取最新一条再裁决"（条款 1.4，issues/123）。
 /// 每行只服务一个判据，并用**不同授权人**隔离"全流程兜底腿"的串扰：
 /// 只有 `zhangsan` / `lisi` 配了全流程委托，其余授权人的负例不会被兜底腿"救回来"。
+/// id 段 911101~911114 是 issues/116 的原始矩阵；911121 起是 issues/123 补的
+/// 「同一作用域内新旧两条并存、最新那条无效」矩阵。
 pub mod parity {
     use crate::model::ProcessSurrogate;
 
@@ -293,6 +341,22 @@ pub mod parity {
         SgRow { id: 911112, process_name: Some("off"),      operator: "zhouqi", surrogate: "agent_null112",  start_time: None, end_time: None, enabled: None,      note: "enabled 为 NULL，不得当启用" },
         SgRow { id: 911113, process_name: Some("selfdel"),  operator: "zhouqi", surrogate: "zhouqi",         start_time: None, end_time: None, enabled: Some(1),    note: "自己委托给自己" },
         SgRow { id: 911114, process_name: Some("leave"),    operator: "zhaoliu",surrogate: "agent_zl114",    start_time: None, end_time: None, enabled: Some(1),    note: "别人的 leave 委托" },
+        // ── issues/123：同一作用域内「旧的有效 + 新的无效」两条并存，必须由**最新一条**裁决 ──
+        // 每格都先落一条窗内 enabled=1 的旧行，再落一条 id 更大的无效行（四种无效形状各一格）。
+        // 判据①腿按 operator 隔离：这四位授权人都**没有**全流程委托行，兜底腿救不回来。
+        SgRow { id: 911121, process_name: Some("m123"), operator: "n9out",   surrogate: "agent_ok121",     start_time: Some("2026-09-01 00:00:00"), end_time: Some("2026-09-30 23:59:59"), enabled: Some(1), note: "123 旧行：窗内 + enabled=1" },
+        SgRow { id: 911122, process_name: Some("m123"), operator: "n9out",   surrogate: "agent_fut122",    start_time: Some("2030-01-01 00:00:00"), end_time: Some("2030-12-31 23:59:59"), enabled: Some(1), note: "123 新行：窗外（未开始）→ 由它裁决" },
+        SgRow { id: 911123, process_name: Some("m123"), operator: "n9off",   surrogate: "agent_ok123",     start_time: Some("2026-09-01 00:00:00"), end_time: Some("2026-09-30 23:59:59"), enabled: Some(1), note: "123 旧行：窗内 + enabled=1" },
+        SgRow { id: 911124, process_name: Some("m123"), operator: "n9off",   surrogate: "agent_off124",    start_time: Some("2026-09-01 00:00:00"), end_time: Some("2026-09-30 23:59:59"), enabled: Some(0), note: "123 新行：enabled=0" },
+        SgRow { id: 911125, process_name: Some("m123"), operator: "n9dirty", surrogate: "agent_ok125",     start_time: Some("2026-09-01 00:00:00"), end_time: Some("2026-09-30 23:59:59"), enabled: Some(1), note: "123 旧行：窗内 + enabled=1" },
+        SgRow { id: 911126, process_name: Some("m123"), operator: "n9dirty", surrogate: "agent_dirty126",  start_time: Some("2026-09-01 00:00:00"), end_time: Some("2026-09-30 23:59:59"), enabled: Some(2), note: "123 新行：enabled 脏值 2（只认 1）" },
+        SgRow { id: 911127, process_name: Some("m123"), operator: "n9self",  surrogate: "agent_ok127",     start_time: Some("2026-09-01 00:00:00"), end_time: Some("2026-09-30 23:59:59"), enabled: Some(1), note: "123 旧行：窗内 + enabled=1" },
+        SgRow { id: 911128, process_name: Some("m123"), operator: "n9self",  surrogate: "n9self",          start_time: Some("2026-09-01 00:00:00"), end_time: Some("2026-09-30 23:59:59"), enabled: Some(1), note: "123 新行：自委托" },
+        // B 格（防"改成恒不并入"）：作用域内只有一条窗内 enabled=1 ⇒ 必须命中
+        SgRow { id: 911129, process_name: Some("m123"), operator: "onlyvalid", surrogate: "agent_only129", start_time: Some("2026-09-01 00:00:00"), end_time: Some("2026-09-30 23:59:59"), enabled: Some(1), note: "123 B 格：唯一一条有效委托" },
+        // 全流程腿同样要"先取最新再裁决"：旧的有效 + 新的停用两条都在空 process_name 作用域里
+        SgRow { id: 911130, process_name: None,         operator: "g9new",   surrogate: "agent_gok130",    start_time: None, end_time: None, enabled: Some(1), note: "123 旧行：全流程作用域内有效" },
+        SgRow { id: 911131, process_name: Some(""),     operator: "g9new",   surrogate: "agent_goff131",   start_time: None, end_time: None, enabled: Some(0), note: "123 新行：全流程作用域内最新那条 enabled=0（库里空串）" },
     ];
 
     pub const EXPECT: &[Expect] = &[
@@ -311,6 +375,14 @@ pub mod parity {
         Expect { operator: "sunwu",    process_name: "pastwin",  time: "",  hit_id: Some(911107), note: "time 传空串 = 不判窗（两仓同语义）" },
         Expect { operator: "zhouqi",   process_name: "off",      time: NOW, hit_id: None,         note: "判据④ enabled=0 / NULL 均不得当启用" },
         Expect { operator: "zhouqi",   process_name: "selfdel",  time: NOW, hit_id: None,         note: "判据③ 自委托过滤 surrogate <> operator" },
+        // ── issues/123：同一作用域内「旧有效 + 新无效」⇒ 判否，且旧的那条**不得复活** ──
+        Expect { operator: "n9out",    process_name: "m123", time: NOW, hit_id: None,         note: "123 最新一条窗外 ⇒ 不命中，也不得回落到旧的窗内行" },
+        Expect { operator: "n9off",    process_name: "m123", time: NOW, hit_id: None,         note: "123 最新一条 enabled=0 ⇒ 不命中，旧的窗内行不得复活" },
+        Expect { operator: "n9dirty",  process_name: "m123", time: NOW, hit_id: None,         note: "123 最新一条 enabled 脏值 2 ⇒ 不命中，旧的窗内行不得复活" },
+        Expect { operator: "n9self",   process_name: "m123", time: NOW, hit_id: None,         note: "123 最新一条自委托 ⇒ 不命中，旧的窗内行不得复活" },
+        Expect { operator: "onlyvalid",process_name: "m123", time: NOW, hit_id: Some(911129), note: "123 B 格：作用域内只有一条有效委托 ⇒ 必须命中（防写成恒不并）" },
+        Expect { operator: "g9new",    process_name: "m123", time: NOW, hit_id: None,         note: "123 全流程腿同样按最新一条裁决（新那条 enabled=0，旧的有效行不得复活）" },
+        Expect { operator: "g9new",    process_name: "m123", time: "",  hit_id: None,         note: "123 time 传空串也不救：判否来自 enabled=0，与窗口无关" },
     ];
 
     /// 装载到内存仓（`process_name`/`enabled` 的 NULL 归一为 ""/0，判据结论不变）。
@@ -436,5 +508,86 @@ mod tests {
         assert_eq!(hit.surrogate, "exact", "精确命中优先于全流程兜底");
         // 全不命中
         assert!(pick_surrogate(prefer.iter(), "ww", "leave", "").is_none());
+    }
+
+    /// A 格（issues/123）：同一 operator+processName 先建"窗内+enabled=1"，
+    /// 再建一条更"新"的无效记录 ⇒ 最新一条说了算，**旧的有效行不得复活**。
+    ///
+    /// 把实现改回"先滤生效、再从剩下的取最新"（即修复前的形状）时，本用例四格全红；
+    /// 而那正是 13 栈在 L2-17/L2-18 上恒并入的成因。
+    #[test]
+    fn test_pick_surrogate_newest_invalid_beats_older_valid() {
+        // 旧行：窗内 + enabled=1（911101 段之外，另起局部 id 段，只在本用例内比大小）
+        let mut older_valid = sg(100, "zs", "leave", "agent_old_valid", 1);
+        older_valid.start_time = Some("2026-09-01 00:00:00".into());
+        older_valid.end_time = Some("2026-09-30 23:59:59".into());
+        let now = "2026-09-21 12:00:00";
+
+        // 四种"最新一条不生效"的形状（可参数化，逐格断言）
+        let newest_invalid: Vec<(ProcessSurrogate, &str)> = vec![
+            {
+                // ① 窗外：整扇窗在未来
+                let mut s = sg(200, "zs", "leave", "agent_new_outwin", 1);
+                s.start_time = Some("2030-01-01 00:00:00".into());
+                s.end_time = Some("2030-12-31 23:59:59".into());
+                (s, "最新一条窗外")
+            },
+            {
+                // ② 窗外：窗已过期
+                let mut s = sg(200, "zs", "leave", "agent_new_expired", 1);
+                s.start_time = Some("2020-01-01 00:00:00".into());
+                s.end_time = Some("2020-12-31 23:59:59".into());
+                (s, "最新一条窗外（已过期）")
+            },
+            ({ sg(200, "zs", "leave", "agent_new_off", 0) }, "最新一条 enabled=0"),
+            ({ sg(200, "zs", "leave", "agent_new_dirty", 2) }, "最新一条 enabled 脏值 2（契约：只认 1）"),
+            ({ sg(200, "zs", "leave", "zs", 1) }, "最新一条自委托"),
+        ];
+        for (fresh, why) in newest_invalid {
+            let list = vec![older_valid.clone(), fresh];
+            let got = pick_surrogate(list.iter(), "zs", "leave", now).map(|s| s.id);
+            assert_eq!(got, None, "{why} ⇒ 不得命中，更不得回落到旧的窗内有效行");
+        }
+    }
+
+    /// B 格（issues/123）：作用域内**只有一条**"窗内 + enabled=1" ⇒ 必须命中。
+    /// 防 A 格的修法被写成"恒不并入"。
+    #[test]
+    fn test_pick_surrogate_sole_valid_row_still_hits() {
+        let now = "2026-09-21 12:00:00";
+        let mut only = sg(7, "zs", "leave", "agent_only", 1);
+        only.start_time = Some("2026-09-01 00:00:00".into());
+        only.end_time = Some("2026-09-30 23:59:59".into());
+        let list = vec![only];
+        let hit = pick_surrogate(list.iter(), "zs", "leave", now).unwrap();
+        assert_eq!(hit.id, 7, "唯一一条有效委托必须命中（精确腿）");
+        assert_eq!(hit.surrogate, "agent_only");
+
+        // 全流程腿同理：唯一一条空 processName 的有效委托也要命中
+        let mut only_all = sg(8, "zs", "", "agent_all_only", 1);
+        only_all.start_time = Some("2026-09-01 00:00:00".into());
+        only_all.end_time = None;
+        let list_all = vec![only_all];
+        let hit = pick_surrogate(list_all.iter(), "zs", "leave", now).unwrap();
+        assert_eq!(hit.id, 8, "唯一一条全流程有效委托必须命中（兜底腿）");
+        assert_eq!(hit.surrogate, "agent_all_only");
+    }
+
+    /// 精确作用域最新一条判否后，**仍要看全流程作用域的最新一条**（不得判否即止）。
+    /// 钉的是 Java `JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet` 同一条形。
+    #[test]
+    fn test_pick_surrogate_exact_scope_invalid_still_checks_global_scope() {
+        let now = "2026-09-21 12:00:00";
+        let mut expired_exact = sg(50, "zs", "leave", "agent_expired", 1);
+        expired_exact.start_time = Some("2020-01-01 00:00:00".into());
+        expired_exact.end_time = Some("2020-12-31 23:59:59".into());
+        let mut live_global = sg(40, "zs", "", "agent_global", 1);
+        live_global.start_time = Some("2026-09-01 00:00:00".into());
+        live_global.end_time = Some("2026-09-30 23:59:59".into());
+        // 兜底行 id 更小也一样要接住：两腿各自取自己作用域里的最新一条
+        let list = vec![expired_exact, live_global];
+        let hit = pick_surrogate(list.iter(), "zs", "leave", now).unwrap();
+        assert_eq!(hit.id, 40, "精确作用域判否后须落到全流程作用域");
+        assert_eq!(hit.surrogate, "agent_global");
     }
 }
