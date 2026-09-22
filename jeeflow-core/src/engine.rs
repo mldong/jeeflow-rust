@@ -1169,7 +1169,12 @@ impl JeeflowEngineImpl {
         revived.actor_id = None;                 // 进行中任务该列恒无值
         revived.actor_ids = vec![operator];
         revived.finish_time = None;
-        revived.variables = vars;                // parent_task_id 随行拷贝＝"上一步的上一步"
+        revived.variables = vars;
+        // parent 随行拷贝＝"上一步的上一步"。**老行该列为 NULL 时必须落 0，不能留 None**：
+        // 留 None 会被 persist_tasks 的建单不变量补成"本次被回退掉的那个任务"id，
+        // 于是当前行 parent=复活行、复活行 parent=当前行，血缘成二元环，回退链在此处会来回跳。
+        // （对齐 Java `history.getParentTaskId()` 与 MoonBit `engine_ops.mbt` 的 carry 口径。）
+        revived.parent_task_id = Some(history.parent_task_id.unwrap_or(0));
         exec.new_tasks.push(revived);
         Ok(())
     }
@@ -2599,6 +2604,50 @@ mod tests {
         assert_eq!(repo.find_history_tasks(iid).unwrap().iter()
             .filter(|t| t.task_name == "task1").count(), 2,
             "原 task1 行应作为历史行保留，加上复活行共两条");
+    }
+
+    /// issues/121 T0 核账抓出的形状：血缘前驱那行是 **P1 之前落的老行**（`task_parent_id` 列为
+    /// NULL ⇒ 水合为 `None`）时，复活行的 parent 必须落 **0**，不能留 `None`——留 None 会被
+    /// persist_tasks 的建单不变量补成"本次被回退掉的那个任务"id，于是当前行 parent＝复活行、
+    /// 复活行 parent＝当前行，血缘成二元环。Java（`history.getParentTaskId()` 工厂里 `?? 0`）与
+    /// MoonBit（`engine_ops.mbt` 的 `carry`）都是 0，本栈曾是唯一分叉的一栈。
+    #[tokio::test]
+    async fn test_i121_t0_rollback_of_legacy_null_parent_row_lands_zero() {
+        let (engine, repo) = make_surrogate_engine();
+        let did = save_define(&repo, "lineage121legacy", &load_flow("02-multi-task"));
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+
+        let t1 = advance_until_doing(&engine, &repo, iid, "task1").await;
+        // 造老数据形状：task1 那行的血缘列写成 NULL（前置自证——本栈水合确实把 NULL 读成 None）
+        let mut legacy = t1.clone();
+        legacy.parent_task_id = None;
+        repo.update_task(&legacy).unwrap();
+        assert_eq!(repo.find_task_by_id(t1.task_id).unwrap().unwrap().parent_task_id, None,
+            "前置条件：该行应已是 parent=NULL 的老行形状");
+
+        let mut a1 = FlowData::new();
+        a1.insert_i64("submitType", 1);
+        let who1 = t1.actor_ids.first().cloned().unwrap();
+        engine.execute_task_async(t1.task_id, &who1, &a1).await.unwrap();
+        let t2 = advance_until_doing(&engine, &repo, iid, "task2").await;
+
+        let mut rb = FlowData::new();
+        rb.insert_i64("submitType", 3);
+        let who2 = t2.actor_ids.first().cloned().unwrap();
+        engine.execute_and_jump_async(t2.task_id, &who2, &rb, None).await.unwrap();
+
+        let revived = repo.find_doing_tasks(iid, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "task1")
+            .expect("回退后应在 task1 复出一条待办");
+        assert_eq!(revived.parent_task_id, Some(0),
+            "老行血缘未知 ⇒ 复活行 parent 必须落 0；实得 {:?}（非 0 即说明被补成了当前任务 id，血缘成环）",
+            revived.parent_task_id);
+        assert_ne!(revived.parent_task_id, Some(t2.task_id),
+            "绝不允许把\"被回退掉的那个任务\"当复活行的前驱");
+        // 回归：该行照常复活成待办、参与者与标记不受影响
+        assert_eq!(revived.actor_ids, vec![who1.clone()]);
+        assert_eq!(revived.variables.get("isFirstTaskNode"), Some(&JsonValue::Bool(false)));
     }
 
     /// issues/121 P2 两格负向：
