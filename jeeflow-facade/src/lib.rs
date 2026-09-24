@@ -314,7 +314,6 @@ fn task_row_to_json(r: &TaskRow) -> Json {
         "expire_time": r.expire_time,
         "form_key": r.form_key,
         "task_parent_id": r.task_parent_id,
-        "variable": r.variable,
         "create_time": r.create_time,
         "create_user": r.create_user,
         "update_time": r.update_time,
@@ -339,7 +338,6 @@ fn instance_row_to_json(r: &InstanceRow) -> Json {
         "business_no": r.business_no,
         "operator": r.operator,
         "expire_time": r.expire_time,
-        "variable": r.variable,
         "create_time": r.create_time,
         "create_user": r.create_user,
         "update_time": r.update_time,
@@ -1108,7 +1106,7 @@ impl JeeflowFacade {
             "parent_node_name": inst.parent_node_name,
             "business_no": inst.business_no,
             "operator": inst.operator,
-            "variables": flow_data_to_object(&inst.variables),
+            "ext": flow_data_to_object(&inst.variables), // issues/124：变量唯一对外出口（ext 豁免 camel，键保持下划线）
             "form_data": form_data_of_flow(&inst.variables, FORM_DATA_PREFIX),
             "create_time": inst.create_time,
             "create_user": inst.create_user,
@@ -1269,8 +1267,7 @@ impl JeeflowFacade {
                     "task_state": t.task_state,
                     "operator": t.actor_id,
                     "finish_time": t.finish_time,
-                    "variable": task_vars,
-                    "ext": ext,
+                    "ext": ext, // issues/124：variable 原串出口下线
                 })
             })
             .collect();
