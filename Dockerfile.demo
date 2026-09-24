@@ -28,6 +28,8 @@ RUN cargo build --release -p jeeflow-demo-salvo 2>/dev/null || true
 # 复制真实源码
 COPY jeeflow-core/src jeeflow-core/src
 COPY jeeflow-repository-sqlx/src jeeflow-repository-sqlx/src
+# lib.rs 用 include_str!("../schema/schema-mysql.sql") 编进二进制，构建上下文缺目录即编译失败
+COPY jeeflow-repository-sqlx/schema jeeflow-repository-sqlx/schema
 COPY jeeflow-persist/src jeeflow-persist/src
 COPY jeeflow-facade/src jeeflow-facade/src
 COPY jeeflow-demo-salvo/src jeeflow-demo-salvo/src
