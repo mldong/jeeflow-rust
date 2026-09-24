@@ -4,7 +4,7 @@
 //! 8 用户 × 5 菜单（待办/已办/发起/抄送/委托）全覆盖（每格 ≥1）。
 
 use jeeflow_facade::JeeflowFacade;
-use serde_json::{json, Value as Json};
+use serde_json::{json, Map, Value as Json};
 use std::collections::HashMap;
 
 /// (defineId, operator, extraVars, 抄送 actorIds)
@@ -67,6 +67,79 @@ const SURROGATES: &[(&str, &str)] = &[
     ("boss", "user1"),
 ];
 
+/// 表单种子数据（八语言 canonical 同表同值：tmp-seed-spec/canonical.md）——
+/// 只为演示回显铺字段，仍全部经引擎真实提交，不直插 repo。
+/// 硬规则 1：日期一律写死字面量，不按当前时钟算（八栈机器时区/系统时间各异，算出来会漂）。
+/// 硬规则 2：字段名严禁 `amount` / `finalAmount` —— 它们是 03-decision-expr / 10-mixed-mode
+///   条件表达式的判定变量，撞上会改流程走向。
+/// 硬规则 3：TF 的键 = 审批节点的 formKey；表里没有的 formKey（apply-form / expense-form /
+///   mix-form 等）只落通用审批意见，不臆造字段。
+
+/// json! 字面量 → 键值表（值类型沿用本文件的 Json；serde_json Map 无序，比对不看键序）。
+fn obj(literal: Json) -> Map<String, Json> {
+    match literal {
+        Json::Object(m) => m,
+        _ => Map::new(),
+    }
+}
+
+/// defineId → 发起表单字段 `f_*`（13=11-assignment-handler 无 apply 节点故不列）。
+fn form_by_define(define_id: i64) -> Map<String, Json> {
+    let literal = match define_id {
+        1 => json!({"f_reason": "家中有事需请假", "f_days": 3, "f_leaveType": "annual", "f_startDate": "2026-09-01", "f_endDate": "2026-09-03"}),
+        2 => json!({"f_reason": "项目上线后调休", "f_days": 2, "f_leaveType": "annual", "f_startDate": "2026-09-07", "f_endDate": "2026-09-08"}),
+        3 => json!({"f_reason": "出差报销申请", "f_days": 1, "f_leaveType": "personal", "f_startDate": "2026-09-10", "f_endDate": "2026-09-10"}),
+        4 => json!({"f_reason": "培训进修请假", "f_days": 5, "f_leaveType": "sick", "f_startDate": "2026-09-14", "f_endDate": "2026-09-18"}),
+        5 => json!({"f_reason": "年假出行", "f_days": 4, "f_leaveType": "annual", "f_startDate": "2026-09-21", "f_endDate": "2026-09-24"}),
+        6 => json!({"f_reason": "婚假申请", "f_days": 10, "f_leaveType": "personal", "f_startDate": "2026-09-28", "f_endDate": "2026-10-07"}),
+        7 => json!({"f_reason": "病假休养", "f_days": 6, "f_leaveType": "sick", "f_startDate": "2026-10-12", "f_endDate": "2026-10-17"}),
+        8 => json!({"f_reason": "产检假", "f_days": 3, "f_leaveType": "sick", "f_startDate": "2026-10-19", "f_endDate": "2026-10-21"}),
+        9 => json!({"f_reason": "陪产假", "f_days": 5, "f_leaveType": "personal", "f_startDate": "2026-10-26", "f_endDate": "2026-10-30"}),
+        10 => json!({"f_reason": "事假处理家务", "f_days": 2, "f_leaveType": "personal", "f_startDate": "2026-11-02", "f_endDate": "2026-11-03"}),
+        11 => json!({"f_bizType": "purchase", "f_budget": 12000, "f_urgency": "normal", "f_desc": "采购一批开发板与传感器"}),
+        12 => json!({"f_reason": "部门例行调休", "f_days": 1, "f_leaveType": "annual", "f_startDate": "2026-11-09", "f_endDate": "2026-11-09"}),
+        14 => json!({"f_reason": "外派学习请假", "f_days": 7, "f_leaveType": "annual", "f_startDate": "2026-11-16", "f_endDate": "2026-11-22"}),
+        15 => json!({"f_reason": "丧假", "f_days": 3, "f_leaveType": "personal", "f_startDate": "2026-11-23", "f_endDate": "2026-11-25"}),
+        _ => json!({}),
+    };
+    obj(literal)
+}
+
+/// 审批节点 formKey → 任务表单字段 `tf_*`；未知 formKey 返回空（见硬规则 3）。
+fn tf_by_form(form_key: &str) -> Map<String, Json> {
+    let literal = match form_key {
+        "leave-form" => json!({"tf_approvedDays": 3, "tf_needExtra": "no", "tf_remark": "按项目排期核准，注意工作交接"}),
+        "review-form" => json!({"tf_riskLevel": "low", "tf_needLegalDoc": "no", "tf_reviewOpinion": "条款与预算均无风险"}),
+        "boss-form" => json!({"tf_finalDecision": "agree", "tf_finalAmount": 8000, "tf_bossNote": "同意，走年度预算"}),
+        "check-form" => json!({"tf_invoiceOk": "yes", "tf_amountChecked": 8000, "tf_checkNote": "票据齐全，计入差旅科目"}),
+        "countersign-form" => json!({"tf_signVote": "support", "tf_signAmount": 5000, "tf_signOpinion": "本条线无异议"}),
+        "seq-form" => json!({"tf_seqStage": "first", "tf_seqVote": "pass", "tf_seqOpinion": "初审通过，转下一人"}),
+        "approve-form" => json!({"tf_approveResult": "ok", "tf_approveAmount": 8000, "tf_approveNote": "审批通过"}),
+        "ratio-form" => json!({"tf_ratioVote": "agree", "tf_ratioOpinion": "达到比例即可通过"}),
+        "veto-form" => json!({"tf_vetoResult": "pass", "tf_vetoReason": "无异议"}),
+        "form-a" => json!({"tf_branchA": "a1", "tf_branchANote": "A 分支选方案 A1"}),
+        "form-b" => json!({"tf_branchB": "b1", "tf_branchBNote": "B 分支选方案 B1"}),
+        "field-form" => json!({"tf_ownerName": "张三", "tf_field": "tech", "tf_fieldNote": "技术域评估通过"}),
+        "operator-form" => json!({"tf_selfCheck": "done", "tf_operatorNote": "发起人自查无误"}),
+        "dept-form" => json!({"tf_deptAgree": "yes", "tf_deptQuota": 8000, "tf_deptNote": "同意占用本部门额度"}),
+        "role-form" => json!({"tf_roleResult": "pass", "tf_roleNote": "角色审批通过"}),
+        _ => json!({}),
+    };
+    obj(literal)
+}
+
+/// 硬规则 5：每个 processTask/execute 调用点都走这一个助手（多处调用点同口径）。
+/// 先落通用审批意见，再按该任务行的 formKey 合并 tf_*（未知 formKey 只有通用意见）。
+fn with_task_form(ex: &mut Json, form_key: Option<&str>) {
+    let Some(dst) = ex.as_object_mut() else { return };
+    dst.insert("tf_approvalComment".to_string(), Json::String("同意，情况已核实".into()));
+    if let Some(key) = form_key {
+        for (k, v) in tf_by_form(key) {
+            dst.insert(k, v);
+        }
+    }
+}
+
 fn to_args(v: Json) -> HashMap<String, Json> {
     match v.as_object() {
         Some(map) => map.clone().into_iter().collect(),
@@ -96,6 +169,12 @@ fn json_to_string(v: &Json) -> String {
 /// startAndExecute 返回键 = data.processInstanceId（8 语言一致；id 可能被 stringify）
 async fn start_instance(facade: &JeeflowFacade, define_id: i64, op: &str, extra: &Json) -> Option<i64> {
     let mut args = json!({"processDefineId": define_id, "operator": op});
+    // 硬规则 4：f_* 先铺、extra 后铺 —— 已有的流程变量（amount / deptLeader）优先，不被表单值盖掉。
+    if let Some(dst) = args.as_object_mut() {
+        for (k, v) in form_by_define(define_id) {
+            dst.insert(k, v);
+        }
+    }
     if let (Some(dst), Some(src)) = (args.as_object_mut(), extra.as_object()) {
         for (k, v) in src {
             dst.insert(k.clone(), v.clone());
@@ -157,12 +236,9 @@ async fn advance(facade: &JeeflowFacade, iid: i64) -> i64 {
                 });
             let Some(actor) = actor else { continue };
             let Some(tid) = t.get("id").and_then(as_i64) else { continue };
-            let r = flow(
-                facade,
-                "processTask/execute",
-                json!({"processTaskId": tid, "operator": actor, "submitType": 1}),
-            )
-            .await;
+            let mut exec = json!({"processTaskId": tid, "operator": actor, "submitType": 1});
+            with_task_form(&mut exec, t.get("formKey").and_then(|v| v.as_str()));
+            let r = flow(facade, "processTask/execute", exec).await;
             if code_of(&r) == 0 {
                 progress = true;
             } else {
@@ -207,12 +283,9 @@ pub async fn seed_business(facade: &JeeflowFacade) {
             for actor in ["leader", "manager"] {
                 if let Some(row) = todo_row(facade, actor, iid).await {
                     let Some(tid) = row.get("id").and_then(as_i64) else { continue };
-                    let r = flow(
-                        facade,
-                        "processTask/execute",
-                        json!({"processTaskId": tid, "operator": actor, "submitType": 1}),
-                    )
-                    .await;
+                    let mut exec = json!({"processTaskId": tid, "operator": actor, "submitType": 1});
+                    with_task_form(&mut exec, row.get("formKey").and_then(|v| v.as_str()));
+                    let r = flow(facade, "processTask/execute", exec).await;
                     if code_of(&r) != 0 {
                         eprintln!("[seed] I14 execute {} FAILED: {}", actor, r);
                     }
