@@ -62,7 +62,8 @@ login-only 下拉 / 字典 / 菜单接口对齐 goframe `IgnoreAuthList`：
 ## 部署与验收
 
 - 一键部署：`mldong-website/public/deploy/mldong-salvo-jeeflow/`（:28080 前端 / :28100 API /
-  :28406 MySQL / :28579 Redis；compose 含 `seccomp:unconfined`——较旧 Docker/runc 的默认
+  :28406 MySQL / :28679 Redis——2026-09-27 由 28579 挪号，那原本是 fastapi 包的 redis 宿主端口，
+  两包同口在并排起栈时后起的会绑不上；compose 含 `seccomp:unconfined`——较旧 Docker/runc 的默认
   seccomp 策略会拦新版 glibc 系统调用）
 - 镜像构建：容器内 cargo 编译（base `mldong/rust:1.97.1`，引擎走 crates.io，镜像与发布产物严格一致）
 - 验收（2026-08-25）：L0–L2 契约 19/19 + L3 端到端 14 过 / 1 固定 skip（S12）/ 0 败
