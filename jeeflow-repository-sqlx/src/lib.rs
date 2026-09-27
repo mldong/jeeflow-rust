@@ -581,12 +581,18 @@ impl ProcessRepository for SqlxRepository {
     fn update_instance(&self, instance: &ProcessInstance) -> JeeflowResult<()> {
         self.block_on(async {
             let var_json = flow_data_to_json(&instance.variables);
+            // issues/125：update_time 由引擎时钟出口供给并绑参，SQL 文本里不留 NOW()——
+            // MySQL 的 NOW() 取 @@session.time_zone 的墙钟，而 create_time 是引擎钟写的裸墙钟，
+            // 两把钟会让同一行两列差一个时区偏移（宿主注入东八、库会话 UTC 时立刻发作）。
+            // 只取一次，与 save_instance 里 create_time 用的是同一个出口。
+            let now = current_time_str();
             // update_user 用 COALESCE：仅当调用方显式回写（如撤回人）时才落库，
             // 其它路径传 None 保持既有值，避免误清（spec/06 withdraw「实例 update_user 回写为撤回人」）。
-            sqlx::query("UPDATE wf_process_instance SET state=?, variable=?, update_user=COALESCE(?, update_user), update_time=NOW() WHERE id=?")
+            sqlx::query("UPDATE wf_process_instance SET state=?, variable=?, update_user=COALESCE(?, update_user), update_time=? WHERE id=?")
                 .bind(instance.state)
                 .bind(&var_json)
                 .bind(&instance.update_user)
+                .bind(&now)
                 .bind(instance.instance_id)
                 .execute(&self.pool)
                 .await
@@ -678,13 +684,17 @@ impl ProcessRepository for SqlxRepository {
     fn update_task(&self, task: &ProcessTask) -> JeeflowResult<()> {
         self.block_on(async {
             let var_json = flow_data_to_json(&task.variables);
+            // issues/125：同 update_instance——update_time 走引擎时钟出口绑参，SQL 里不留 NOW()。
+            // 只取一次，本条语句的 finish_time（来自聚合根，也是引擎钟产的）与它同一基准。
+            let now = current_time_str();
             // update_user COALESCE：撤回/转办/办结显式回写操作人时落库，其它路径保持既有值。
-            sqlx::query("UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, variable=?, update_user=COALESCE(?, update_user), update_time=NOW() WHERE id=?")
+            sqlx::query("UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, variable=?, update_user=COALESCE(?, update_user), update_time=? WHERE id=?")
                 .bind(task.task_state)
                 .bind(&task.actor_id)
                 .bind(&task.finish_time)
                 .bind(&var_json)
                 .bind(&task.update_user)
+                .bind(&now)
                 .bind(task.task_id)
                 .execute(&self.pool)
                 .await
@@ -2890,5 +2900,150 @@ mod tests {
 
             clean_by_define(&pool, define_id).await;
         });
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // M5（issues/125）：写库的 update_time 必须来自引擎时钟出口
+    //
+    // 病灶：两条 UPDATE 原先写 `update_time=NOW()`，而 MySQL 的 NOW() 取 @@session.time_zone
+    // 的墙钟，同一行的 create_time 却是引擎钟写的裸墙钟 ⇒ 宿主注入东八、库会话 UTC（或反之）
+    // 时两列差 8 小时，且 issues/120 辛苦收敛的"壳注入后全栈同基准"在这两列上失效。
+    //
+    // 判据形状（缺一条就是死格）：
+    //  - 牙：注入固定钟后断 `update_time == 注入串`——旧实现会拿 DB 墙钟，必红；
+    //  - 探针自证：先断 `NOW() != 注入串`，否则"等于注入串"可能只是两把钟恰好同读数（假绿）；
+    //  - 同基准：同一行 create_time 与 update_time 相等（一次 update 的间隔是秒级，不该差 8 小时）；
+    //  - 回归：task 路径同款；两条 SQL 的形状由 test_update_sql_has_no_db_clock 常驻盯住。
+    //
+    // 时钟是进程级 static，故用 ClockScope（内部互斥 + drop 复原），夹具只用 900501–900599 段。
+    // ═══════════════════════════════════════════════════════
+
+    const CLOCK125_FIXED: &str = "2026-07-15 08:30:00";
+
+    fn clock125_fixed() -> String {
+        CLOCK125_FIXED.to_string()
+    }
+
+    #[tokio::test]
+    async fn test_mysql_m5_update_time_follows_engine_clock() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        sqlx::query("DELETE FROM wf_process_task WHERE id BETWEEN 900501 AND 900599").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id BETWEEN 900501 AND 900599").execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id BETWEEN 900501 AND 900599").execute(&pool).await.unwrap();
+
+        // 注入必须**先于**任何写库，且横跨 run_sync 的 blocking 线程（进程级 static 全线程可见）
+        let _clock = jeeflow_core::clock::ClockScope::injected(clock125_fixed);
+
+        // 探针自证：会话钟与注入钟若相同，下面的等值断言就分辨不出基准来源 ⇒ 无牙，先报红
+        let db_now: String = sqlx::query_scalar("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')")
+            .fetch_one(&pool).await.unwrap();
+        assert_ne!(db_now, CLOCK125_FIXED,
+            "M5: 数据库 NOW() 恰好等于注入钟串 ⇒ 这条判据在此环境分不出两把钟，无牙");
+
+        let pool2 = pool.clone();
+        let (instance_id, task_id) = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: 900501, name: "rust_m5_clock".into(), display_name: "M5 Clock".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+
+            let mut instance = ProcessInstance {
+                instance_id: 900502, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: Some("rust125-instance".into()),
+                operator: "user1".into(), expire_time: None,
+                variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some("user1".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut instance).unwrap();
+
+            let mut loaded = repo.find_instance_by_id(instance.instance_id).unwrap().unwrap();
+            loaded.state = 20;
+            loaded.update_user = Some("user1".into());
+            repo.update_instance(&loaded).unwrap();
+
+            let mut task = ProcessTask {
+                task_id: 900503, process_instance_id: instance.instance_id,
+                task_name: "task1".into(), display_name: "M5 Task".into(),
+                task_type: 0, perform_type: 0, task_state: 10,
+                actor_id: Some("user1".into()), actor_ids: vec!["user1".into()],
+                finish_time: None, expire_time: None, form_key: None,
+                parent_task_id: None, variables: jeeflow_core::json::FlowData::new(),
+                create_time: None, create_user: Some("user1".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_task(&mut task).unwrap();
+
+            let mut tloaded = repo.find_task_by_id(task.task_id).unwrap().unwrap();
+            tloaded.task_state = 20;
+            tloaded.finish_time = Some(jeeflow_core::clock::current_time_str());
+            repo.update_task(&tloaded).unwrap();
+
+            (instance.instance_id, task.task_id)
+        }).await;
+
+        // ── 实例：create_time 与 update_time 都必须是注入串（同一行两列同一把钟）──────────
+        let row = sqlx::query("SELECT DATE_FORMAT(create_time, '%Y-%m-%d %H:%i:%s') AS ct, \
+             DATE_FORMAT(update_time, '%Y-%m-%d %H:%i:%s') AS ut FROM wf_process_instance WHERE id = ?")
+            .bind(instance_id).fetch_one(&pool).await.unwrap();
+        let ct: String = row.get("ct");
+        let ut: String = row.get("ut");
+        assert_eq!(ct, CLOCK125_FIXED, "M5: 实例 create_time 应为注入钟串");
+        assert_eq!(ut, CLOCK125_FIXED,
+            "M5: 实例 update_time 不是引擎钟串（实得 {}），说明 SQL 又把钟交给数据库了；DB 墙钟是 {}", ut, db_now);
+        assert_eq!(ct, ut, "M5: 同一行两列必须同基准（差 8 小时就是本案签名）");
+
+        // ── 任务：同款 ──────────────────────────────────────────────────────────
+        let trow = sqlx::query("SELECT DATE_FORMAT(create_time, '%Y-%m-%d %H:%i:%s') AS ct, \
+             DATE_FORMAT(update_time, '%Y-%m-%d %H:%i:%s') AS ut FROM wf_process_task WHERE id = ?")
+            .bind(task_id).fetch_one(&pool).await.unwrap();
+        let tct: String = trow.get("ct");
+        let tut: String = trow.get("ut");
+        assert_eq!(tct, CLOCK125_FIXED, "M5: 任务 create_time 应为注入钟串");
+        assert_eq!(tut, CLOCK125_FIXED,
+            "M5: 任务 update_time 不是引擎钟串（实得 {}）；DB 墙钟是 {}", tut, db_now);
+        assert_eq!(tct, tut, "M5: 任务同一行两列必须同基准");
+
+        // ── 回归：finish_time 也走引擎钟（聚合根产的值经绑参落库，不被会话钟改写）─────────
+        let ft: Option<String> = sqlx::query("SELECT DATE_FORMAT(finish_time, '%Y-%m-%d %H:%i:%s') AS ft FROM wf_process_task WHERE id = ?")
+            .bind(task_id).fetch_one(&pool).await.unwrap().get("ft");
+        assert_eq!(ft.as_deref(), Some(CLOCK125_FIXED), "M5: finish_time 应为引擎钟串");
+
+        sqlx::query("DELETE FROM wf_process_task WHERE id = ?").bind(task_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_define WHERE id = 900501").execute(&pool).await.unwrap();
+
+        // drop(_clock) 复原默认基准，别把注入钟留给同批并发的其它用例
+    }
+
+    /// 形状门禁（不连库，恒跑）：两处 UPDATE 的 SQL 文本里不许出现 NOW()，必须绑引擎钟。
+    /// 静态普查门禁 dbclock_census.py 管八栈，这条管本文件不被后人顺手改回 `update_time=NOW()`。
+    #[test]
+    fn test_update_sql_has_no_db_clock() {
+        // 本文件自读；整行注释里写 NOW() 是在解释缺陷，不算病灶 ⇒ 先剥注释再数
+        let src = include_str!("lib.rs");
+        for head in ["fn update_instance", "fn update_task"] {
+            let i = src.find(head).unwrap_or_else(|| panic!("找不到 {} —— 方法被改名/挪走", head));
+            let rest = &src[i..];
+            let end = rest.find("\n    fn ").unwrap_or_else(|| panic!("{} 切不出方法边界", head));
+            let body = &rest[..end];
+            let code: String = body.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!code.contains("NOW()"),
+                "{} 的代码里仍有 NOW() ⇒ 又把钟交给数据库会话时区了", head);
+            assert!(code.contains("update_time=?"),
+                "{} 不是绑参形状（没找到 `update_time=?`）", head);
+            assert!(code.contains("current_time_str()"),
+                "{} 没走引擎时钟出口 current_time_str()", head);
+        }
     }
 }
