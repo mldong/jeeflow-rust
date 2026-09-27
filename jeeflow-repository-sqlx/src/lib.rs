@@ -827,7 +827,12 @@ impl ProcessRepository for SqlxRepository {
     fn page_todo_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
-            let op = query.operator.clone();
+            // issues/129：空 operator → 空页，且不再下推 `(? IS NULL OR …)` 旁路。
+            // 只补门面兜底不够：自定义 SPI 仓储/直连仓储传空时，旁路仍会把全库摊出去。
+            let op = match query.operator.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Ok(PageResult::new(page_num, page_size, 0, Vec::new())),
+            };
             // m_ 过滤下推（issues/106）：白名单条件拼进 COUNT 与 SELECT，bind 顺序 operator → filters → limit
             let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_task_col);
             let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
@@ -837,9 +842,9 @@ impl ProcessRepository for SqlxRepository {
                  INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.task_state = 10 AND (? IS NULL OR ta.actor_id = ?){where_extra}"
+                 WHERE t.task_state = 10 AND ta.actor_id = ?{where_extra}"
             );
-            let mut count_q = sqlx::query(&count_sql).bind(op.clone()).bind(op.clone());
+            let mut count_q = sqlx::query(&count_sql).bind(op.clone());
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
                 .fetch_one(&self.pool)
@@ -860,10 +865,10 @@ impl ProcessRepository for SqlxRepository {
                  INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id \
                  INNER JOIN wf_process_instance pi ON t.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE t.task_state = 10 AND (? IS NULL OR ta.actor_id = ?){where_extra} \
+                 WHERE t.task_state = 10 AND ta.actor_id = ?{where_extra} \
                  ORDER BY t.id DESC LIMIT ? OFFSET ?"
             );
-            let mut rows_q = sqlx::query(&select_sql).bind(op.clone()).bind(op);
+            let mut rows_q = sqlx::query(&select_sql).bind(op.clone());
             for v in &fvals { rows_q = rows_q.bind(v); }
             let rows = rows_q
                 .bind(page_size)
@@ -944,7 +949,12 @@ impl ProcessRepository for SqlxRepository {
     fn page_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
-            let op = query.operator.clone();
+            // issues/129：空 operator → 空页，且不再下推 `(? IS NULL OR …)` 旁路。
+            // 只补门面兜底不够：自定义 SPI 仓储/直连仓储传空时，旁路仍会把全库摊出去。
+            let op = match query.operator.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Ok(PageResult::new(page_num, page_size, 0, Vec::new())),
+            };
             // m_ 过滤下推（issues/106）：bind 顺序 operator×2 → filters → limit
             let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_instance_col);
             let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
@@ -952,9 +962,9 @@ impl ProcessRepository for SqlxRepository {
                 "SELECT COUNT(*) AS cnt \
                  FROM wf_process_instance pi \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE (? IS NULL OR pi.operator = ?){where_extra}"
+                 WHERE pi.operator = ?{where_extra}"
             );
-            let mut count_q = sqlx::query(&count_sql).bind(op.clone()).bind(op.clone());
+            let mut count_q = sqlx::query(&count_sql).bind(op.clone());
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
                 .fetch_one(&self.pool)
@@ -969,10 +979,10 @@ impl ProcessRepository for SqlxRepository {
                         pd.name AS define_name, pd.display_name AS define_display_name, pd.version AS define_version \
                  FROM wf_process_instance pi \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE (? IS NULL OR pi.operator = ?){where_extra} \
+                 WHERE pi.operator = ?{where_extra} \
                  ORDER BY pi.id DESC LIMIT ? OFFSET ?"
             );
-            let mut rows_q = sqlx::query(&select_sql).bind(op.clone()).bind(op);
+            let mut rows_q = sqlx::query(&select_sql).bind(op.clone());
             for v in &fvals { rows_q = rows_q.bind(v); }
             let rows = rows_q
                 .bind(page_size)
@@ -988,7 +998,12 @@ impl ProcessRepository for SqlxRepository {
     fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
-            let op = query.operator.clone();
+            // issues/129：空 operator → 空页，且不再下推 `(? IS NULL OR …)` 旁路。
+            // 只补门面兜底不够：自定义 SPI 仓储/直连仓储传空时，旁路仍会把全库摊出去。
+            let op = match query.operator.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Ok(PageResult::new(page_num, page_size, 0, Vec::new())),
+            };
             // m_ 过滤下推（issues/106）：加 WHERE 后 DISTINCT 语义不受影响；bind 顺序 operator×2 → filters → limit
             let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_instance_col);
             let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
@@ -997,9 +1012,9 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_cc_instance cc \
                  INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE (? IS NULL OR cc.actor_id = ?){where_extra}"
+                 WHERE cc.actor_id = ?{where_extra}"
             );
-            let mut count_q = sqlx::query(&count_sql).bind(op.clone()).bind(op.clone());
+            let mut count_q = sqlx::query(&count_sql).bind(op.clone());
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
                 .fetch_one(&self.pool)
@@ -1015,10 +1030,10 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_cc_instance cc \
                  INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE (? IS NULL OR cc.actor_id = ?){where_extra} \
+                 WHERE cc.actor_id = ?{where_extra} \
                  ORDER BY pi.id DESC LIMIT ? OFFSET ?"
             );
-            let mut rows_q = sqlx::query(&select_sql).bind(op.clone()).bind(op);
+            let mut rows_q = sqlx::query(&select_sql).bind(op.clone());
             for v in &fvals { rows_q = rows_q.bind(v); }
             let rows = rows_q
                 .bind(page_size)
@@ -1747,6 +1762,92 @@ mod tests {
         sqlx::query("DELETE FROM wf_process_task WHERE id = ?").bind(task_id).execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM wf_process_instance WHERE id = ?").bind(instance_id).execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM wf_process_define WHERE id = ?").bind(define_id).execute(&pool).await.unwrap();
+    }
+
+    /// issues/129 T1（真库 MySQL）：SQL 仓三处 page 的空 operator 必须返回空页。
+    /// 这条同时承担两件别人替不了的事：
+    /// ① 验"删掉 `? IS NULL OR …` 之后 bind 个数与占位符仍对齐"——不对齐会在 execute 期直接炸，
+    ///    纯内存仓测试与门面测试都盖不到这条；
+    /// ② 验传了人就查得到行（防把"泄漏"修成"失联"这种假修法）。
+    #[tokio::test]
+    async fn test_mysql_129_empty_operator_no_full_scan() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        // 独占 id 段 9129xx（共享测试库，必须先清干净，判据才不被脏行污染）
+        for sql in [
+            "DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 912900 AND 912999",
+            "DELETE FROM wf_process_cc_instance WHERE process_instance_id BETWEEN 912900 AND 912999",
+            "DELETE FROM wf_process_task WHERE id BETWEEN 912900 AND 912999",
+            "DELETE FROM wf_process_instance WHERE id BETWEEN 912900 AND 912999",
+            "DELETE FROM wf_process_define WHERE id BETWEEN 912900 AND 912999",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: 912901, name: "rust_129_test".into(), display_name: "129 Test".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+
+            let mut instance = ProcessInstance {
+                instance_id: 912902, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: None, operator: "u129a".into(),
+                expire_time: None, variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some("u129a".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut instance).unwrap();
+
+            let mut task = ProcessTask {
+                task_id: 912903, process_instance_id: instance.instance_id,
+                task_name: "t1".into(), display_name: "T1".into(),
+                task_type: 0, perform_type: 0, task_state: 10,
+                actor_id: None, actor_ids: vec!["u129a".into()],
+                finish_time: None, expire_time: None, form_key: None,
+                parent_task_id: None, variables: jeeflow_core::json::FlowData::new(),
+                create_time: None, create_user: Some("u129a".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_task(&mut task).unwrap();
+            repo.add_task_actor(task.task_id, &["u129a".to_string()]).unwrap();
+            repo.create_cc_instance(instance.instance_id, "u129a", &["u129cc".to_string()]).unwrap();
+
+            // 负向：三处都不许把"没传 operator"折叠成"看全库"
+            let empty = PageQuery::new(1, 10);
+            assert_eq!(repo.page_instances(&empty).unwrap().record_count, 0,
+                "129: page_instances 空 operator 读到了全库");
+            assert_eq!(repo.page_todo_tasks(&empty).unwrap().record_count, 0,
+                "129: page_todo_tasks 空 operator 读到了全库");
+            assert_eq!(repo.page_cc_instances(&empty).unwrap().record_count, 0,
+                "129: page_cc_instances 空 operator 读到了全库");
+
+            // 正向：传了人必须查得到（SQL 占位符/绑定也得对，否则这里直接 panic）
+            let mut mine = PageQuery::new(1, 10);
+            mine.operator = Some("u129a".to_string());
+            assert_eq!(repo.page_instances(&mine).unwrap().record_count, 1, "129: u129a 应有 1 条实例");
+            assert_eq!(repo.page_todo_tasks(&mine).unwrap().record_count, 1, "129: u129a 应有 1 条待办");
+            let mut ccq = PageQuery::new(1, 10);
+            ccq.operator = Some("u129cc".to_string());
+            assert_eq!(repo.page_cc_instances(&ccq).unwrap().record_count, 1, "129: u129cc 应有 1 条抄送");
+        }).await;
+
+        for sql in [
+            "DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 912900 AND 912999",
+            "DELETE FROM wf_process_cc_instance WHERE process_instance_id BETWEEN 912900 AND 912999",
+            "DELETE FROM wf_process_task WHERE id BETWEEN 912900 AND 912999",
+            "DELETE FROM wf_process_instance WHERE id BETWEEN 912900 AND 912999",
+            "DELETE FROM wf_process_define WHERE id BETWEEN 912900 AND 912999",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
     }
 
     /// M3: Persist ARCHIVE — bizData stored as plain text in wf_process_instance.variable

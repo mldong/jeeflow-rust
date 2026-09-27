@@ -1357,10 +1357,15 @@ mod tests {
         let actors: Vec<String> = fired.iter().map(|(_, a)| a.clone().expect("cc_actor_id 应直传")).collect();
         assert_eq!(actors, vec!["u1".to_string(), "u2".to_string()], "cc_actor_id 顺序应与 f_ccActors 一致");
 
-        // cc 行已落库，且与 fire 粒度一一对应
-        let mut q = crate::model::PageQuery::new(1, 10);
-        let page = repo.page_cc_instances(&mut q).unwrap();
-        assert_eq!(page.record_count, 2, "cc 实例应逐人落库");
+        // cc 行已落库，且与 fire 粒度一一对应。
+        // issues/129：`operator` 为空不再等于"看全部"（那条正是被堵的旁路）⇒ 计数逐人取。
+        let mut cc_total = 0;
+        for actor in ["u1", "u2"] {
+            let mut q = crate::model::PageQuery::new(1, 10);
+            q.operator = Some(actor.to_string());
+            cc_total += repo.page_cc_instances(&q).unwrap().record_count;
+        }
+        assert_eq!(cc_total, 2, "cc 实例应逐人落库");
     }
 
     /// P0 零副作用（issues/102 验收口径）：无监听器装配 → 抄送照常落库、fire 侧不抛错。
@@ -1381,6 +1386,8 @@ mod tests {
         let instance = rt.block_on(engine.start_async(define_id, "user1", &args)).unwrap();
 
         let mut q = crate::model::PageQuery::new(1, 10);
+        // issues/129：空 operator ⇒ 空页（不再是"看全部"），按抄送接收人取数
+        q.operator = Some("u9".to_string());
         let page = repo.page_cc_instances(&mut q).unwrap();
         assert_eq!(page.record_count, 1, "无监听器时 cc 实例仍应照常落库");
         assert!(instance.instance_id > 0);
@@ -1858,8 +1865,14 @@ mod tests {
         let iid = start_and_apply(&engine, &repo, did).await;
         // Create CC instances
         repo.create_cc_instance(iid, "user1", &["cc_user1".into(), "cc_user2".into()]).unwrap();
-        let page = repo.page_cc_instances(&PageQuery::new(1, 10)).unwrap();
-        assert!(page.record_count > 0, "c19: cc instances should exist");
+        // issues/129：`page_cc_instances` 传空 operator 现在是空页（原"空即全量"是旁路）
+        // ⇒ c19 的"cc 行确实落库"判据改成逐接收人取数，两条都要在。
+        for actor in ["cc_user1", "cc_user2"] {
+            let mut cq = PageQuery::new(1, 10);
+            cq.operator = Some(actor.to_string());
+            let page = repo.page_cc_instances(&cq).unwrap();
+            assert_eq!(page.record_count, 1, "c19: cc 实例应为接收人 {} 落库一条", actor);
+        }
     }
 
     #[tokio::test]

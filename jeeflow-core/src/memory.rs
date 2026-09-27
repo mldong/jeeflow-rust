@@ -315,10 +315,14 @@ impl ProcessRepository for MemoryRepository {
         let instances = self.instances.lock().unwrap();
         let defines = self.defines.lock().unwrap();
 
+        // issues/129：`is_none()` 短路＝放行全库待办（旁路型缺口，比缺过滤器更隐蔽）。
+        // 与 page_done_tasks 的 117 姿势同形：operator 为空（None 或全空白）→ 空页。
+        let op_s = query.operator.as_deref().map(str::trim).unwrap_or("");
         let mut rows: Vec<TaskRow> = tasks.values()
             .filter(|t| {
                 t.task_state == TaskState::Doing.code()
-                    && (query.operator.is_none() || t.actor_ids.contains(query.operator.as_ref().unwrap()))
+                    && !op_s.is_empty()
+                    && t.actor_ids.iter().any(|a| a.as_str() == op_s)
             })
             .map(|t| {
                 let inst = instances.get(&t.process_instance_id);
@@ -444,12 +448,11 @@ impl ProcessRepository for MemoryRepository {
         let defines = self.defines.lock().unwrap();
         let mut rows: Vec<InstanceRow> = instances
             .values()
+            // issues/129：原 `.unwrap_or(true)`＝"没传就看全部"，一条不带 operator 的
+            // page 请求能读到别人的实例（线上实测 4 → 25）。空值一律空页。
             .filter(|i| {
-                query
-                    .operator
-                    .as_ref()
-                    .map(|op| &i.operator == op)
-                    .unwrap_or(true)
+                let op = query.operator.as_deref().map(str::trim).unwrap_or("");
+                !op.is_empty() && i.operator == op
             })
             .map(|i| {
                 let define = defines.get(&i.define_id);
@@ -494,12 +497,10 @@ impl ProcessRepository for MemoryRepository {
         let defines = self.defines.lock().unwrap();
         let mut rows: Vec<InstanceRow> = ccs
             .iter()
+            // issues/129：同上——抄送列表也不得把"没传 operator"折叠成"看全部"。
             .filter(|cc| {
-                query
-                    .operator
-                    .as_ref()
-                    .map(|op| &cc.actor_id == op)
-                    .unwrap_or(true)
+                let op = query.operator.as_deref().map(str::trim).unwrap_or("");
+                !op.is_empty() && cc.actor_id == op
             })
             .map(|cc| {
             let inst = instances.get(&cc.process_instance_id);

@@ -434,6 +434,22 @@ fn arg_str_or(args: &HashMap<String, Json>, key: &str, default: &str) -> String 
     arg_str(args, key).unwrap_or_else(|| default.to_string())
 }
 
+/// `operator` 取参 + 缺省兜底（issues/129）：对齐 Java 参考实现
+/// `toStr(args.get("operator"), "user1")`——门面不感知登录态，缺省走 demo 风格 `user1`
+/// （spec 06 §2.4）。空串/全空白同样按缺省处理：否则"没传"会在仓储层被折叠成"不过滤"，
+/// 一条不带 operator 的 `processInstance/page` 就能读到别人的实例（线上实测 4 → 25）。
+fn operator_arg(args: &HashMap<String, Json>, keys: &[&str]) -> String {
+    for k in keys {
+        if let Some(v) = arg_str(args, k) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    "user1".to_string()
+}
+
 /// 硬必填字符串参数：缺失或 trim 后为空串 → 返回携带统一 msg 的 Business 错误。
 /// 撤回/转办的 operator、fromActor、toActor 一律走它，严禁缺省回落固定账号（issues/114/115）。
 fn require_non_empty(
@@ -1055,7 +1071,7 @@ impl JeeflowFacade {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
         let mut query = PageQuery::new(page_num, page_size);
-        query.operator = arg_str(args, "operator");
+        query.operator = Some(operator_arg(args, &["operator"]));
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_instances(&query)?;
         let rows: Vec<Json> = page.rows.iter().map(instance_row_to_json).collect();
@@ -1358,7 +1374,7 @@ impl JeeflowFacade {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
         let mut query = PageQuery::new(page_num, page_size);
-        query.operator = arg_str(args, "operator");
+        query.operator = Some(operator_arg(args, &["operator"]));
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_cc_instances(&query)?;
         let rows: Vec<Json> = page.rows.iter().map(instance_row_to_json).collect();
@@ -1375,7 +1391,7 @@ impl JeeflowFacade {
         let page_size = arg_i64_or(args, "pageSize", 20)?;
         let mut query = PageQuery::new(page_num, page_size);
         // UI 注入 operator；兼容 userId（curl/旧客户端）
-        query.operator = arg_str(args, "operator").or_else(|| arg_str(args, "userId"));
+        query.operator = Some(operator_arg(args, &["operator", "userId"]));
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_todo_tasks(&query)?;
         let rows: Vec<Json> = page.rows.iter().map(task_row_to_json).collect();
@@ -1387,7 +1403,7 @@ impl JeeflowFacade {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 20)?;
         let mut query = PageQuery::new(page_num, page_size);
-        query.operator = arg_str(args, "operator");
+        query.operator = Some(operator_arg(args, &["operator"]));
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_done_tasks(&query)?;
         let rows: Vec<Json> = page.rows.iter().map(task_row_to_json).collect();
@@ -3826,6 +3842,112 @@ mod tests {
         let resp = facade.flow("processInstance/page", &HashMap::new()).await;
         assert_eq!(resp["code"], 0);
         assert!(resp["data"]["rows"].is_array());
+    }
+
+    /// issues/129 夹具：user1 与 user2 **各**一条实例 + 各自的待办/已办 + 抄送。
+    /// 必须存在"别人的行"——空仓上"不传 operator == 传 user1"恒真，那种夹具等于没测。
+    fn seed_operator_facade() -> (JeeflowFacade, Arc<MemoryRepository>) {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut design = ProcessDesign {
+            id: 2001, name: "op129".into(), display_name: "operator 兜底夹具".into(),
+            design_type: "op129".into(), icon: None, is_deployed: 1, remark: None,
+            create_time: None, create_user: None, update_time: None, update_user: None,
+        };
+        repo.save_design(&mut design).unwrap();
+        let mut ids = Vec::new();
+        for who in ["user1", "user2"] {
+            let mut inst = ProcessInstance {
+                instance_id: 0, parent_id: None, define_id: 2001, state: 10,
+                parent_node_name: None, business_no: None,
+                operator: who.into(), expire_time: None,
+                variables: FlowData::new(), tasks: vec![],
+                create_time: Some("2026-01-10 10:00:00".into()),
+                create_user: Some(who.into()),
+                update_time: None, update_user: None,
+                define: None,
+            };
+            repo.save_instance(&mut inst).unwrap();
+            ids.push(inst.instance_id);
+            // 待办：actor_ids 含本人；已办：actor_id = 本人且 state=20
+            let mut todo = ProcessTask {
+                task_id: 0, process_instance_id: inst.instance_id,
+                task_name: "a".into(), display_name: "待办".into(),
+                task_type: 0, perform_type: 0, task_state: 10,
+                actor_id: Some(who.into()), actor_ids: vec![who.into()],
+                finish_time: None, expire_time: None,
+                form_key: None, parent_task_id: None,
+                variables: FlowData::new(),
+                create_time: Some("2026-01-10 10:00:00".into()),
+                create_user: None, update_time: None, update_user: None,
+            };
+            repo.save_task(&mut todo).unwrap();
+            let mut done = ProcessTask {
+                task_id: 0, process_instance_id: inst.instance_id,
+                task_name: "b".into(), display_name: "已办".into(),
+                task_type: 0, perform_type: 0, task_state: 20,
+                actor_id: Some(who.into()), actor_ids: vec![],
+                finish_time: Some("2026-01-10 11:00:00".into()), expire_time: None,
+                form_key: None, parent_task_id: None,
+                variables: FlowData::new(),
+                create_time: Some("2026-01-10 10:00:00".into()),
+                create_user: None, update_time: None, update_user: None,
+            };
+            repo.save_task(&mut done).unwrap();
+            // 抄送也给每人一条：否则 ccList 在空 cc 表上"不传==传 user1==0"恒真，等于没测
+            repo.create_cc_instance(inst.instance_id, "user1", &[who.to_string()]).unwrap();
+        }
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(200000)));
+        (JeeflowFacade::new(ctx), repo)
+    }
+
+    async fn count_of(facade: &JeeflowFacade, action: &str, operator: Option<&str>) -> i64 {
+        let mut args: HashMap<String, Json> = HashMap::new();
+        if let Some(o) = operator {
+            args.insert("operator".to_string(), json!(o));
+        }
+        let resp = facade.flow(action, &args).await;
+        assert_eq!(resp["code"], 0, "{} => {}", action, resp);
+        resp["data"]["recordCount"].as_i64().unwrap_or(-1)
+    }
+
+    /// 正向：不传 operator 与传 `user1` 同答案（缺省兜底，对齐 Java）；
+    /// 负向：不存在的用户必须 0 行；**回归红线**：不传绝不能等于"全库"（修复前 page 是 2、todo 是 2）。
+    #[tokio::test]
+    async fn test_operator_absent_does_not_scan_all() {
+        for action in [
+            "processInstance/page",
+            "processTask/todoList",
+            "processTask/doneList",
+            "processInstance/ccList",
+        ] {
+            let (facade, _repo) = seed_operator_facade();
+            let none = count_of(&facade, action, None).await;
+            let mine = count_of(&facade, action, Some("user1")).await;
+            let ghost = count_of(&facade, action, Some("__nobody__")).await;
+            assert_eq!(none, mine, "{}: 不传 operator 与传 user1 不同 ⇒ 缺省没兜住", action);
+            assert_eq!(ghost, 0, "{}: 不存在的用户仍拿到行 ⇒ operator 过滤未生效", action);
+            assert!(none <= 1, "{}: 不传 operator 拿到 {} 行 ⇒ 空值被折叠成读全库（期望 ≤1）", action, none);
+        }
+    }
+
+    /// 绕开门面直连仓储：`operator=None` 必须空页（自定义 SPI 仓储不走门面兜底，
+    /// 只补门面不补仓储的话，这条会红——两处都得堵）。内存仓与 SQL 仓同判据。
+    #[test]
+    fn test_repository_empty_operator_returns_empty_page() {
+        let (_facade, repo) = seed_operator_facade();
+        let q = PageQuery::new(1, 20); // operator 字段默认 None
+        assert_eq!(repo.page_instances(&q).unwrap().record_count, 0, "page_instances 空 operator 不得读全库");
+        assert_eq!(repo.page_todo_tasks(&q).unwrap().record_count, 0, "page_todo_tasks 空 operator 不得读全库");
+        assert_eq!(repo.page_cc_instances(&q).unwrap().record_count, 0, "page_cc_instances 空 operator 不得读全库");
+        // 同一夹具下传了人就必须有行（防"永远返回空页"这种把泄漏改成失联的假修法）
+        let mut q2 = PageQuery::new(1, 20);
+        q2.operator = Some("user1".to_string());
+        assert_eq!(repo.page_instances(&q2).unwrap().record_count, 1, "user1 应有 1 条实例");
+        assert_eq!(repo.page_todo_tasks(&q2).unwrap().record_count, 1, "user1 应有 1 条待办");
+        assert_eq!(repo.page_cc_instances(&q2).unwrap().record_count, 1, "user1 应有 1 条抄送");
     }
 
     #[tokio::test]
