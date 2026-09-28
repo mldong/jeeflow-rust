@@ -2249,13 +2249,13 @@ fn build_node_progress(
         }
         // operatorList_{node} 优先，否则 actor_ids 并集
         let mut members: Vec<String> = Vec::new();
-        if let Some(list) = ts[0].variables.get_str(&format!("operatorList_{}", name)) {
-            members = list
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
+        // issues/131：名册现在是任务变量里的**数组**（java ProcessInstance.java:257 也是 List）。
+        // 逗号串那一支有意不兜——存量兼容不做（owner 2026-09-28）。
+        members = ts[0].variables
+            .get(&format!("operatorList_{}", name))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
         if members.is_empty() {
             let mut set = std::collections::HashSet::new();
             for t in &ts {

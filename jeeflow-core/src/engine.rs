@@ -368,15 +368,18 @@ impl JeeflowEngineImpl {
                 if actor_ids.is_empty() {
                     return Ok(());
                 }
-                // Store full operator list in instance variables
-                let op_list_key = format!("csv_{}_operatorList", node.id);
-                exec.process_instance.variables.insert_str(&op_list_key, actor_ids.join(","));
-                let lc_key = format!("csv_{}_loopCounter", node.id);
-                exec.process_instance.variables.insert_i64(&lc_key, 0);
                 // Create only the first actor's task
-                let tasks = exec.process_instance.create_countersign_tasks(
+                let mut tasks = exec.process_instance.create_countersign_tasks(
                     &node.id, &node.display_name, &[actor_ids[0].clone()], &exec.operator,
                     task_type, node.form_key(), None);
+                // issues/131：簿记三件落在首位成员任务的变量上（java ProcessInstance.java:257-259）。
+                // 聚合根 push 的是克隆 ⇒ 返回值与 tasks.last() 两份都写，才算"落库那份带上了"。
+                if let Some(t) = tasks.first_mut() {
+                    seed_countersign_bookkeeping(t, &node.id, &actor_ids, 0);
+                }
+                if let Some(t) = exec.process_instance.tasks.last_mut() {
+                    seed_countersign_bookkeeping(t, &node.id, &actor_ids, 0);
+                }
                 // TASK_START 不在这里 fire：此处 task_id 尚为 0（create_task 只置 0，
                 // 真实 id 由 persist_tasks→save_task 的 next_id 分配）。若在此 fire，
                 // 监听器 find_task(0) 查不到 → TODO 丢失（issues/13 salvo 栈根因，对齐
@@ -851,22 +854,29 @@ impl JeeflowEngineImpl {
                 // Fall through to 10b (follow output edges)
             } else if is_sequential {
                 // SEQUENTIAL: check if more actors to process
-                let op_list_key = format!("csv_{}_operatorList", node_id);
-                let lc_key = format!("csv_{}_loopCounter", node_id);
-                let op_list_str = exec.process_instance.variables.get_str_or(&op_list_key, "");
-                let operator_list: Vec<String> = op_list_str.split(',')
-                    .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                let lc = exec.process_instance.variables.get_i64_or(&lc_key, 0) as usize;
+                // issues/131：名单与序号从**刚完成那一条任务的变量**上读（java CountersignHandler
+                // .java:71-77 读 completed.getVariables()），不再读实例变量 csv_*。
+                let roster_key = format!("operatorList_{}", node_id);
+                let lc_key = format!("loopCounter_{}", node_id);
+                let operator_list: Vec<String> = countersign_roster(&task.variables, &roster_key);
+                let lc = task.variables.get_i64_or(&lc_key, 0) as usize;
 
                 if lc + 1 < operator_list.len() {
                     // Create next sequential task, do NOT follow edges
                     let next_lc = lc + 1;
-                    exec.process_instance.variables.insert_i64(&lc_key, next_lc as i64);
-                    let new_task = exec.process_instance.create_countersign_tasks(
+                    let mut new_task = exec.process_instance.create_countersign_tasks(
                         node_id, &node_ref.display_name,
                         &[operator_list[next_lc].clone()], &exec.operator,
                         TaskType::from_code(node_ref.task_type()),
                         node_ref.form_key(), None);
+                    // 三件重写在新任务上（java CountersignHandler.java:154-157）：名册原样带过去、
+                    // 序号 +1、总数不变 ⇒ 代理人只扩"当一步"的参与者，改不动票数。
+                    if let Some(t) = new_task.first_mut() {
+                        seed_countersign_bookkeeping(t, node_id, &operator_list, next_lc as i64);
+                    }
+                    if let Some(t) = exec.process_instance.tasks.last_mut() {
+                        seed_countersign_bookkeeping(t, node_id, &operator_list, next_lc as i64);
+                    }
                     exec.new_tasks.extend(new_task);
                     // Persist + return (no edge follow)
                     self.persist_tasks(&mut exec)?;
@@ -1180,6 +1190,29 @@ impl JeeflowEngineImpl {
     }
 }
 
+
+/// issues/131（案 A，以 java 为准）：串行会签簿记三件写在**成员任务的变量**上，
+/// 不再是实例变量 `csv_{node}_operatorList` 逗号串。判据基准逐字取 Java 参考实现：
+/// 写侧 `ProcessInstance.java:257-259`、读与推进侧 `CountersignHandler.java:71-84,154-157`。
+/// 名单必须是**数组**——门禁 L2-23 按 `len(值)` 数成员，逗号串会被数成字符串长度。
+fn seed_countersign_bookkeeping(t: &mut ProcessTask, node: &str, roster: &[String], loop_counter: i64) {
+    let list = JsonValue::Array(roster.iter().map(|a| JsonValue::Str(a.clone())).collect());
+    t.variables.insert(format!("operatorList_{}", node), list);
+    t.variables.insert_i64(format!("loopCounter_{}", node), loop_counter);
+    t.variables.insert_i64(format!("nrOfInstances_{}", node), roster.len() as i64);
+}
+
+/// 从任务变量读会签全量名册（数组形状；缺键/非数组 ⇒ 空表，与 java `toStringList` 同档）。
+/// 存量兼容**有意不做**（owner 2026-09-28：demo 重启即重建、pro 是 goframe 版本）
+/// ⇒ 不再兜底读旧的实例变量 `csv_*`。
+fn countersign_roster(vars: &FlowData, key: &str) -> Vec<String> {
+    vars.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default()
+}
+
+/// 取本次刚建出的那条任务（聚合根里 push 的是克隆，两份都要写才算落库）。
 /// 解析发起时抄送人（对齐 Go facade.go:203 issues/56 E28）：
 /// 支持 JSON 数组（vben 多选 ApiSelect 提交）与逗号分隔字符串两种形态。
 fn parse_cc_actors(v: Option<&JsonValue>) -> Vec<String> {
@@ -2365,7 +2398,11 @@ mod tests {
         add_surrogate(&repo, "userB", "cs-seq-approve", "agentB");
 
         let iid = start_and_apply(&engine, &repo, did).await;
-        let roster_key = "csv_task1_operatorList";
+        // issues/131（案 A，以 java 为准）：名册落点从实例变量 `csv_{node}_operatorList`（逗号串）
+        // 搬到**成员任务的变量** `operatorList_{node}`（数组）。三条判据分开钉：
+        // ①新键在任务上且是数组；②旧落点彻底没有（键名与容器一起搬家，不是"两边都写"）；
+        // ③名册不得被代理人扩写——改了就是改了票数（原断言的强度，保留）。
+        let roster_key = "operatorList_task1";
         let step1 = repo.find_doing_tasks(iid, &[]).unwrap();
         assert_eq!(step1.len(), 1, "串行会签一步只有一个在办任务");
         assert_eq!(
@@ -2374,9 +2411,16 @@ mod tests {
             "第一步任务的参与者 = 当步人 + 其代理人"
         );
         assert_eq!(
-            repo.find_instance_by_id(iid).unwrap().unwrap().variables.get_str(roster_key),
-            Some("userA,userB"),
-            "投票名册 operatorList 不得被代理人扩写（改了就是改了票数）"
+            countersign_roster(&step1[0].variables, roster_key),
+            vec!["userA".to_string(), "userB".to_string()],
+            "投票名册须落在任务变量 operatorList_节点 且是数组、不得被代理人扩写"
+        );
+        let inst_vars = &repo.find_instance_by_id(iid).unwrap().unwrap().variables;
+        assert!(
+            inst_vars.get(roster_key).is_none()
+                && inst_vars.get("csv_task1_operatorList").is_none()
+                && inst_vars.get("csv_task1_loopCounter").is_none(),
+            "簿记三件都不得再留在实例变量上（落点搬家＝换容器＋换键名）"
         );
 
         engine.execute_task_async(step1[0].task_id, "userA", &FlowData::new()).await.unwrap();
@@ -2388,9 +2432,19 @@ mod tests {
             "第二步推进出的任务同样并入当步代理人"
         );
         assert_eq!(
-            repo.find_instance_by_id(iid).unwrap().unwrap().variables.get_str(roster_key),
-            Some("userA,userB"),
-            "推进后名册仍不变"
+            countersign_roster(&step2[0].variables, roster_key),
+            vec!["userA".to_string(), "userB".to_string()],
+            "推进后名册仍不变（java CountersignHandler.java:154 把原名单重写在新任务上）"
+        );
+        assert_eq!(
+            step2[0].variables.get_i64_or("loopCounter_task1", -1),
+            1,
+            "推进后 loopCounter_节点 须 +1 写在新任务上（java:156）"
+        );
+        assert_eq!(
+            step2[0].variables.get_i64_or("nrOfInstances_task1", -1),
+            2,
+            "nrOfInstances_节点 全程是名册总人数，不随推进变小（java:157）"
         );
         let node_rows: Vec<i64> = repo.find_history_tasks(iid).unwrap()
             .iter().filter(|t| t.task_name == "task1").map(|t| t.task_id).collect();
