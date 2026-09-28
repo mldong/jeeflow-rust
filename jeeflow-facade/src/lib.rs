@@ -1155,16 +1155,27 @@ impl JeeflowFacade {
             return Err(JeeflowError::Business("无权限撤回该流程实例".into()));
         }
 
+        // issues/134 案 A：实例状态守卫在聚合根 `ProcessInstance::withdraw` 内
+        // （state≠10 ⇒ 内部码 20010009，出口 99999999 ＋ 固定文案「流程实例非进行中，无法撤回」），
+        // 本调用排在**一切改写与落库之前**——被拒时实例 state、任务行、update_user 一行都不动，
+        // 下方两次 update 也走不到（对齐 Java `JeeflowFacade.withdraw` 的 canWithdraw → inst.withdraw
+        // → updateInstance 序；鉴权两判据仍排在它之前，顺序未动）。
+        // 先快照"改写前哪些行是进行中"，让成功路径的 update_user 回写判据与改前逐字一致。
+        let doing_ids: Vec<i64> = inst.tasks.iter()
+            .filter(|t| t.task_state == TaskState::Doing.code())
+            .map(|t| t.task_id)
+            .collect();
+        inst.withdraw()?;
+
         // 实例 update_user 回写为撤回人。
         inst.update_user = Some(operator.clone());
         // 进行中任务的 update_user 同样回写（withdraw 只翻 Doing→Withdraw，
         // 已完成(20)/已终止(40) 的行不受影响，其 update_user 保持不动）。
         for task in &mut inst.tasks {
-            if task.task_state == TaskState::Doing.code() {
+            if doing_ids.contains(&task.task_id) {
                 task.update_user = Some(operator.clone());
             }
         }
-        inst.withdraw();
         // 级联落库判据取 Withdraw(30)：inst.withdraw() 已在内存里把进行中任务翻成 30，
         // 此处若仍判 Doing 则该循环永不命中，任务会留在库里 10（继续出现在待办）。
         for task in &inst.tasks {
@@ -5740,6 +5751,146 @@ mod tests {
         a2.insert("id".to_string(), json!(iid2));
         a2.insert("operator".to_string(), json!("flow.admin"));
         assert_eq!(facade2.flow("processInstance/withdraw", &a2).await["code"], 0, "admin 应放行");
+    }
+
+    // ─── issues/134 案 A · 撤回的实例状态守卫（非进行中 ⇒ 99999999 ＋ 固定文案，不落库）───
+    //
+    // 缺陷：issues/113 只管住**任务行**，**实例**层面没判状态 ⇒ 对已办结(20)/已终止(40) 的实例
+    // 调撤回会把实例静默改写成 30（已办列表/按状态聚合的统计凭空改历史，且不报错）。
+    // 判据（八栈逐字统一）：聚合根 withdraw 时 state != 10 ⇒ 内部码 20010009，**一行都不改、不落库**；
+    // 门面沿用 issues/121 口径吞内部码 ⇒ 出口 code=99999999 ＋ msg 逐字 ＝ 固定文案（文案不带码值）。
+    // 权威＝Java 参考实现 WithdrawInstanceStateGuardTest ＋ spec 06 §processInstance/withdraw。
+
+    /// 出口文案逐字固定（八栈一致）；L2 门禁按逐字断言，不许用"包含 撤回"这种宽松判据
+    const WD134_MSG: &str = "流程实例非进行中，无法撤回";
+
+    /// `{id, operator}` 撤回入参
+    fn wd134_withdraw_args(iid: i64, operator: &str) -> HashMap<String, Json> {
+        let mut m = HashMap::new();
+        m.insert("id".to_string(), json!(iid));
+        m.insert("operator".to_string(), json!(operator));
+        m
+    }
+
+    /// 任务行快照（行 id / 行状态 / 行 update_user），对账"一行都不改"
+    fn wd134_task_rows(facade: &JeeflowFacade, iid: i64) -> Vec<(i64, i32, Option<String>)> {
+        let mut rows: Vec<(i64, i32, Option<String>)> = facade.repo().find_history_tasks(iid).unwrap()
+            .into_iter()
+            .map(|t| (t.task_id, t.task_state, t.update_user))
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        rows
+    }
+
+    /// 实例快照（state / update_user）
+    fn wd134_instance(facade: &JeeflowFacade, iid: i64) -> (i32, Option<String>) {
+        let inst = facade.repo().find_instance_by_id(iid).unwrap()
+            .unwrap_or_else(|| panic!("实例 {} 应存在", iid));
+        (inst.state, inst.update_user)
+    }
+
+    /// 负向①（跨栈门禁格 L2-28 同形）：真把实例办到 state=20 再调撤回
+    /// ⇒ 出口 code=99999999 ＋ msg 逐字；**再读一次**实例仍 20，update_user 与任务行一行未动。
+    /// 撤回人用 `flow.admin` 哨兵（归属判据 3 放行），确保报错来自本案守卫而非鉴权分支。
+    #[tokio::test]
+    async fn test_withdraw_on_finished_instance_returns_verbatim_msg_and_does_not_persist() {
+        let facade = make_facade();
+        let (iid, approve_task) = start_two_step_flow(&facade, "wd134-finish-flow").await;
+        assert_eq!(exec_task(&facade, approve_task, "user2", vec![]).await["code"], 0, "办结应成功");
+
+        let before = wd134_instance(&facade, iid);
+        assert_eq!(before.0, InstanceState::Finished.code(), "夹具前提：实例已办结 state=20");
+        let rows_before = wd134_task_rows(&facade, iid);
+        assert!(!rows_before.is_empty(), "夹具前提：应有任务行");
+
+        let resp = facade.flow("processInstance/withdraw", &wd134_withdraw_args(iid, "flow.admin")).await;
+        assert_eq!(resp["code"], CODE_ERROR, "非进行中实例撤回必须报错（禁止静默成功）: {:?}", resp);
+        assert_eq!(resp["msg"], WD134_MSG, "出口 msg 逐字固定，内部码 20010009 不进 msg: {:?}", resp);
+        assert!(!resp["msg"].as_str().unwrap_or_default().contains("2001000"),
+                "内部码严禁进 msg: {:?}", resp);
+
+        let after = wd134_instance(&facade, iid);
+        assert_eq!(after.0, InstanceState::Finished.code(),
+                   "被拒后**再读一次**实例 state 必须仍是 20（本案病灶：改前会被静默改写成 30）");
+        assert_eq!(after.1, before.1, "被拒的那次不得落库改写实例 update_user");
+        assert_eq!(wd134_task_rows(&facade, iid), rows_before, "被拒的那次不得改写任务行");
+    }
+
+    /// 负向②：state=40（强行终止）档。门面没有"终止实例"的 action，壳侧同样造不出这一档
+    /// （issues/134 §5.2 因此把 L2-28 限定在 20 ＋ 正向 10），故用聚合根自己的 `interrupt`
+    /// 命令把存储里的实例自然推到 40，再走门面撤回。
+    #[tokio::test]
+    async fn test_withdraw_on_interrupted_instance_is_rejected() {
+        let facade = make_facade();
+        let (iid, _) = start_two_step_flow(&facade, "wd134-interrupt-flow").await;
+        let mut inst = facade.repo().find_instance_by_id(iid).unwrap().unwrap();
+        inst.interrupt();
+        inst.update_user = Some("boss".to_string());
+        facade.repo().update_instance(&inst).unwrap();
+        assert_eq!(wd134_instance(&facade, iid).0, InstanceState::Interrupt.code(),
+                   "夹具前提：实例已终止 state=40");
+
+        let resp = facade.flow("processInstance/withdraw", &wd134_withdraw_args(iid, "flow.admin")).await;
+        assert_eq!(resp["code"], CODE_ERROR, "已终止实例撤回必须报错: {:?}", resp);
+        assert_eq!(resp["msg"], WD134_MSG, "出口 msg 逐字固定: {:?}", resp);
+
+        let after = wd134_instance(&facade, iid);
+        assert_eq!(after.0, InstanceState::Interrupt.code(), "被拒后实例仍 40");
+        assert_eq!(after.1.as_deref(), Some("boss"), "被拒后不落库：update_user 仍是终止人");
+        for t in facade.repo().find_history_tasks(iid).unwrap() {
+            assert_ne!(t.task_state, TaskState::Withdraw.code(), "任务行不得被改成 30：{}", t.task_name);
+        }
+    }
+
+    /// 正向对照（门面级）：进行中(10) 的实例撤回照旧 code=0，实例落 30、进行中任务落 30 并回写
+    /// 撤回人；已完成(20) 的 apply 行仍不被改写（issues/113 的既有保护保持原样）。
+    #[tokio::test]
+    async fn test_withdraw_on_doing_instance_still_succeeds_and_lands_state30() {
+        let facade = make_facade();
+        let (iid, approve_task) = start_two_step_flow(&facade, "wd134-doing-flow").await;
+        let apply = facade.repo().find_history_tasks(iid).unwrap().into_iter()
+            .find(|t| t.task_name == "apply").expect("夹具前提：应有 apply 行");
+        assert_eq!(apply.task_state, TaskState::Finished.code(), "夹具前提：apply 行已办结 20");
+
+        let resp = facade.flow("processInstance/withdraw", &wd134_withdraw_args(iid, "applicant")).await;
+        assert_eq!(resp["code"], 0, "进行中实例撤回照旧成功（守卫没写反）: {:?}", resp);
+
+        let after = wd134_instance(&facade, iid);
+        assert_eq!(after.0, InstanceState::Withdraw.code(), "实例应落 30");
+        assert_eq!(after.1.as_deref(), Some("applicant"), "实例 update_user 回写撤回人");
+        assert!(facade.repo().find_doing_tasks(iid, &[]).unwrap().is_empty(),
+                "整单撤回后不应残留进行中任务");
+        let approve = facade.repo().find_task_by_id(approve_task).unwrap().unwrap();
+        assert_eq!(approve.task_state, TaskState::Withdraw.code(), "进行中任务行应落 30");
+        assert_eq!(approve.update_user.as_deref(), Some("applicant"), "被撤任务 update_user 回写撤回人");
+        let apply_after = facade.repo().find_task_by_id(apply.task_id).unwrap().unwrap();
+        assert_eq!(apply_after.task_state, TaskState::Finished.code(),
+                   "已完成(20) 行仍不得被撤回改写（issues/113 既有保护保持原样）");
+    }
+
+    /// 回归：守卫排在**鉴权之后**（issues/114 的两条既有文案顺序未被本案抢答），
+    /// 且负向都不改状态、不改行。
+    #[tokio::test]
+    async fn test_withdraw_state_guard_runs_after_permission_checks() {
+        let facade = make_facade();
+        let (iid, approve_task) = start_two_step_flow(&facade, "wd134-order-flow").await;
+        assert_eq!(exec_task(&facade, approve_task, "user2", vec![]).await["code"], 0, "办结应成功");
+        let inst_before = wd134_instance(&facade, iid);
+        assert_eq!(inst_before.0, InstanceState::Finished.code(), "夹具前提：实例已办结 state=20");
+        let rows_before = wd134_task_rows(&facade, iid);
+
+        let mut no_operator = HashMap::new();
+        no_operator.insert("id".to_string(), json!(iid));
+        let r1 = facade.flow("processInstance/withdraw", &no_operator).await;
+        assert_eq!(r1["code"], CODE_ERROR);
+        assert_eq!(r1["msg"], "operator 必填", "缺 operator 仍先命中必填校验: {:?}", r1);
+
+        let r2 = facade.flow("processInstance/withdraw", &wd134_withdraw_args(iid, "stranger")).await;
+        assert_eq!(r2["code"], CODE_ERROR);
+        assert_eq!(r2["msg"], "无权限撤回该流程实例", "鉴权文案仍排在状态守卫之前（顺序未动）: {:?}", r2);
+
+        assert_eq!(wd134_instance(&facade, iid), inst_before, "两条负向都不该改实例 state/update_user");
+        assert_eq!(wd134_task_rows(&facade, iid), rows_before, "两条负向都不该改写任务行");
     }
 
     // ─── transfer：正向留痕 + 挪待办 ───

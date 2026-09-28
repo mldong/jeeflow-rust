@@ -1,6 +1,7 @@
 //! Domain model — DDD aggregate root (ProcessInstance) + sub-entity (ProcessTask).
 //! Aligned with Java reference implementation: spec/03 (state machine), spec/04 (engine ops).
 
+use crate::error::{JeeflowError, JeeflowResult};
 use crate::json::{JsonValue, FlowData};
 use std::collections::HashMap;
 
@@ -320,13 +321,32 @@ impl ProcessInstance {
     }
 
     /// Withdraw (state → WITHDRAW=30).
-    pub fn withdraw(&mut self) {
+    ///
+    /// issues/134 案 A（owner 2026-09-28 拍板）：撤回只允许**进行中(10)** 的实例。实例不是 10
+    /// （已完成 20 / 已撤回 30 / 强行终止 40 / 已拒绝 45 / 挂起 50 / 已废弃 99）⇒ 报错，
+    /// **一行都不改、不落库**——守卫排在下面的任务行循环之前，否则已办结实例会被静默改写成 30
+    /// （已办列表与按状态聚合的统计凭空改历史，且调用方看不到任何报错）。
+    /// 任务行层面那句"已完成(20)/已终止(40) 行不改写"的既有保护（下方 `TaskState::Doing` 判据）
+    /// 保持原样，实例级守卫排在它之前。
+    ///
+    /// 对外 msg 用固定中文文案、不含引擎内部码：本栈 `JeeflowError::code()` 恒 99999999，
+    /// 与 20010007 / 20010008（`engine::rollback_to_parent`）同形——内部码 **20010009**
+    /// 只留在规范与本注释，门面出 `code=99999999` ＋ 这句原文，不拼码、不加前缀（issues/121 口径）。
+    ///
+    /// Err: `JeeflowError::Business`（内部码 20010009 实例非进行中）
+    pub fn withdraw(&mut self) -> JeeflowResult<()> {
+        const NOT_DOING: &str = "流程实例非进行中，无法撤回";   // 内部码 20010009
+
+        if self.state != InstanceState::Doing.code() {
+            return Err(JeeflowError::Business(NOT_DOING.to_string()));
+        }
         for task in &mut self.tasks {
             if task.task_state == TaskState::Doing.code() {
                 task.withdraw();
             }
         }
         self.state = InstanceState::Withdraw.code();
+        Ok(())
     }
 
     /// Add variables.
@@ -1036,8 +1056,115 @@ mod tests {
     fn test_instance_withdraw_state() {
         let define = make_define(1, "test");
         let mut inst = ProcessInstance::create(&define, "user1", &FlowData::new());
-        inst.withdraw();
+        // issues/134 案 A：withdraw 现在会因实例状态守卫返回 Result——这里夹具是进行中(10)，
+        // 期望值未动（仍断实例落 30），只按新签名 unwrap。
+        inst.withdraw().unwrap();
         assert_eq!(inst.state, InstanceState::Withdraw.code());
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/134 案 A · 撤回的实例状态守卫（聚合根 ProcessInstance::withdraw）
+    //
+    // 缺陷：issues/113 只落了**任务行**层面的保护（已完成 20 / 已终止 40 的行不被撤回改写），
+    // **实例**层面没判状态——对已办结(20)/已终止(40) 的实例调撤回会把实例静默改写成 30，
+    // 已办列表与按状态聚合的统计凭空改历史，调用方还看不到任何报错。
+    // 判据（八栈逐字统一）：state != 10(进行中) ⇒ 内部码 20010009，文案固定、**一行都不改**，
+    // 守卫排在任务行循环之前。权威＝Java 参考实现 WithdrawInstanceStateGuardTest + spec 06。
+    // ═══════════════════════════════════════════════════════
+
+    /// 出口文案逐字固定（八栈一致）；按逐字断言，不许用"包含 撤回"这种宽松判据。
+    /// 内部码 20010009 不进 msg（issues/121 口径；本栈 `JeeflowError::code()` 恒 99999999）。
+    const WD134_MSG: &str = "流程实例非进行中，无法撤回";
+
+    /// 一个进行中(10) 的实例：一行进行中任务 task1，参与者 leader，发起人 zhangsan。
+    /// 夹具刻意不设 update_user，负向档的"一行都不改"才照得出来。
+    fn wd134_doing_instance() -> ProcessInstance {
+        let define = make_define(9527, "134-guard");
+        let mut inst = ProcessInstance::create(&define, "zhangsan", &FlowData::new());
+        inst.instance_id = 9001;
+        inst.create_task("task1", "审批", &["leader".to_string()], "zhangsan",
+                         TaskType::Major, PerformType::Normal, None, None);
+        inst
+    }
+
+    /// 把实例**自然**办到 state=20（行真办结 + 聚合根 finish），不用手改 state 造假形状。
+    fn wd134_finished_instance() -> ProcessInstance {
+        let mut inst = wd134_doing_instance();
+        inst.tasks[0].finish("leader", &FlowData::new()).unwrap();
+        inst.finish();
+        assert_eq!(inst.state, InstanceState::Finished.code(), "夹具前提：实例已办结");
+        assert_eq!(inst.tasks[0].task_state, TaskState::Finished.code(), "夹具前提：任务行已办结");
+        inst
+    }
+
+    /// 断负向：错误变体 ＋ 文案逐字相等 ＋ 不含内部码 ＋ 实例状态/任务行一行未改。
+    fn wd134_assert_rejected_without_touching_rows(inst: &mut ProcessInstance, original_state: i32) {
+        use crate::error::ERR_BUSINESS;
+        let row_states_before: Vec<i32> = inst.tasks.iter().map(|t| t.task_state).collect();
+        let row_users_before: Vec<Option<String>> =
+            inst.tasks.iter().map(|t| t.update_user.clone()).collect();
+        let update_user_before = inst.update_user.clone();
+
+        let err = inst.withdraw().err()
+            .expect("非进行中实例撤回必须报错，不得静默改写为 30");
+        match &err {
+            JeeflowError::Business(msg) => {
+                assert_eq!(msg, WD134_MSG, "文案逐字固定（不带码值、不带前缀）");
+            }
+            other => panic!("本栈形状应与 20010007/20010008 同形（Business 变体），实得 {:?}", other),
+        }
+        assert_eq!(err.code(), ERR_BUSINESS, "本栈出口码恒 99999999");
+        assert!(!err.message().contains("2001000"),
+                "内部码 20010009 严禁进 msg，实得 {}", err.message());
+
+        assert_eq!(inst.state, original_state, "被拒后实例状态必须仍是原值 {}", original_state);
+        // 病灶判据：被拒绝不能把实例静默改成 30。负向③（已撤回 30 二次撤）原值就是 30，
+        // 那条由上一行的"仍是原值"覆盖，这里只对 20/40 两档显式钉"不得变成 30"。
+        if original_state != InstanceState::Withdraw.code() {
+            assert_ne!(inst.state, InstanceState::Withdraw.code(), "实例状态严禁被改写成 30(已撤回)");
+        }
+        assert_eq!(inst.update_user, update_user_before, "被拒的那次不得写实例 update_user");
+        let row_states_after: Vec<i32> = inst.tasks.iter().map(|t| t.task_state).collect();
+        let row_users_after: Vec<Option<String>> =
+            inst.tasks.iter().map(|t| t.update_user.clone()).collect();
+        assert_eq!(row_states_after, row_states_before, "任务行状态不得被改写");
+        assert_eq!(row_users_after, row_users_before, "任务行 update_user 不得被改写");
+    }
+
+    /// 负向①：已完成(20) 的实例调撤回 ⇒ 20010009 ＋ 固定文案，实例仍 20、行仍 20
+    #[test]
+    fn test_withdraw_on_finished_instance_is_rejected_and_keeps_state() {
+        let mut inst = wd134_finished_instance();
+        wd134_assert_rejected_without_touching_rows(&mut inst, InstanceState::Finished.code());
+    }
+
+    /// 负向②：强行终止(40) 的实例调撤回 ⇒ 同样拒绝，实例仍 40、行仍 40
+    /// （门面/壳侧造不出这一档，issues/134 §5.2 把 L2-28 限定在 20 ＋ 正向 10，故由本栈单测钉住）
+    #[test]
+    fn test_withdraw_on_interrupted_instance_is_rejected_and_keeps_state() {
+        let mut inst = wd134_doing_instance();
+        inst.interrupt();
+        assert_eq!(inst.state, InstanceState::Interrupt.code(), "夹具前提：实例已终止");
+        assert_eq!(inst.tasks[0].task_state, TaskState::Interrupt.code(), "夹具前提：任务行已终止");
+        wd134_assert_rejected_without_touching_rows(&mut inst, InstanceState::Interrupt.code());
+    }
+
+    /// 负向③：已撤回(30) 的实例二次撤回同样被拒——重复撤不得把状态再翻一次
+    #[test]
+    fn test_withdraw_on_already_withdrawn_instance_is_rejected_on_second_call() {
+        let mut inst = wd134_doing_instance();
+        inst.withdraw().expect("首次：进行中，照旧成功");
+        assert_eq!(inst.state, InstanceState::Withdraw.code());
+        wd134_assert_rejected_without_touching_rows(&mut inst, InstanceState::Withdraw.code());
+    }
+
+    /// 正向对照：进行中(10) 的实例撤回照旧成功，实例与进行中任务都落 30（防"守卫写反"假绿）
+    #[test]
+    fn test_withdraw_on_doing_instance_still_succeeds_and_lands_state30() {
+        let mut inst = wd134_doing_instance();
+        inst.withdraw().expect("进行中实例撤回应成功（守卫没写反）");
+        assert_eq!(inst.state, InstanceState::Withdraw.code(), "进行中实例撤回应落 30(WITHDRAW)");
+        assert_eq!(inst.tasks[0].task_state, TaskState::Withdraw.code(), "进行中任务行应落 30");
     }
 
     #[test]
