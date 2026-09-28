@@ -397,6 +397,11 @@ impl ProcessInstance {
     }
 
     /// Create a reject task (退回上一步 — new task for previous node).
+    ///
+    /// ⚠️ issues/126 案 A 普查：本函数**全仓零调用者**（回退新建实际走 `engine.rs` 的
+    /// `rollback_to_parent`，那条已接到期写点④）。按启动词 §1.9-1 口径**不接线、不删、不为它造测试**：
+    /// 本签名没有节点引用 ⇒ 拿不到到期表达式，接一次就要改公开签名（发布 crate 的破坏性改动）。
+    /// 将来复活它时记得补 `expire_time::apply_expire_time`（Java 同名方法 `rejectTask` 是五处写点之一）。
     pub fn reject_task(&mut self, task_name: &str, display_name: &str,
                         actor_ids: &[String], operator: &str,
                         parent_task_id: i64) -> ProcessTask {

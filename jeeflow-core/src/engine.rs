@@ -360,6 +360,8 @@ impl JeeflowEngineImpl {
 
         let perform_type = PerformType::from_code(node.perform_type());
         let task_type = TaskType::from_code(node.task_type());
+        // issues/126 案 A：节点上配的到期表达式一次读好、三条建单支路共用（未配 ⇒ 该列保持 NULL）
+        let expr = crate::expire_time::expire_expr_of(node);
 
         let task = if perform_type == PerformType::Countersign {
             let cs_type = node.countersign_type();
@@ -380,6 +382,10 @@ impl JeeflowEngineImpl {
                 if let Some(t) = exec.process_instance.tasks.last_mut() {
                     seed_countersign_bookkeeping(t, &node.id, &actor_ids, 0);
                 }
+                // issues/126 案 A 写点②：串行会签**首位成员**按节点表达式算到期时间
+                // （变量源＝实例变量，对齐 Java `this.variables` / boot2 `execution.getArgs()`）
+                stamp_expire(&mut tasks, &mut exec.process_instance.tasks, expr.as_deref(),
+                             &exec.process_instance.variables);
                 // TASK_START 不在这里 fire：此处 task_id 尚为 0（create_task 只置 0，
                 // 真实 id 由 persist_tasks→save_task 的 next_id 分配）。若在此 fire，
                 // 监听器 find_task(0) 查不到 → TODO 丢失（issues/13 salvo 栈根因，对齐
@@ -389,17 +395,25 @@ impl JeeflowEngineImpl {
                 exec.process_instance.tasks.last().cloned().unwrap()
             } else {
                 // PARALLEL: create all tasks at once
-                let tasks = exec.process_instance.create_countersign_tasks(
+                let mut tasks = exec.process_instance.create_countersign_tasks(
                     &node.id, &node.display_name, &actor_ids, &exec.operator,
                     task_type, node.form_key(), None);
+                // issues/126 案 A 写点③：并行会签**全员**逐条按节点表达式算到期时间
+                stamp_expire(&mut tasks, &mut exec.process_instance.tasks, expr.as_deref(),
+                             &exec.process_instance.variables);
                 // TASK_START 统一改在 persist_tasks 落库后 fire（见下）。
                 exec.new_tasks.extend(tasks);
                 exec.process_instance.tasks.last().cloned().unwrap()
             }
         } else {
-            exec.process_instance.create_task(
+            let mut task = exec.process_instance.create_task(
                 &node.id, &node.display_name, &actor_ids, &exec.operator,
-                task_type, perform_type, node.form_key(), None)
+                task_type, perform_type, node.form_key(), None);
+            // issues/126 案 A 写点①：普通建单按节点表达式算到期时间；
+            // 节点没配 ⇒ 这一列保持 NULL（不写 now()、不写 ''、不写 0）
+            stamp_expire(std::slice::from_mut(&mut task), &mut exec.process_instance.tasks,
+                         expr.as_deref(), &exec.process_instance.variables);
+            task
         };
 
         // TASK_START 统一改在 persist_tasks 落库后 fire（见下）。此处只登记新任务。
@@ -842,6 +856,8 @@ impl JeeflowEngineImpl {
             let cs_type = node_ref.countersign_type();
             let cond = node_ref.countersign_completion_condition();
             let is_sequential = cs_type.to_uppercase() == "SEQUENTIAL" || cs_type.to_uppercase() == "SERIAL";
+            // issues/126 案 A：串行推进那一支要用的节点到期表达式（其余档位走不到，读一次不贵）
+            let cs_expr = crate::expire_time::expire_expr_of(node_ref);
 
             // Check one-vote veto gate first
             let veto_hit = submit_type == Some(20)
@@ -877,6 +893,13 @@ impl JeeflowEngineImpl {
                     if let Some(t) = exec.process_instance.tasks.last_mut() {
                         seed_countersign_bookkeeping(t, node_id, &operator_list, next_lc as i64);
                     }
+                    // issues/126 案 A 写点⑤（§1.8 里最容易被漏掉的那一处）：串行会签**推进出的
+                    // 下一位成员**。java 侧这一支是 `CountersignHandler.createNextCountersignTask`，
+                    // 聚合根为此专开公开入口 `applyNodeExpireTime`（commit `cb541d4`）；基准侧 boot2
+                    // 的串行推进是回调 `createCountersignTask`（`ProcessTaskServiceImpl:485`，
+                    // 内含 :524 那处到期写）⇒ 不补就是"首成员有到期、第二三位没有"。
+                    stamp_expire(&mut new_task, &mut exec.process_instance.tasks,
+                                 cs_expr.as_deref(), &exec.process_instance.variables);
                     exec.new_tasks.extend(new_task);
                     // Persist + return (no edge follow)
                     self.persist_tasks(&mut exec)?;
@@ -1179,6 +1202,20 @@ impl JeeflowEngineImpl {
         revived.actor_id = None;                 // 进行中任务该列恒无值
         revived.actor_ids = vec![operator];
         revived.finish_time = None;
+        // issues/126 案 A 写点④（回退/跳转新建）：到期时间按**被回退掉的那个节点**（＝当前行所在
+        // 节点）的表达式重算——逐字对齐基准侧 boot2 `ProcessTaskServiceImpl.rejectTask` 的
+        // `String expireTime = ((TaskModel)current).getExpireTime();` 与 Java 参考实现
+        // `ProcessInstance.rejectTask`（commit `cb541d4`）。
+        // ⚠️ 变量源用**随行拷贝那份变量** `vars`（＝boot2 的 hisVariable），不是实例变量——
+        // 两档搞混会让"表达式是个变量名"这一档跨栈给出不同答案（§1 变量源那段）。
+        // 当前节点没配表达式 ⇒ 尺子直接 return，复活行沿用 `history` 克隆来的继承值（boot2 同形）。
+        // （附带发现：姊妹栈 go `d10ebd0` 这一支取的是 `prev`＝复活行的节点，与 boot2/java 不一致。）
+        if let Some(cur_node) = exec.process_model.get_node(&current.task_name) {
+            if matches!(cur_node.node_type, NodeType::Task | NodeType::Custom) {
+                let cur_expr = crate::expire_time::expire_expr_of(cur_node);
+                crate::expire_time::apply_expire_time(&mut revived, cur_expr.as_deref(), &vars);
+            }
+        }
         revived.variables = vars;
         // parent 随行拷贝＝"上一步的上一步"。**老行该列为 NULL 时必须落 0，不能留 None**：
         // 留 None 会被 persist_tasks 的建单不变量补成"本次被回退掉的那个任务"id，
@@ -1200,6 +1237,33 @@ fn seed_countersign_bookkeeping(t: &mut ProcessTask, node: &str, roster: &[Strin
     t.variables.insert(format!("operatorList_{}", node), list);
     t.variables.insert_i64(format!("loopCounter_{}", node), loop_counter);
     t.variables.insert_i64(format!("nrOfInstances_{}", node), roster.len() as i64);
+}
+
+/// issues/126 案 A：**五处建单写点共用的尺子**（对齐 Java `ProcessInstance.applyExpireTime` 一把尺子
+/// 量五处，commit `cb541d4`；本栈写点清单见 `expire_time` 模块头与五处调用点注释）。
+///
+/// 聚合根 `create_task` / `create_countersign_tasks` push 进 `instance.tasks` 的是**克隆**，
+/// 交回引擎、最终由 `persist_tasks` 落库的是返回值 ⇒ 两份都要写才算数
+/// （issues/131 同款教训，见 `seed_countersign_bookkeeping` 的两个 `if let`）。
+///
+/// 参数按字段拆开传（`new` / `aggregate` / `args` 三个借用互不重叠），调用点直接借 `exec` 的
+/// 两个字段就能过借用检查——否则会撞成"同时可变借 `exec.process_instance`"。
+///
+/// `expr` 为空（节点没配）⇒ 一份都不动：这一列保持 NULL，不写 `now()`、不写 `''`、不写 0。
+fn stamp_expire(new: &mut [ProcessTask], aggregate: &mut Vec<ProcessTask>,
+                expr: Option<&str>, args: &FlowData) {
+    for t in new.iter_mut() {
+        crate::expire_time::apply_expire_time(t, expr, args);
+    }
+    let n = new.len();
+    if n == 0 || n > aggregate.len() {
+        return;
+    }
+    let start = aggregate.len() - n;
+    for i in 0..n {
+        let v = new[i].expire_time.clone();
+        aggregate[start + i].expire_time = v;
+    }
 }
 
 /// 从任务变量读会签全量名册（数组形状；缺键/非数组 ⇒ 空表，与 java `toStringList` 同档）。
@@ -2860,4 +2924,254 @@ mod tests {
         assert!(e2.to_string().contains("无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务") && !e2.to_string().contains("2001000"), "实得 {}", e2.to_string());
     }
 
+    // ═══════════════════════════════════════════════════════
+    // issues/126 案 A · 任务行 expire_time 的**五处建单写点**（内存仓路）
+    //   形状照 Java 参考实现 `ExpireTimeOnCreateTest`（d9e9397）+ `JeeflowFacadeTest` 两格（cb541d4），
+    //   以及同批已落地的 go `engine/expire_time_test.go`（d10ebd0）。
+    //   断言一律打在**仓储读回的持久行**上（不是引擎返回的聚合对象）——issues/113 教训：
+    //   只有读回值能证明"这一列真进了库"。本文件只新增断言，未改任何既有断言的期望值。
+    // ═══════════════════════════════════════════════════════
+
+    /// 夹具构造器：start → (specs 逐个 task 节点) → end 的线性流。
+    /// `specs` 给的是**完整**的 properties 片段（不玩"基础片段 + 覆盖"，免得同名键靠后者胜出）。
+    fn exp_flow(name: &str, specs: &[(&str, &str)]) -> String {
+        let mut nodes = vec![
+            r#"{"id":"start","type":"snaker:start","properties":{},"text":{"value":"开始"}}"#.to_string(),
+        ];
+        let mut edges: Vec<String> = Vec::new();
+        let mut prev = "start".to_string();
+        for (i, (id, props)) in specs.iter().enumerate() {
+            nodes.push(format!(
+                r#"{{"id":"{id}","type":"snaker:task","properties":{{{props}}},"text":{{"value":"节点{n}"}}}}"#,
+                id = id, props = props, n = i + 1));
+            edges.push(format!(
+                r#"{{"id":"e{i}","sourceNodeId":"{prev}","targetNodeId":"{id}","properties":{{}}}}"#,
+                i = i, prev = prev, id = id));
+            prev = id.to_string();
+        }
+        nodes.push(
+            r#"{"id":"end","type":"snaker:end","properties":{},"text":{"value":"结束"}}"#.to_string());
+        edges.push(format!(
+            r#"{{"id":"eend","sourceNodeId":"{prev}","targetNodeId":"end","properties":{{}}}}"#,
+            prev = prev));
+        let out = format!(
+            r#"{{"name":"{name}","displayName":"到期时间建单","type":"approval","nodes":[{}],"edges":[{}]}}"#,
+            nodes.join(","), edges.join(","));
+        out
+    }
+
+    fn exp_submit(t: i64) -> FlowData {
+        let mut a = FlowData::new();
+        a.insert_i64("submitType", t);
+        a
+    }
+
+    /// 读回某节点的 DOING 行，**条数不符直接红**——"行没读到"与"值为空"必须分开断，
+    /// 否则未配那一档会拿"压根没查到行"混成"查到且为空"，判据恒真（§1.8 的点名要求）。
+    fn exp_doing(repo: &MemoryRepository, iid: i64, node: &str, want: usize) -> Vec<ProcessTask> {
+        let mut rows: Vec<ProcessTask> = repo.find_doing_tasks(iid, &[]).unwrap()
+            .into_iter().filter(|t| t.task_name == node).collect();
+        rows.sort_by_key(|t| t.task_id);
+        assert_eq!(rows.len(), want, "节点 {node} 的 DOING 行数应为 {want}（这是\"行没读到\"那一档，与值为空分开）");
+        rows
+    }
+
+    /// 从 DOING 行里取某参与者那条（取不到即红＝"行没读到"）
+    fn exp_actor(rows: &[ProcessTask], actor: &str) -> ProcessTask {
+        rows.iter().find(|t| t.actor_ids.iter().any(|a| a == actor))
+            .unwrap_or_else(|| panic!("参与者 {actor} 的 DOING 行没读到（实得 {:?}）",
+                rows.iter().map(|t| t.actor_ids.clone()).collect::<Vec<_>>()))
+            .clone()
+    }
+
+    /// 同行 expire − create ≈ 表达式偏移（**不许只判非空**：只判非空就会被占位 now() 蒙过去，
+    /// 那正是本病灶的形状）。带宽 [-5s, +60s] 与 java/go 同档：秒级 floor + 落库耗时。
+    fn exp_expire_about(row: &ProcessTask, want: i64, who: &str) {
+        let exp = row.expire_time.as_deref()
+            .unwrap_or_else(|| panic!("{who} 配了到期表达式，expire_time 却是空"));
+        let cre = row.create_time.as_deref()
+            .unwrap_or_else(|| panic!("{who} 的 create_time 应有值（内部对照）"));
+        let delta = crate::expire_time::to_epoch_secs(exp).unwrap()
+            - crate::expire_time::to_epoch_secs(cre).unwrap();
+        assert!(delta >= want - 5 && delta <= want + 60,
+            "{who} 的 expire − create = {delta}s，期望 ≈{want}s（带宽 -5s/+60s）；\
+             占位 now() 会算出 ≈0 ⇒ 新建即逾期");
+    }
+
+    /// 该列必须为空（未配 / 解析不出两档共用），并要求行本身读到了
+    fn exp_expire_null(row: &ProcessTask, why: &str) {
+        assert!(row.create_time.is_some(), "内部对照：{why} 那行的 create_time 应有值");
+        assert_eq!(row.expire_time, None,
+            "{why}：expire_time 被赋成 {:?}，期望保持空（不造默认值、不写 now()）", row.expire_time);
+    }
+
+    /// T0 正向①：普通建单（写点①）配 `2h` ⇒ 同一行 expire − create ≈ 2h
+    #[tokio::test]
+    async fn test_i126_normal_create_relative_expression() {
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i126_2h";
+        let did = save_define(&repo, name,
+            &exp_flow(name, &[("approve", r#""assignee":"zhangsan","expireTime":"2h""#)]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        exp_expire_about(&exp_doing(&repo, inst.instance_id, "approve", 1)[0], 7200, "普通建单（写点①）");
+    }
+
+    /// T0 正向②：表达式是**变量名** ⇒ 取实例变量里那个变量的值
+    /// （建单三处的变量源＝实例变量，对齐 Java `this.variables` / boot2 `execution.getArgs()`）
+    #[tokio::test]
+    async fn test_i126_normal_create_expression_is_variable() {
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i126_var";
+        let did = save_define(&repo, name,
+            &exp_flow(name, &[("approve", r#""assignee":"zhangsan","expireTime":"dueAt""#)]));
+        let mut args = FlowData::new();
+        args.insert_str("dueAt", "2026-12-31 10:00:00");
+        let inst = engine.start_async(did, "zhangsan", &args).await.unwrap();
+        let row = &exp_doing(&repo, inst.instance_id, "approve", 1)[0];
+        assert_eq!(row.expire_time.as_deref(), Some("2026-12-31 10:00:00"),
+            "表达式 dueAt 命中实例变量 ⇒ 该取变量值，而不是 now+偏移");
+    }
+
+    /// T0 负向③：未配的三档（属性缺键 / JSON null / 空串）⇒ 该列保持 NULL，不许造默认值。
+    /// 三档并排是因为"投成空串还是缺键"这种形状差异本身就藏过病灶（见 `expire_expr_of` 注释）。
+    #[tokio::test]
+    async fn test_i126_normal_create_unconfigured_keeps_null() {
+        for (i, &props) in [
+            r#""assignee":"zhangsan""#,
+            r#""assignee":"zhangsan","expireTime":null"#,
+            // 空串那档不能写进 `r#"..."#`：结尾连着的 `""#` 会被 raw string 当成终止符而吞掉一个引号
+            "\"assignee\":\"zhangsan\",\"expireTime\":\"\"",
+        ].iter().enumerate() {
+            let (engine, repo) = make_surrogate_engine();
+            let name = format!("i126_none{i}");
+            let did = save_define(&repo, &name, &exp_flow(&name, &[("approve", props)]));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            exp_expire_null(&exp_doing(&repo, inst.instance_id, "approve", 1)[0],
+                ["属性缺键（未配）", "配成 JSON null", "配成空串"][i]);
+        }
+    }
+
+    /// T0 负向④：解析不出 ⇒ 空，而不是退回 now()（§1.9-3 的"前缀非整数 ⇒ 落穿 ⇒ NULL"同档）
+    #[tokio::test]
+    async fn test_i126_normal_create_unparsable_stays_null() {
+        for expr in ["not-a-time", "xh", "2027-03-04"] {
+            let (engine, repo) = make_surrogate_engine();
+            let name = format!("i126_bad_{expr}");
+            let did = save_define(&repo, &name, &exp_flow(&name,
+                &[("approve", &format!(r#""assignee":"zhangsan","expireTime":"{expr}""#))]));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            exp_expire_null(&exp_doing(&repo, inst.instance_id, "approve", 1)[0],
+                &format!("表达式 {expr} 解析不出"));
+        }
+    }
+
+    /// 写点③：并行会签**全员**逐条都要带到期时间
+    #[tokio::test]
+    async fn test_i126_parallel_countersign_every_member() {
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i126_par";
+        let did = save_define(&repo, name, &exp_flow(name, &[(
+            "cs", r#""assignee":"zhangsan,lisi","performType":1,"countersignType":"PARALLEL","expireTime":"2h""#,
+        )]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let rows = exp_doing(&repo, inst.instance_id, "cs", 2); // 并行＝全员一次建齐
+        for row in rows.iter() {
+            exp_expire_about(row, 7200, "并行会签成员");
+        }
+    }
+
+    /// §1.8 格一（写点②＋⑤）：串行会签**首位成员**有到期 ∧ **推进出的第二成员**也有到期。
+    /// 第五处是四处写点之外最容易漏的一条（java `CountersignHandler.createNextCountersignTask`
+    /// 绕过建单 helper；基准 boot2 的串行推进回调 `createCountersignTask`，:524 在写）。
+    #[tokio::test]
+    async fn test_i126_sequential_first_and_advanced_member_both_expire() {
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i126_seq";
+        let did = save_define(&repo, name, &exp_flow(name, &[(
+            "cs", r#""assignee":"userA,userB","performType":1,"countersignType":"SEQUENTIAL","expireTime":"2h""#,
+        )]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+
+        let first = exp_actor(&exp_doing(&repo, iid, "cs", 1), "userA");
+        exp_expire_about(&first, 7200, "串行会签首成员（写点②）");
+
+        engine.execute_task_async(first.task_id, "userA", &exp_submit(1)).await.unwrap();
+        let second = exp_actor(&exp_doing(&repo, iid, "cs", 1), "userB");
+        exp_expire_about(&second, 7200, "推进新建的第二成员（写点⑤）");
+    }
+
+    /// §1.8 格二：同一条串行会签夹具**去掉 expireTime** ⇒ 首成员与推进成员两行都留空。
+    /// "行没读到"与"值为空"分开断（`exp_doing`/`exp_actor` 先保证行在，再看值），否则这条恒真。
+    #[tokio::test]
+    async fn test_i126_sequential_unconfigured_keeps_both_members_null() {
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i126_seq_none";
+        let did = save_define(&repo, name, &exp_flow(name, &[(
+            "cs", r#""assignee":"userA,userB","performType":1,"countersignType":"SEQUENTIAL""#,
+        )]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+
+        let first = exp_actor(&exp_doing(&repo, iid, "cs", 1), "userA");
+        exp_expire_null(&first, "未配的串行会签首成员");
+        engine.execute_task_async(first.task_id, "userA", &exp_submit(1)).await.unwrap();
+        let second = exp_actor(&exp_doing(&repo, iid, "cs", 1), "userB");
+        exp_expire_null(&second, "未配时推进出的第二成员");
+    }
+
+    /// 写点④正向（回退新建）：到期表达式取**被回退掉的那个节点**（＝当前行节点）的，
+    /// 逐字对齐 boot2 `ProcessTaskServiceImpl.rejectTask` 的 `((TaskModel)current).getExpireTime()`。
+    /// 夹具把表达式**只配在 approve（当前节点）**上 ⇒ 若实现错取"复活行那个节点（apply）"的表达式，
+    /// 这里就会拿到空 ⇒ 这一格直接把两档分开（go `d10ebd0` 取的正是后者，已在报告点名）。
+    #[tokio::test]
+    async fn test_i126_rollback_uses_current_node_expression() {
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i126_rb";
+        let did = save_define(&repo, name, &exp_flow(name, &[
+            ("apply", r#""assignee":"zhangsan""#),
+            ("approve", r#""assignee":"lisi","expireTime":"2h""#),
+        ]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+        let apply = exp_doing(&repo, iid, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &exp_submit(1)).await.unwrap();
+        let approve = exp_doing(&repo, iid, "approve", 1)[0].clone();
+        assert!(approve.expire_time.is_some(), "前置条件：approve 那行自己就该带到期时间");
+
+        engine.execute_and_jump_async(approve.task_id, "lisi", &exp_submit(3), None).await.unwrap();
+        let revived = exp_doing(&repo, iid, "apply", 1)[0].clone();
+        assert_ne!(revived.task_id, apply.task_id, "复活应是**新行**，不是把原行改回进行中");
+        exp_expire_about(&revived, 7200, "回退新建的复活行（写点④）");
+    }
+
+    /// 写点④的变量源：回退新建用**随行拷贝那份变量**（boot2 的 hisVariable），不是实例变量。
+    /// 两份都放 `dueAt` 且值不同：实例那份＝发起时给的 2027，行那份＝办结 apply 时给的 2028
+    /// ⇒ 取到 2027 就说明变量源错接成了实例变量（§1「两档搞混会让变量名这一档跨栈给出不同答案」）。
+    #[tokio::test]
+    async fn test_i126_rollback_reads_carried_variables_not_instance() {
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i126_rb_var";
+        let did = save_define(&repo, name, &exp_flow(name, &[
+            ("apply", r#""assignee":"zhangsan""#),
+            ("approve", r#""assignee":"lisi","expireTime":"dueAt""#),
+        ]));
+        let mut start_args = FlowData::new();
+        start_args.insert_str("dueAt", "2027-01-01 01:01:01"); // 实例变量那份
+        let inst = engine.start_async(did, "zhangsan", &start_args).await.unwrap();
+        let iid = inst.instance_id;
+        assert_eq!(inst.variables.get_str("dueAt"), Some("2027-01-01 01:01:01"),
+            "前置条件：实例变量里是 2027 那份");
+
+        let apply = exp_doing(&repo, iid, "apply", 1)[0].clone();
+        let mut row_args = exp_submit(1);
+        row_args.insert_str("dueAt", "2028-02-02 02:02:02"); // 只进**这一行**的变量
+        engine.execute_task_async(apply.task_id, "zhangsan", &row_args).await.unwrap();
+        let approve = exp_doing(&repo, iid, "approve", 1)[0].clone();
+
+        engine.execute_and_jump_async(approve.task_id, "lisi", &exp_submit(3), None).await.unwrap();
+        let revived = exp_doing(&repo, iid, "apply", 1)[0].clone();
+        assert_eq!(revived.expire_time.as_deref(), Some("2028-02-02 02:02:02"),
+            "回退新建必须读随行那份（2028）；实得 {:?}＝读成实例变量或压根没算", revived.expire_time);
+    }
 }
