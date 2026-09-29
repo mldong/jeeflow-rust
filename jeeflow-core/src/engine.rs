@@ -113,12 +113,98 @@ impl JeeflowEngineImpl {
     /// 抄送知会事件（CC_CREATE / issues/102·104）：逐抄送人 fire，`cc_actor_id` 直传事件体。
     /// 接收人过滤（trim / 非空 / 去重）由集成层监听器负责，引擎只按 cc 行粒度 fire
     /// （对齐 Java `notifyCcCreate` / PHP v1.3.8）。无监听器装配时零副作用。
+    ///
+    /// **三条抄送路径共用本函数**（规范 11 §11.2 原则 1 ＋ §11.7）：发起 `f_ccActors`、
+    /// 办理 `tf_ccActors`、门面手动 `processInstance/createCCInstance`——"新增了一条抄送记录"
+    /// 这个事实成立就 fire `CC_CREATE`(4)，路径不进事件名。
     pub fn notify_cc_create(&self, instance_id: i64, cc_actors: &[String]) {
         for actor in cc_actors {
             let event = ProcessEvent::new(ProcessEventType::CcCreate, instance_id)
                 .with_cc_actor_id(actor.clone());
-            ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+            self.fire_event(event);
         }
+    }
+
+    /// 事件**唯一 fire 口**（引擎内部与门面手动路径共用，规范 11 §11.5）。
+    ///
+    /// 语义要点：① fire 必须排在**落库之后**（§11.2 原则 3——先 fire 后落库会让监听器
+    /// 站内信反查 / persist 回写读到旧状态，issues/121·126 同一族）；② 监听器异常
+    /// 在 [`ProcessPublisher::notify`] 内逐监听器隔离，**不经 `?` 传播**，故本方法返回 `()`。
+    pub fn fire_event(&self, event: ProcessEvent) {
+        ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+    }
+
+    /// 任务维度结果事件（5 `TASK_COMPLETE` / 6 `TASK_REJECT`）统一 fire 口，
+    /// 载荷四键按规范 11 §11.3：`instanceId` / `taskId` / `operator` / `submitType`，
+    /// `sourceId`＝taskId。
+    ///
+    /// 5 与 6 **互斥**（§11.3 码 6 括注）：由调用点保证——同意/会签办理/重新提交走
+    /// [`execute_task_async`] 发 5，退回/拒绝（submitType 2/3/6）走 `execute_jump_inner` /
+    /// [`execute_and_jump_to_end_async`] 发 6；同一次动作不会两支都发。
+    /// 拒绝/跳转/退发起人不再各开一号，靠载荷 `submitType` 区分（§11.2 原则 2）。
+    fn notify_task_outcome(
+        &self,
+        event_type: ProcessEventType,
+        instance_id: i64,
+        task_id: i64,
+        operator: &str,
+        submit_type: Option<i64>,
+    ) {
+        let mut data = FlowData::new();
+        data.insert_i64("instanceId", instance_id);
+        data.insert_i64("taskId", task_id);
+        data.insert_str("operator", operator);
+        match submit_type {
+            Some(v) => data.insert_i64("submitType", v),
+            // 未经门面提交的引擎内部动作（如 flow.auto 驱动）无 submitType ⇒ 键位保留、值 null，
+            // 监听器判据"必须能拿到上表这些键"仍成立（§11.3 注）。
+            None => data.insert("submitType".to_string(), JsonValue::Null),
+        }
+        self.fire_event(ProcessEvent::new(event_type, task_id).with_data(data));
+    }
+
+    /// 8 `TASK_WITHDRAW`：撤回把实例 `state` 写 30 且被撤任务行更新完成之后 fire，
+    /// **每轮撤回只 fire 一次**（不逐任务，§11.3 码 8）。载荷 `instanceId` / `operator`。
+    pub fn notify_task_withdraw(&self, instance_id: i64, operator: &str) {
+        let mut data = FlowData::new();
+        data.insert_i64("instanceId", instance_id);
+        data.insert_str("operator", operator);
+        self.fire_event(ProcessEvent::new(ProcessEventType::TaskWithdraw, instance_id).with_data(data));
+    }
+
+    /// 7 `TASK_TRANSFER`：任务参与者被替换并落库之后 fire，`sourceId`＝taskId。
+    /// 载荷 `instanceId` / `taskId` / `fromActor` / `toActor` / `operator`（§11.3 码 7）。
+    pub fn notify_task_transfer(
+        &self,
+        instance_id: i64,
+        task_id: i64,
+        from_actor: &str,
+        to_actor: &str,
+        operator: &str,
+    ) {
+        let mut data = FlowData::new();
+        data.insert_i64("instanceId", instance_id);
+        data.insert_i64("taskId", task_id);
+        data.insert_str("fromActor", from_actor);
+        data.insert_str("toActor", to_actor);
+        data.insert_str("operator", operator);
+        self.fire_event(ProcessEvent::new(ProcessEventType::TaskTransfer, task_id).with_data(data));
+    }
+
+    /// 9 `INSTANCE_TERMINATED`：实例 `state` 写 40 落库之后 fire。
+    /// 载荷 `instanceId` / `operator` / `reason`（§11.3 码 9）。
+    ///
+    /// ⚠️ 本栈门面当前**没有"终止实例"的 action**（issues/134 §5.2 同记：壳侧造不出这一档），
+    /// 故引擎内无触发点，本方法是给终止腿落地时用的唯一入口
+    /// ——集成层严禁自己补发（§11.1），缺哪一支走 issues 反馈。
+    pub fn notify_instance_terminated(&self, instance_id: i64, operator: &str, reason: &str) {
+        let mut data = FlowData::new();
+        data.insert_i64("instanceId", instance_id);
+        data.insert_str("operator", operator);
+        data.insert_str("reason", reason);
+        self.fire_event(
+            ProcessEvent::new(ProcessEventType::InstanceTerminated, instance_id).with_data(data),
+        );
     }
 
     fn repo(&self) -> &Arc<dyn ProcessRepository> {
@@ -321,9 +407,14 @@ impl JeeflowEngineImpl {
                 // Persist
                 self.repo().update_instance(&exec.process_instance)?;
 
-                // Fire event
+                // Fire event（2 PROCESS_INSTANCE_END）：实例 state 落库为终态之后 fire，
+                // 载荷带落库后的 `state` 整数（规范 11 §11.3 码 2「直传载荷键」）。
+                // 办结与拒绝**共用这一支**、规范名不拆（§11.6），下游按 state 分。
+                let mut data = FlowData::new();
+                data.insert_i64("instanceId", exec.process_instance.instance_id);
+                data.insert_i64("state", exec.process_instance.state as i64);
                 let event = ProcessEvent::new(ProcessEventType::ProcessInstanceEnd,
-                                               exec.process_instance.instance_id);
+                                             exec.process_instance.instance_id).with_data(data);
                 ProcessPublisher::notify(&event, &self.ctx.event_listeners);
 
                 self.fire_post_interceptors(exec)?;
@@ -645,7 +736,16 @@ impl JeeflowEngineImpl {
                 self.repo().add_task_actor(task.task_id, &task.actor_ids)?;
             }
             // 落库后 fire TASK_START（此时 task_id 已分配且行已提交，监听器 find_task 可查）
-            let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, task.task_id);
+            // 载荷三键按规范 11 §11.3 码 3：instanceId / taskId / actors（actors 含委托并入后的集合）
+            let mut data = FlowData::new();
+            data.insert_i64("instanceId", instance_id);
+            data.insert_i64("taskId", task.task_id);
+            data.insert(
+                "actors".to_string(),
+                JsonValue::Array(task.actor_ids.iter().map(|a| JsonValue::Str(a.clone())).collect()),
+            );
+            let event = ProcessEvent::new(ProcessEventType::ProcessTaskStart, task.task_id)
+                .with_data(data);
             ProcessPublisher::notify(&event, &self.ctx.event_listeners);
         }
         // 聚合根内的任务副本同步并入后的参与者（否则 update_instance 落库的副本仍是
@@ -731,6 +831,19 @@ impl JeeflowEngineImpl {
         // 7. Save instance (sync)
         self.repo().save_instance(&mut instance)?;
 
+        // 7.5 Fire 1 PROCESS_INSTANCE_START：实例行 insert **之后**立刻 fire
+        // （规范 11 §11.3 码 1 触发时机／08 场景 28，sourceId＝instanceId、载荷 instanceId）。
+        // 位置必须排在待办生成（步骤 10 persist_tasks 里的 3 PROCESS_TASK_START）之前：
+        // spec §11.8／08 场景「L2-30」钉的是**按顺序**的码值序列 `[1,3,5,2]`，
+        // "只断出现过不算过"——排在 persist 之后就是 [3,1,…]，顺序判据直接红。
+        // Java 参考实现的同序形状：PROCESS_INSTANCE_START 在 StartModel.execute（开始节点）里 fire，
+        // 而 taskId 是之后 saveNewTask 才分配的。
+        let mut start_data = FlowData::new();
+        start_data.insert_i64("instanceId", instance.instance_id);
+        let event = ProcessEvent::new(ProcessEventType::ProcessInstanceStart, instance.instance_id)
+            .with_data(start_data);
+        ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+
         // 8. Handle CC actors (sync) — 对齐 Go facade.go:203（issues/56 E28）：
         // vben 发起页"抄送给"是多选 ApiSelect，提交 JSON 数组；也兼容逗号分隔字符串。
         // 旧版仅 get_str+split，数组走 get_str=None → cc 实例从不创建（L3 S6）。
@@ -754,10 +867,8 @@ impl JeeflowEngineImpl {
         // 11. Update instance (sync)
         self.repo().update_instance(&exec.process_instance)?;
 
-        // 12. Fire start event
-        let event = ProcessEvent::new(ProcessEventType::ProcessInstanceStart, instance.instance_id);
-        ProcessPublisher::notify(&event, &self.ctx.event_listeners);
-
+        // 1 PROCESS_INSTANCE_START 在步骤 7.5（实例行落库后、待办生成前）fire，
+        // 以保证 spec §11.8 的码值顺序 [1,3,5,2]（见那里的注释）。
         Ok(exec.process_instance)
     }
 
@@ -821,6 +932,14 @@ impl JeeflowEngineImpl {
         if let Some(t) = instance.tasks.iter().find(|t| t.task_id == task_id) {
             self.repo().update_task(t)?;
         }
+
+        // 7.5 Fire 5 TASK_COMPLETE：任务行 state→已完成（20）**落库之后** fire
+        // （规范 11 §11.3 码 5 触发时机／08 场景 30，先 fire 后落库即红）。
+        // 本方法是"同意/申请/重新提交/会签办理"路径 ⇒ 发 5；退回三档（submitType 2/3/6）
+        // 走 execute_jump_inner / execute_and_jump_to_end_async 发 6，两支互斥不并列。
+        // 会签未合并（只办掉一个人那一张）时同样发 5——"这张任务单被办掉"是既成事实。
+        self.notify_task_outcome(ProcessEventType::TaskComplete,
+                                 instance.instance_id, task_id, operator, submit_type);
 
         // 8. Find the node for this task
         let node = model.get_node(&task.task_name).cloned();
@@ -970,17 +1089,16 @@ impl JeeflowEngineImpl {
             }
         }
 
-        // 11. Handle task-level CC (sync)
-        if let Some(cc_actors) = exec.args.get_str("tf_ccActors") {
-            let actors: Vec<String> = cc_actors.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !actors.is_empty() {
-                self.repo().create_cc_instance(exec.process_instance.instance_id, operator, &actors)?;
-                // CC_CREATE（issues/102·104，六语言统一）：办理时抄送同样逐抄送人 fire
-                self.notify_cc_create(exec.process_instance.instance_id, &actors);
-            }
+        // 11. Handle task-level CC (sync) — 规范 11 §11.7（issues/127）：办理带 `tf_ccActors`
+        // ⇒ 与任务更新同批建 `wf_process_cc_instance` 行，**落库后**逐抄送人 fire CC_CREATE(4)。
+        // 取值与发起腿 `f_ccActors` 同用一个 parse_cc_actors（数组＝vben 多选 ApiSelect 提交，
+        // 逗号串＝旧客户端）；此前只 get_str ⇒ 数组形态静默丢值、cc 行与事件双双缺失，
+        // 正是 issues/56 E28 在发起腿踩过的同一个坑。
+        let cc_actors = parse_cc_actors(exec.args.inner().get("tf_ccActors"));
+        if !cc_actors.is_empty() {
+            self.repo().create_cc_instance(exec.process_instance.instance_id, operator, &cc_actors)?;
+            // CC_CREATE（issues/102·104，六语言统一）：办理时抄送同样逐抄送人 fire
+            self.notify_cc_create(exec.process_instance.instance_id, &cc_actors);
         }
 
         // 12. Persist new tasks + update instance (sync) — assigns IDs in-place
@@ -1045,6 +1163,18 @@ impl JeeflowEngineImpl {
         if let Some(t) = instance.tasks.iter().find(|t| t.task_id == task_id) {
             self.repo().update_task(t)?;
         }
+
+        // 跳转三档的结果事件（规范 11 §11.3 码 5/6，**互斥**：走 reject 就不再 fire complete）：
+        //   JumpTarget::Node        ＝ submitType 4 跳指定节点 → 5 TASK_COMPLETE（码 5 事实列"同意/跳转/会签办理"）
+        //   JumpTarget::FirstTaskNode ＝ submitType 6 退回发起人   → 6 TASK_REJECT
+        //   JumpTarget::RollbackLineage＝ submitType 3 退回上一步   → 6 TASK_REJECT
+        // fire 排在被办任务 update_task 落库之后（taskId 可反查）；实例终态 2 由 End 节点
+        // / jump_to_end 那一支另 fire，载荷 submitType 供下游分档（§11.2 原则 2 码粗载荷细）。
+        let outcome = match mode {
+            JumpTarget::Node(_) => ProcessEventType::TaskComplete,
+            JumpTarget::FirstTaskNode | JumpTarget::RollbackLineage => ProcessEventType::TaskReject,
+        };
+        self.notify_task_outcome(outcome, instance.instance_id, task_id, operator, submit_type);
 
         let mut exec = Execution::new(instance, model, define, operator, full_args);
         exec.process_task = Some(task);
@@ -1113,6 +1243,12 @@ impl JeeflowEngineImpl {
             self.repo().update_task(t)?;
         }
 
+        // 拒绝（submitType 2）＝任务被退回/拒绝 → 6 TASK_REJECT，任务行落库之后 fire
+        // （规范 11 §11.3 码 6；与 5 互斥——这一支**不发** TASK_COMPLETE，
+        // 08 场景 30「走退回的这一次不得再发 5」）。实例终态 2 在下方另 fire。
+        self.notify_task_outcome(ProcessEventType::TaskReject,
+                                 instance.instance_id, task_id, operator, submit_type);
+
         // Reject the instance
         instance.reject();
         instance.abandon_all_doing();
@@ -1128,8 +1264,12 @@ impl JeeflowEngineImpl {
 
         // Fire event（合并派：驳回=办结，同 finish 路径 fire ProcessInstanceEnd；
         // issues/104 §2.3 兑现缺口——execute_and_jump_to_end_async 此前漏 fire）
+        // 载荷带落库后的 state（规范 11 §11.3 码 2），本路径为已拒绝 45。
+        let mut data = FlowData::new();
+        data.insert_i64("instanceId", instance.instance_id);
+        data.insert_i64("state", instance.state as i64);
         let event = ProcessEvent::new(ProcessEventType::ProcessInstanceEnd,
-                                       instance.instance_id);
+                                     instance.instance_id).with_data(data);
         ProcessPublisher::notify(&event, &self.ctx.event_listeners);
 
         Ok(Vec::new())
@@ -3173,5 +3313,513 @@ mod tests {
         let revived = exp_doing(&repo, iid, "apply", 1)[0].clone();
         assert_eq!(revived.expire_time.as_deref(), Some("2028-02-02 02:02:02"),
             "回退新建必须读随行那份（2028）；实得 {:?}＝读成实例变量或压根没算", revived.expire_time);
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// issues/127 ＋ 132 · 事件代码腿（唯一权威＝规范 11 docs/spec/11-events.md §11.3/§11.7）
+//
+// 判据形状按 spec §11.8／08-compliance「事件契约」表的要求写：
+// **用 recorder 断"收到 ＋ 顺序 ＋ 时机"，只断"出现过"不算过**（顺序与缺支正是本案两个病灶）。
+// 镜像层跨栈格 L2-30 断的码值序列 [1,3,5,2] ＋ 抄送支 [4]，本栈等价物即
+// `test_i132_sequence_from_start_to_end`（用规范名断，不拿数字码当判据——§11.3）。
+// ═══════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod event_leg_tests {
+    use super::*;
+    use crate::memory::MemoryRepository;
+    use crate::id_gen::AtomicIdGenerator;
+
+    /// 全量顺序 recorder：按注册顺序收下**每一个**事件（不筛类型）——
+    /// 只有留全序列才能同时判"缺支"和"顺序"（spec §11.8 明写只断出现过不算过）。
+    #[derive(Default)]
+    struct SeqRecorder {
+        events: std::sync::Mutex<Vec<ProcessEvent>>,
+    }
+    impl ProcessEventListener for SeqRecorder {
+        fn on_event(&self, event: &ProcessEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    /// 夹具引擎：内存仓 ＋ 顺序 recorder。
+    fn ev_engine() -> (JeeflowEngineImpl, Arc<MemoryRepository>, Arc<SeqRecorder>) {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let rec = Arc::new(SeqRecorder::default());
+        ctx.register_event_listener(rec.clone());
+        (JeeflowEngineImpl::new(ctx), repo, rec)
+    }
+
+    /// 收到的**规范名**序列（跨栈判据用名不用码，spec §11.3）。
+    fn seq(rec: &SeqRecorder) -> Vec<String> {
+        rec.events.lock().unwrap().iter()
+            .map(|e| e.event_type.spec_name().to_string())
+            .collect()
+    }
+
+    /// 线性流夹具：start → (specs 逐个 task 节点) → end（与 `exp_flow` 同形状，自带一份免跨模块耦合）。
+    fn ev_flow(name: &str, specs: &[(&str, &str)]) -> String {
+        let mut nodes = vec![
+            r#"{"id":"start","type":"snaker:start","properties":{},"text":{"value":"开始"}}"#.to_string(),
+        ];
+        let mut edges: Vec<String> = Vec::new();
+        let mut prev = "start".to_string();
+        for (i, (id, props)) in specs.iter().enumerate() {
+            nodes.push(format!(
+                r#"{{"id":"{id}","type":"snaker:task","properties":{{{props}}},"text":{{"value":"节点{n}"}}}}"#,
+                id = id, props = props, n = i + 1));
+            edges.push(format!(
+                r#"{{"id":"e{i}","sourceNodeId":"{prev}","targetNodeId":"{id}","properties":{{}}}}"#,
+                i = i, prev = prev, id = id));
+            prev = id.to_string();
+        }
+        nodes.push(
+            r#"{"id":"end","type":"snaker:end","properties":{},"text":{"value":"结束"}}"#.to_string());
+        edges.push(format!(
+            r#"{{"id":"eend","sourceNodeId":"{prev}","targetNodeId":"end","properties":{{}}}}"#,
+            prev = prev));
+        format!(
+            r#"{{"name":"{name}","displayName":"事件腿","type":"approval","nodes":[{}],"edges":[{}]}}"#,
+            nodes.join(","), edges.join(","))
+    }
+
+    fn ev_define(repo: &Arc<MemoryRepository>, name: &str, content: &str) -> i64 {
+        let mut define = ProcessDefine {
+            id: 0, name: name.into(), display_name: name.into(),
+            define_type: "approval".into(), state: 1,
+            content: content.as_bytes().to_vec(),
+            version: 1, create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        repo.save_define(&mut define).unwrap();
+        define.id
+    }
+
+    fn ev_submit(t: i64) -> FlowData {
+        let mut a = FlowData::new();
+        a.insert_i64("submitType", t);
+        a
+    }
+
+    /// 取某节点的 DOING 行（条数不符直接红＝"行没读到"与"值为空"分开断）。
+    fn ev_doing(repo: &MemoryRepository, iid: i64, node: &str, want: usize) -> Vec<ProcessTask> {
+        let mut rows: Vec<ProcessTask> = repo.find_doing_tasks(iid, &[]).unwrap()
+            .into_iter().filter(|t| t.task_name == node).collect();
+        rows.sort_by_key(|t| t.task_id);
+        assert_eq!(rows.len(), want, "节点 {node} 的 DOING 行数应为 {want}，实得 {:?}",
+            rows.iter().map(|t| t.task_name.clone()).collect::<Vec<_>>());
+        rows
+    }
+
+    /// 事件落库后 fire（08 场景 28／32「先 fire 后落库即红」）：fire 时反查仓储必须读到该值。
+    fn ev_at_fire_reads_instance_state(rec: &SeqRecorder, spec_name: &str) -> Vec<Option<i32>> {
+        rec.events.lock().unwrap().iter()
+            .filter(|e| e.event_type.spec_name() == spec_name)
+            .map(|e| e.data.get_i64("state").map(|v| v as i32))
+            .collect()
+    }
+
+    // ─── L2-30 的栈内等价物：一条流从发起到办结按顺序 [1,3,5,2] ───
+
+    /// 正向①（spec §11.8／08 场景 28·29·30·32）：start → apply → end 一条流跑通，
+    /// recorder 按顺序收到 **`[PROCESS_INSTANCE_START, PROCESS_TASK_START, TASK_COMPLETE, PROCESS_INSTANCE_END]`**
+    /// ＝码值序列 `[1,3,5,2]`（规范名是判据，数字码不是）。
+    ///
+    /// 顺序是本病灶之一：改前 PROCESS_INSTANCE_START 排在 persist_tasks **之后** ⇒ 实得 `[3,1,…]`；
+    /// 缺支是另一病灶：改前 TASK_COMPLETE(5) 整支不存在。
+    #[tokio::test]
+    async fn test_i132_sequence_from_start_to_end() {
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_seq";
+        let did = ev_define(&repo, name, &ev_flow(name, &[("apply", r#""assignee":"zhangsan""#)]));
+
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+
+        assert_eq!(seq(&rec), vec![
+            "PROCESS_INSTANCE_START",   // 1 实例行 insert 之后
+            "PROCESS_TASK_START",       // 3 apply 任务行落库之后
+            "TASK_COMPLETE",            // 5 任务行 state=20 落库之后（改前整支缺）
+            "PROCESS_INSTANCE_END",     // 2 实例 state 落终库之后
+        ], "一条流从发起到办结必须按顺序收到码值 [1,3,5,2]（规范名序列）");
+
+        // 时机（08 场景 28·29·30：fire 时行必须已落库可反查）
+        let events = rec.events.lock().unwrap();
+        let iid = inst.instance_id;
+        assert_eq!(events[0].source_id, iid);
+        assert_eq!(events[0].data.get_i64("instanceId"), Some(iid), "码 1 载荷键 instanceId");
+        assert!(repo.find_instance_by_id(iid).unwrap().is_some(), "码 1 fire 时实例行已入库");
+
+        let tid = events[1].source_id;
+        assert!(tid > 0);
+        assert_eq!(events[1].data.get_i64("instanceId"), Some(iid), "码 3 载荷键 instanceId");
+        assert_eq!(events[1].data.get_i64("taskId"), Some(tid), "码 3 载荷键 taskId");
+        assert_eq!(events[1].data.get("actors").and_then(|v| v.as_array()).map(|a| a.len()),
+            Some(1), "码 3 载荷键 actors（参与者列表）");
+        assert!(repo.find_task_by_id(tid).unwrap().is_some(), "码 3 fire 时任务行已入库可反查");
+
+        assert_eq!(events[2].source_id, tid, "码 5 sourceId＝taskId");
+        assert_eq!(events[2].data.get_i64("instanceId"), Some(iid));
+        assert_eq!(events[2].data.get_i64("taskId"), Some(tid));
+        assert_eq!(events[2].data.get_str("operator"), Some("zhangsan"), "码 5 载荷键 operator");
+        assert_eq!(events[2].data.get_i64("submitType"), Some(1), "码 5 载荷键 submitType");
+        assert_eq!(repo.find_task_by_id(tid).unwrap().unwrap().task_state,
+            TaskState::Finished.code(), "码 5 fire 时任务行 state 已是已完成(20)");
+
+        assert_eq!(events[3].source_id, iid, "码 2 sourceId＝instanceId");
+        assert_eq!(events[3].data.get_i64("state"), Some(InstanceState::Finished.code() as i64),
+            "码 2 载荷键 state＝落库后的实例状态整数");
+    }
+
+    /// 时机（08 场景 32）：PROCESS_INSTANCE_END 载荷的 state 就是**落库后**那一档
+    /// ——办结 20／拒绝 45 两支都必须在 fire 前把 state 写进去（监听器反查读不到旧状态）。
+    #[tokio::test]
+    async fn test_i132_instance_end_state_is_persisted_value() {
+        // 办结档
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_end_finish";
+        let did = ev_define(&repo, name, &ev_flow(name, &[("apply", r#""assignee":"zhangsan""#)]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+        assert_eq!(ev_at_fire_reads_instance_state(&rec, "PROCESS_INSTANCE_END"),
+            vec![Some(InstanceState::Finished.code())], "办结那一支的 state 必须是落库后的 20");
+
+        // 拒绝档（共用码 2，规范名不拆，靠 state 分——spec §11.6）
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_end_reject";
+        let did = ev_define(&repo, name, &ev_flow(name, &[
+            ("apply", r#""assignee":"zhangsan""#),
+            ("approve", r#""assignee":"lisi""#),
+        ]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+        let approve = ev_doing(&repo, inst.instance_id, "approve", 1)[0].clone();
+        let mut rej = ev_submit(2);
+        rej.insert_str("reject", "true");
+        engine.execute_and_jump_to_end_async(approve.task_id, "lisi", &rej).await.unwrap();
+
+        let states = ev_at_fire_reads_instance_state(&rec, "PROCESS_INSTANCE_END");
+        assert_eq!(states, vec![Some(InstanceState::Reject.code())],
+            "驳回那一支 fire 时实例已是 45");
+        assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+            InstanceState::Reject.code(), "对照：库里落的就是 45");
+    }
+
+    // ─── 抄送支（08 场景 33：三条路径都要建 cc 行 ＋ 逐人 fire 4）───
+
+    /// 正向②（spec §11.7／issues/127）：**办理腿** `tf_ccActors` 建 cc 行并逐抄送人 fire
+    /// CC_CREATE(4)，`ccActorId` 直传、fire 排在 cc 行落库之后。
+    /// 数组形态（vben 多选 ApiSelect 提交）与逗号串形态都要覆盖——改前只 `get_str`，
+    /// 数组那一档 cc 行与事件双双丢失（issues/56 E28 在发起腿的同款坑）。
+    #[tokio::test]
+    async fn test_i127_cc_create_on_execute_leg() {
+        for (i, cc_value) in [
+            JsonValue::Array(vec![JsonValue::Str("u1".into()), JsonValue::Str("u2".into())]),
+            JsonValue::Str("u1,u2".into()),
+        ].into_iter().enumerate() {
+            let (engine, repo, rec) = ev_engine();
+            let name = format!("i127_tf_cc{i}");
+            let did = ev_define(&repo, &name, &ev_flow(&name, &[("apply", r#""assignee":"zhangsan""#)]));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+
+            let mut args = ev_submit(1);
+            args.insert("tf_ccActors".to_string(), cc_value);
+            engine.execute_task_async(apply.task_id, "zhangsan", &args).await.unwrap();
+
+            // 一次性取快照（guard 出了语句即释放，下面的 seq() 才能再锁同一把 Mutex）
+            let events = rec.events.lock().unwrap().clone();
+            let cc: Vec<(i64, Option<String>)> = events.iter()
+                .filter(|e| e.event_type == ProcessEventType::CcCreate)
+                .map(|e| (e.source_id, e.cc_actor_id.clone())).collect();
+            assert_eq!(cc, vec![
+                (inst.instance_id, Some("u1".to_string())),
+                (inst.instance_id, Some("u2".to_string())),
+            ], "办理腿应逐抄送人 fire CC_CREATE（第 {} 档：{:?}）", i, cc);
+            // 载荷键 ccActorId（§11.3 码 4 直传列）
+            for e in events.iter().filter(|e| e.event_type == ProcessEventType::CcCreate) {
+                assert_eq!(e.data.get_str("ccActorId"), e.cc_actor_id.as_deref(),
+                    "ccActorId 既进事件体也进载荷（同键同源）");
+            }
+            // 时机：fire 时 cc 行已落库（接收人档逐人数）
+            for who in ["u1", "u2"] {
+                let mut q = crate::model::PageQuery::new(1, 10);
+                q.operator = Some(who.to_string());
+                assert_eq!(repo.page_cc_instances(&q).unwrap().record_count, 1,
+                    "抄送人 {who} 的 cc 行应已落库（第 {i} 档）");
+            }
+            // 顺序：办理腿的 CC_CREATE 排在任务办结之后（cc 行与任务更新同批，任务先落）
+            let names = seq(&rec);
+            let complete = names.iter().position(|n| n == "TASK_COMPLETE").expect("应有 TASK_COMPLETE");
+            let first_cc = names.iter().position(|n| n == "CC_CREATE").expect("应有 CC_CREATE");
+            assert!(first_cc > complete, "抄送支须排在任务落库之后（TASK_COMPLETE  index {complete} < CC_CREATE index {first_cc}）");
+        }
+    }
+
+    /// 负向（规范 11 §11.7 本轮钉死的边界第 2 条）：**覆盖面只算 `executeProcessTask` 一条腿**——
+    /// `executeAndJumpTask`（submitType 4）/ `jumpToEnd`（2）/ 退发起人（6）/ 退回上一步（3）
+    /// 这类跳转·回退 action 带的 `tf_ccActors` **本轮不建 cc 行、不发 CC_CREATE(4)**。
+    /// 单栈自行放宽＝跨栈分叉（spec 原文点名的反例是"go 第一轮就是这种超集"），
+    /// 故本格是"把钩子挪进跳转腿"这类变异的靶子：改宽即红。
+    #[tokio::test]
+    async fn test_i132_jump_rollback_legs_do_not_create_cc() {
+        // 三档跳转·回退 action，各用一台干净引擎（互不串档）。
+        let legs: [(&str, i64, bool, Option<&str>); 4] = [
+            ("i132_nocc_jump4", 4, false, Some("apply")), // executeAndJumpTask 跳指定节点
+            ("i132_nocc_rb3", 3, false, None),            // 退回上一步（血缘版）
+            ("i132_nocc_rb6", 6, false, None),            // 退回发起人
+            ("i132_nocc_end2", 2, true, None),            // jumpToEnd 拒绝到终态
+        ];
+        for (name, submit_type, to_end, target) in legs.into_iter() {
+            let (engine, repo, rec) = ev_engine();
+            let did = ev_define(&repo, name, &ev_flow(name, &[
+                ("apply", r#""assignee":"zhangsan""#),
+                ("approve", r#""assignee":"lisi""#),
+            ]));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+            engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+            let approve = ev_doing(&repo, inst.instance_id, "approve", 1)[0].clone();
+            // 清空发起段事件，下面只看跳转·回退这一档自己发了什么。
+            rec.events.lock().unwrap().clear();
+
+            let mut args = ev_submit(submit_type);
+            args.insert("tf_ccActors".to_string(),
+                JsonValue::Array(vec![JsonValue::Str("u1".into()), JsonValue::Str("u2".into())]));
+            let res = match (to_end, target) {
+                (true, _) => engine
+                    .execute_and_jump_to_end_async(approve.task_id, "lisi", &args).await,
+                (false, Some(t)) => engine
+                    .execute_and_jump_async(approve.task_id, "lisi", &args, Some(t)).await,
+                (false, None) if submit_type == 6 => engine
+                    .execute_and_jump_to_first_async(approve.task_id, "lisi", &args).await,
+                (false, None) => engine
+                    .execute_and_jump_async(approve.task_id, "lisi", &args, None).await,
+            };
+            assert!(res.is_ok(), "{name} 跳转档应执行成功，实得 {:?}", res.err());
+
+            let names = seq(&rec);
+            assert!(!names.iter().any(|n| n == "CC_CREATE"),
+                "{name}：跳转·回退带 tf_ccActors 严禁发 CC_CREATE（§11.7 覆盖面窄口径），实得 {names:?}");
+            for who in ["u1", "u2"] {
+                let mut q = crate::model::PageQuery::new(1, 10);
+                q.operator = Some(who.to_string());
+                assert_eq!(repo.page_cc_instances(&q).unwrap().record_count, 0,
+                    "{name}：跳转·回退带 tf_ccActors 严禁建 cc 行（§11.7），抄送人 {who} 实得非零");
+            }
+        }
+    }
+
+    /// 正向③（08 场景 33 三条路径同判）：手动支与引擎支**归一**——三条路径共用
+    /// `notify_cc_create` 一个收口，发起腿 fire 的规范名与办理腿／门面手动腿完全同码同名。
+    /// 手动腿（`facade.createCCInstance`）的 fire 点在 facade 侧测试
+    /// （`jeeflow-facade` 的 `test_cc_create_fired_on_manual_create_cc` ＋ 本轮补的载荷断言）。
+    #[tokio::test]
+    async fn test_i132_cc_create_same_funnel_on_start_leg() {
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_start_cc";
+        let did = ev_define(&repo, name, &ev_flow(name, &[("apply", r#""assignee":"zhangsan""#)]));
+        let mut args = FlowData::new();
+        args.insert("f_ccActors".to_string(),
+            JsonValue::Array(vec![JsonValue::Str("u7".into())]));
+        let inst = engine.start_async(did, "zhangsan", &args).await.unwrap();
+
+        let names = seq(&rec);
+        assert!(names.iter().any(|n| n == "CC_CREATE"), "发起腿仍须 fire CC_CREATE：{names:?}");
+        let events = rec.events.lock().unwrap();
+        let cc = events.iter().find(|e| e.event_type == ProcessEventType::CcCreate).unwrap();
+        assert_eq!(cc.source_id, inst.instance_id, "码 4 sourceId＝instanceId");
+        assert_eq!(cc.cc_actor_id.as_deref(), Some("u7"));
+    }
+
+    // ─── 5 / 6 互斥（08 场景 30·31）───
+
+    /// 正向④：submitType=2 拒绝 → 只 fire `TASK_REJECT`(6)，**不得**再 fire `TASK_COMPLETE`(5)
+    /// （§11.3 码 6 括注「同一动作走 reject 就不再 fire complete」／08 场景 30 后半句）。
+    /// 实例终态 2 另 fire（办结/拒绝共用一支）。
+    #[tokio::test]
+    async fn test_i132_reject_fires_task_reject_not_complete() {
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_reject";
+        let did = ev_define(&repo, name, &ev_flow(name, &[
+            ("apply", r#""assignee":"zhangsan""#),
+            ("approve", r#""assignee":"lisi""#),
+        ]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+        rec.events.lock().unwrap().clear();
+
+        let approve = ev_doing(&repo, inst.instance_id, "approve", 1)[0].clone();
+        engine.execute_and_jump_to_end_async(approve.task_id, "lisi", &ev_submit(2)).await.unwrap();
+
+        assert_eq!(seq(&rec), vec!["TASK_REJECT", "PROCESS_INSTANCE_END"],
+            "拒绝这一次：6 与 2 各一次，严禁再发 5");
+        let events = rec.events.lock().unwrap();
+        assert_eq!(events[0].source_id, approve.task_id, "码 6 sourceId＝taskId");
+        assert_eq!(events[0].data.get_i64("submitType"), Some(2), "码 6 载荷 submitType 供下游分档");
+        assert_eq!(events[0].data.get_str("operator"), Some("lisi"));
+        assert_eq!(events[0].data.get_i64("instanceId"), Some(inst.instance_id));
+        assert_eq!(events[0].data.get_i64("taskId"), Some(approve.task_id));
+    }
+
+    /// 正向⑤：退回上一步（submitType 3，血缘版）与退回发起人（submitType 6）都归 `TASK_REJECT`(6)
+    /// （§11.2 原则 2「码粗载荷细」——不为退发起人/退上一步各开一号）；
+    /// 而跳转指定节点（submitType 4）归 `TASK_COMPLETE`(5)（§11.3 码 5 事实列「同意/跳转/会签办理」）。
+    #[tokio::test]
+    async fn test_i132_rollback_legs_reject_and_jump_leg_complete() {
+        // submitType=3 退回上一步
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_rb3";
+        let did = ev_define(&repo, name, &ev_flow(name, &[
+            ("apply", r#""assignee":"zhangsan""#),
+            ("approve", r#""assignee":"lisi""#),
+        ]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+        rec.events.lock().unwrap().clear();
+
+        let approve = ev_doing(&repo, inst.instance_id, "approve", 1)[0].clone();
+        engine.execute_and_jump_async(approve.task_id, "lisi", &ev_submit(3), None).await.unwrap();
+        assert_eq!(seq(&rec), vec!["TASK_REJECT", "PROCESS_TASK_START"],
+            "退回上一步＝6（复活行另发一条 3），且不发 5");
+
+        // submitType=6 退回发起人
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_rb6";
+        let did = ev_define(&repo, name, &ev_flow(name, &[
+            ("apply", r#""assignee":"zhangsan""#),
+            ("approve", r#""assignee":"lisi""#),
+        ]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+        rec.events.lock().unwrap().clear();
+
+        let approve = ev_doing(&repo, inst.instance_id, "approve", 1)[0].clone();
+        engine.execute_and_jump_to_first_async(approve.task_id, "lisi", &ev_submit(6)).await.unwrap();
+        let names = seq(&rec);
+        assert_eq!(names, vec!["TASK_REJECT", "PROCESS_TASK_START"],
+            "退回发起人＝6（新待办另发一条 3），且不发 5");
+        let events = rec.events.lock().unwrap();
+        assert_eq!(events[0].data.get_i64("submitType"), Some(6), "载荷 submitType 区分两支退法");
+
+        // submitType=4 跳转指定节点 → 5
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_jump4";
+        let did = ev_define(&repo, name, &ev_flow(name, &[
+            ("apply", r#""assignee":"zhangsan""#),
+            ("approve", r#""assignee":"lisi""#),
+            ("done", r#""assignee":"boss""#),
+        ]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+        let approve = ev_doing(&repo, inst.instance_id, "approve", 1)[0].clone();
+        rec.events.lock().unwrap().clear();
+
+        engine.execute_and_jump_async(approve.task_id, "lisi", &ev_submit(4), Some("done")).await.unwrap();
+        let names = seq(&rec);
+        assert_eq!(names, vec!["TASK_COMPLETE", "PROCESS_TASK_START"],
+            "跳转指定节点归 5（TASK_COMPLETE 事实列含「跳转」），新待办另发 3");
+        let events = rec.events.lock().unwrap();
+        assert_eq!(events[0].data.get_i64("submitType"), Some(4));
+        assert_eq!(events[0].source_id, approve.task_id);
+    }
+
+    /// 会签：串行会签"推进出的下一位成员"也是一条新待办 ⇒ 3 必发；
+    /// 该成员被办掉 ⇒ 5 必发；一票名册未跑完时**不**发实例终态 2（§11.4 不发清单的反面）。
+    #[tokio::test]
+    async fn test_i132_sequential_countersign_per_member_codes() {
+        let (engine, repo, rec) = ev_engine();
+        let name = "i132_cs_seq";
+        let did = ev_define(&repo, name, &ev_flow(name, &[(
+            "cs", r#""assignee":"userA,userB","performType":1,"countersignType":"SEQUENTIAL""#,
+        )]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let first = ev_doing(&repo, inst.instance_id, "cs", 1)[0].clone();
+        engine.execute_task_async(first.task_id, "userA", &ev_submit(1)).await.unwrap();
+
+        assert_eq!(seq(&rec), vec![
+            "PROCESS_INSTANCE_START", "PROCESS_TASK_START",   // 首成员待办
+            "TASK_COMPLETE",                                  // 首成员办掉（会签办理也归 5）
+            "PROCESS_TASK_START",                             // 推进出的第二成员＝又一条 3
+        ], "串行会签逐成员发 3，办掉发 5；未跑完名册不得发 2");
+        assert!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state
+            == InstanceState::Doing.code(), "第二成员还在办 ⇒ 实例仍进行中");
+    }
+
+    /// 不发清单（08 场景 35）：定义生命周期（save_define）与实例/任务**变量写入**（update_instance /
+    /// update_task 直落）不构成独立事实 ⇒ 一律不 fire。多发即红。
+    #[test]
+    fn test_i132_not_fired_for_define_lifecycle_and_variable_writes() {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let rec = Arc::new(SeqRecorder::default());
+        ctx.register_event_listener(rec.clone());
+        let engine = JeeflowEngineImpl::new(ctx);
+
+        // 定义生命周期四事：save / 改状态 / 再存（引擎侧无 fire 义务，spec §11.4-2）
+        let name = "i132_not_fire";
+        let did = ev_define(&repo, name, &ev_flow(name, &[("apply", r#""assignee":"zhangsan""#)]));
+        let mut define = repo.find_define_by_id(did).unwrap().unwrap();
+        define.state = 0;
+        repo.save_define(&mut define).unwrap();
+
+        // 实例/任务变量写入（§11.4-3）
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let inst = rt.block_on(engine.start_async(did, "zhangsan", &FlowData::new())).unwrap();
+        rec.events.lock().unwrap().clear();
+
+        let mut inst2 = repo.find_instance_by_id(inst.instance_id).unwrap().unwrap();
+        inst2.variables.insert_str("aVar", "1");
+        repo.update_instance(&inst2).unwrap();
+        let task = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()[0].clone();
+        let mut task2 = task.clone();
+        task2.variables.insert_str("tVar", "1");
+        repo.update_task(&task2).unwrap();
+
+        assert!(seq(&rec).is_empty(), "定义生命周期与变量写入严禁 fire（§11.4 不发清单），实得 {:?}", seq(&rec));
+    }
+
+    /// 异常隔离 ＋ 订阅形状（spec §11.5／08 场景 36）在引擎主流程上的等价物：
+    /// 监听器 panic 不回滚主流程、不中断后续监听器，事件流仍完整。
+    /// （纯 publisher 层的三场景单测见 `crate::event::publisher_tests`。）
+    #[tokio::test]
+    async fn test_i132_listener_panic_does_not_break_flow() {
+        struct Boom;
+        impl ProcessEventListener for Boom {
+            fn on_event(&self, _e: &ProcessEvent) { panic!("监听器炸了"); }
+        }
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        ctx.register_event_listener(Arc::new(Boom));
+        let rec = Arc::new(SeqRecorder::default());
+        ctx.register_event_listener(rec.clone());   // 炸的那个**先注册**
+        let engine = JeeflowEngineImpl::new(ctx);
+
+        let name = "i132_panic";
+        let did = ev_define(&repo, name, &ev_flow(name, &[("apply", r#""assignee":"zhangsan""#)]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        engine.execute_task_async(apply.task_id, "zhangsan", &ev_submit(1)).await.unwrap();
+
+        assert_eq!(seq(&rec), vec![
+            "PROCESS_INSTANCE_START", "PROCESS_TASK_START", "TASK_COMPLETE", "PROCESS_INSTANCE_END"],
+            "先注册的监听器 panic 不得中断后续监听器，也不得回滚主流程");
+        assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+            InstanceState::Finished.code(), "主流程照旧办结落库");
     }
 }

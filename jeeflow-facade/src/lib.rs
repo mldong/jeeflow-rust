@@ -1184,6 +1184,10 @@ impl JeeflowFacade {
             }
         }
         self.repo.update_instance(&inst)?;
+        // 8 TASK_WITHDRAW（规范 11 §11.3 码 8／08 场景 34）：被撤任务行更新完成 **且** 实例
+        // state=30 落库之后 fire，**每轮撤回只 fire 一次**（不逐任务）。
+        // 被 issues/134 的状态守卫拒掉时上面 `inst.withdraw()?` 已提前 return，这支不会发。
+        self.engine.notify_task_withdraw(inst.instance_id, &operator);
         Ok(Json::Null)
     }
 
@@ -1368,7 +1372,10 @@ impl JeeflowFacade {
             return Err(JeeflowError::Business("actorIds 缺失".into()));
         }
         self.repo.create_cc_instance(id, &operator, &actors)?;
-        // CC_CREATE（issues/102·104，六语言统一）：手动补抄送逐抄送人 fire（对齐 Go facade）
+        // CC_CREATE（4）——**手动支与引擎支归一**（规范 11 §11.2 原则 1／§11.7，issues/132 §4.5
+        // rust 条目）：本路径与引擎的发起 `f_ccActors`、办理 `tf_ccActors` 两条腿共用
+        // `JeeflowEngineImpl::notify_cc_create` 这唯一收口，逐抄送人在 **cc 行落库之后** fire。
+        // "新增了一条抄送记录"这个事实成立就发，路径不进事件名（Java 旧状"手动不 fire"是缺不是基准）。
         self.engine.notify_cc_create(id, &actors);
         Ok(json!({}))
     }
@@ -1761,6 +1768,11 @@ impl JeeflowFacade {
         // 不同步则待办不会真正挪到 B（sqlx update_task 不写 actor 表，无副作用）。
         task.actor_ids = self.repo.find_task_actors(task_id)?;
         self.repo.update_task(&task)?;
+        // 7 TASK_TRANSFER（规范 11 §11.3 码 7／08 场景 34）：参与者被替换（remove+add）
+        // 且留痕行落库之后 fire，sourceId＝taskId，载荷五键
+        // instanceId / taskId / fromActor / toActor / operator。
+        self.engine.notify_task_transfer(
+            task.process_instance_id, task_id, &from_actor, &to_actor, &operator);
         Ok(Json::Null)
     }
 
@@ -6307,4 +6319,187 @@ mod tests {
             "缺键的存量历史行回退现算：仅进行中判定 ⇒ false（不报错、不读成未定义）");
     }
 
+    // ═══════════════════════════════════════════════════════
+    // issues/127 ＋ 132 · 事件代码腿（门面侧三支：7 转办 / 8 撤回 / 4 手动抄送）
+    //   唯一权威＝规范 11 docs/spec/11-events.md §11.3／§11.7，可判定条目见 08-compliance「事件契约」
+    //   场景 33·34。判据形状按 spec 要求：recorder 断"收到 ＋ 顺序 ＋ **时机**"——
+    //   监听器在 fire 当场回读仓储，落库在前、fire 在后（§11.2 原则 3，先 fire 后落库即红）。
+    // ═══════════════════════════════════════════════════════
+
+    /// fire 当场从仓储读回的状态快照（证明"事件排在落库之后"）
+    #[derive(Clone)]
+    struct SeenAtFire {
+        event: ProcessEvent,
+        instance_state: Option<i32>,
+        task_states: Vec<(i64, i32)>,
+        task_actors: Vec<String>,
+    }
+
+    struct FacadeProbe {
+        repo: Arc<MemoryRepository>,
+        seen: std::sync::Mutex<Vec<SeenAtFire>>,
+    }
+    impl FacadeProbe {
+        fn new(repo: Arc<MemoryRepository>) -> Self {
+            FacadeProbe { repo, seen: std::sync::Mutex::new(Vec::new()) }
+        }
+    }
+    impl ProcessEventListener for FacadeProbe {
+        fn on_event(&self, event: &ProcessEvent) {
+            let iid = event.data.get_i64("instanceId").unwrap_or(event.source_id);
+            let instance_state = self.repo.find_instance_by_id(iid).ok().flatten().map(|i| i.state);
+            let task_states: Vec<(i64, i32)> = self.repo.find_history_tasks(iid).unwrap_or_default()
+                .into_iter().map(|t| (t.task_id, t.task_state)).collect();
+            let tid = event.data.get_i64("taskId").unwrap_or(event.source_id);
+            let task_actors = self.repo.find_task_actors(tid).unwrap_or_default();
+            self.seen.lock().unwrap().push(SeenAtFire {
+                event: event.clone(), instance_state, task_states, task_actors });
+        }
+    }
+
+    /// 装了 probe 的门面（与 `make_facade` 同夹具，只多一个监听器）
+    fn make_probe_facade() -> (JeeflowFacade, Arc<MemoryRepository>, Arc<FacadeProbe>) {
+        let repo = Arc::new(MemoryRepository::new());
+        let probe = Arc::new(FacadeProbe::new(repo.clone()));
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        ctx.register_event_listener(probe.clone());
+        (JeeflowFacade::new(ctx), repo, probe)
+    }
+
+    fn seen_names(seen: &[SeenAtFire]) -> Vec<&'static str> {
+        seen.iter().map(|s| s.event.event_type.spec_name()).collect()
+    }
+
+    /// 08 场景 34 · 码 8 `TASK_WITHDRAW`：撤回把实例写 30、被撤任务行更新完成后 fire
+    /// **恰好一次**（不逐任务），载荷 `instanceId` / `operator`，sourceId＝instanceId。
+    #[tokio::test]
+    async fn test_i132_withdraw_fires_task_withdraw_once_after_persist() {
+        let (facade, _repo, probe) = make_probe_facade();
+        let (iid, task_id) = start_two_step_flow(&facade, "ev132-wd").await;
+        probe.seen.lock().unwrap().clear();   // 只留撤回这一轮
+
+        let resp = facade.flow("processInstance/withdraw", &wd134_withdraw_args(iid, "applicant")).await;
+        assert_eq!(resp["code"], 0, "撤回应成功：{:?}", resp);
+
+        let seen = probe.seen.lock().unwrap().clone();
+        assert_eq!(seen_names(&seen), vec!["TASK_WITHDRAW"],
+            "每轮撤回只 fire 一次码 8，不得逐任务发、也不得捎带其它码");
+        let s = &seen[0];
+        assert_eq!(s.event.source_id, iid, "码 8 sourceId＝instanceId");
+        assert_eq!(s.event.data.get_i64("instanceId"), Some(iid), "载荷键 instanceId");
+        assert_eq!(s.event.data.get_str("operator"), Some("applicant"), "载荷键 operator＝撤回人");
+        // 时机：fire 当场实例与任务行都已是 30（改序到落库之前 ⇒ 这两格红）
+        assert_eq!(s.instance_state, Some(30), "fire 时实例 state=30 必须已落库");
+        assert!(s.task_states.contains(&(task_id, 30)),
+            "fire 时被撤任务行必须已落 30（issues/113 级联腿），实得 {:?}", s.task_states);
+    }
+
+    /// 负向：issues/134 状态守卫拒掉的那一次撤回**一行都不落库** ⇒ 也**不得** fire 码 8。
+    #[tokio::test]
+    async fn test_i132_guarded_withdraw_fires_nothing() {
+        let (facade, _repo, probe) = make_probe_facade();
+        let (iid, task_id) = start_two_step_flow(&facade, "ev132-wd-guard").await;
+        // 先把实例推到已办结(20)：直接撤掉唯一在办任务 → 走到 end
+        let mut a = HashMap::new();
+        a.insert("processTaskId".to_string(), json!(task_id));
+        a.insert("operator".to_string(), json!("user2"));
+        a.insert("submitType".to_string(), json!(1));
+        assert_eq!(facade.flow("processTask/execute", &a).await["code"], 0);
+        assert_eq!(wd134_instance(&facade, iid).0, 20, "夹具前提：实例已办结");
+        probe.seen.lock().unwrap().clear();
+
+        let resp = facade.flow("processInstance/withdraw", &wd134_withdraw_args(iid, "applicant")).await;
+        assert_eq!(resp["code"], 99999999, "已办结实例撤回必须报错：{:?}", resp);
+        assert_eq!(resp["msg"], WD134_MSG, "文案逐字：{:?}", resp);
+        let seen = seen_names(&probe.seen.lock().unwrap().clone());
+        assert!(seen.is_empty(), "被守卫拒掉的撤回严禁 fire 码 8（没发生的事实不发消息），实得 {:?}", seen);
+    }
+
+    /// 08 场景 34 · 码 7 `TASK_TRANSFER`：参与者被替换并落库之后 fire，
+    /// sourceId＝taskId，载荷五键 `instanceId` / `taskId` / `fromActor` / `toActor` / `operator`。
+    #[tokio::test]
+    async fn test_i132_transfer_fires_task_transfer_after_actor_swap() {
+        let (facade, _repo, probe) = make_probe_facade();
+        let (iid, task_id) = start_two_step_flow(&facade, "ev132-tr").await;
+        probe.seen.lock().unwrap().clear();
+
+        let resp = facade.flow("processTask/transfer", &transfer_args(task_id, "user2", "user9", "user2")).await;
+        assert_eq!(resp["code"], 0, "转办应成功：{:?}", resp);
+
+        let seen = probe.seen.lock().unwrap().clone();
+        assert_eq!(seen_names(&seen), vec!["TASK_TRANSFER"],
+            "转办只 fire 一次码 7；转办不新建任务行 ⇒ 不得捎带码 3");
+        let s = &seen[0];
+        assert_eq!(s.event.source_id, task_id, "码 7 sourceId＝taskId");
+        assert_eq!(s.event.data.get_i64("instanceId"), Some(iid));
+        assert_eq!(s.event.data.get_i64("taskId"), Some(task_id));
+        assert_eq!(s.event.data.get_str("fromActor"), Some("user2"), "载荷键 fromActor");
+        assert_eq!(s.event.data.get_str("toActor"), Some("user9"), "载荷键 toActor");
+        assert_eq!(s.event.data.get_str("operator"), Some("user2"), "载荷键 operator");
+        // 时机：fire 当场参与者表已换人（先 fire 后落库 ⇒ 监听器会读到旧参与者）
+        assert_eq!(s.task_actors, vec!["user9".to_string()],
+            "fire 时参与者应已替换为 toActor，实得 {:?}", s.task_actors);
+    }
+
+    /// 负向：转办被拒（原办理人不是参与人）⇒ 参与者表不动 ⇒ 不得 fire 码 7。
+    #[tokio::test]
+    async fn test_i132_rejected_transfer_fires_nothing() {
+        let (facade, _repo, probe) = make_probe_facade();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ev132-tr-guard").await;
+        probe.seen.lock().unwrap().clear();
+
+        let resp = facade.flow("processTask/transfer", &transfer_args(task_id, "ghost", "user9", "ghost")).await;
+        assert_eq!(resp["code"], 99999999, "非参与人转办必须报错：{:?}", resp);
+        assert!(probe.seen.lock().unwrap().is_empty(), "被拒的转办严禁 fire 码 7");
+    }
+
+    /// 08 场景 33 · 手动支与引擎支**归一**（§11.2 原则 1）：门面 `createCCInstance` 逐抄送人
+    /// fire 码 4，载荷 `ccActorId` 与事件体同源，且 fire 时 cc 行已落库。
+    /// （既有的 `test_cc_create_fired_on_manual_create_cc` 只数了次数，本格补载荷键 ＋ 时机。）
+    #[tokio::test]
+    async fn test_i132_manual_cc_create_payload_and_timing() {
+        let (facade, repo, probe) = make_probe_facade();
+        let mut a = HashMap::new();
+        a.insert("processInstanceId".to_string(), json!(2002));
+        a.insert("operator".to_string(), json!("user1"));
+        a.insert("actorIds".to_string(), json!(["u3", "u4"]));
+        let resp = facade.flow("processInstance/createCCInstance", &a).await;
+        assert_eq!(resp["code"], 0, "{:?}", resp);
+
+        let seen = probe.seen.lock().unwrap().clone();
+        assert_eq!(seen_names(&seen), vec!["CC_CREATE", "CC_CREATE"], "逐抄送人各 fire 一次");
+        for (s, want) in seen.iter().zip(["u3", "u4"]) {
+            assert_eq!(s.event.source_id, 2002, "码 4 sourceId＝instanceId");
+            assert_eq!(s.event.cc_actor_id.as_deref(), Some(want));
+            assert_eq!(s.event.data.get_str("ccActorId"), Some(want), "载荷键 ccActorId（§11.3 码 4）");
+            // 时机：fire 当场 cc 行已在库里（接收人档回读）
+            let mut q = PageQuery::new(1, 10);
+            q.operator = Some(want.to_string());
+            assert_eq!(repo.page_cc_instances(&q).unwrap().record_count, 1,
+                "fire 时抄送人 {want} 的 cc 行应已落库");
+        }
+    }
+
+    /// 不发清单（08 场景 35）在门面侧的对照：`updateCCStatus`（读已读状态回写）不是新事实
+    /// ⇒ 不得 fire CC_CREATE；`processInstance/page` 等只读 action 同样零事件。
+    #[tokio::test]
+    async fn test_i132_no_fire_for_cc_status_update_and_reads() {
+        let (facade, _repo, probe) = make_probe_facade();
+        let (iid, _) = start_two_step_flow(&facade, "ev132-not-fire").await;
+        probe.seen.lock().unwrap().clear();
+
+        let mut a = HashMap::new();
+        a.insert("processInstanceId".to_string(), json!(iid));
+        a.insert("operator".to_string(), json!("user2"));
+        assert_eq!(facade.flow("processInstance/updateCCStatus", &a).await["code"], 0);
+        assert_eq!(facade.flow("processTask/todoList", &HashMap::new()).await["code"], 0);
+        assert_eq!(facade.flow("processInstance/detail", &a).await["code"], 0);
+
+        let seen = seen_names(&probe.seen.lock().unwrap().clone());
+        assert!(seen.is_empty(),
+            "已读回写与只读 action 一律不 fire（§11.4 不发清单），实得 {:?}", seen);
+    }
 }
