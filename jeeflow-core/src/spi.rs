@@ -290,6 +290,37 @@ pub struct Candidate {
 }
 
 // ═══════════════════════════════════════════════════════
+// CustomNodeHandler — 记录类（snaker:custom）节点处理器
+// ═══════════════════════════════════════════════════════
+
+/// 记录类节点 `properties.clazz` 缺省时返回值落进流程变量的键
+/// （逐字对齐 java `FlowConst.CUSTOM_RETURN_VAL`，spec/02 §6）。
+pub const CUSTOM_RETURN_VAL: &str = "custom_return_val";
+
+/// 记录类（`snaker:custom`）节点处理器（issues/142 A 批 · spec/02 §6.1／§6.2）。
+///
+/// **为什么是"按名注册表"而不是反射**：Rust 没有 `Class.forName(clazz)` 这一层，
+/// `clazz` 串在共享夹具（`flows/08-custom-node.json`）里写的是 Java FQCN，
+/// 本栈无从解析也**不该**报错——c# 与 python 本轮同策走按名注册
+/// （python `extensions.py::register_custom`／c# `ServiceContext.CustomHandlers`），
+/// 集成方把 `clazz` 原样串当注册名即可，同一份流程 JSON 不用为 Rust 改。
+///
+/// 注册入口：[`crate::context::ServiceContext::register_custom_handler`]。
+///
+/// 返回值形状：
+/// - `Ok(Some(v))` ⇒ 引擎按节点 `val`（缺省 [`CUSTOM_RETURN_VAL`]）把 `v` 写进流程变量；
+/// - `Ok(None)` ⇒ 不写（对齐 java 的 `IHandler` 那一支：处理器自己往 `execution.args` 里塞）；
+/// - `Err(..)` ⇒ **处理器自身执行失败**，属业务错误，照旧外抛打断本次执行
+///   （spec/02 §6.2 第 2 条末句明写这一档不在豁免内）；
+///   panic 同样外抛（本栈不套 `catch_unwind`——那会把业务错误悄悄降级成"跳过处理器"）。
+///
+/// 节点属性 `methodName` / `args` 由处理器自己从 `execution.current_node` 读
+/// （它们在 java 侧是反射入参形状，本栈按名注册后只剩"节点配置"的含义）。
+pub trait CustomNodeHandler: Send + Sync {
+    fn handle(&self, execution: &mut crate::engine::Execution) -> JeeflowResult<Option<JsonValue>>;
+}
+
+// ═══════════════════════════════════════════════════════
 // ProcessEventListener — concepts/04 §4.1
 // ═══════════════════════════════════════════════════════
 

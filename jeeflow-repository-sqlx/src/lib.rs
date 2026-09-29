@@ -681,7 +681,16 @@ impl ProcessRepository for SqlxRepository {
                 task.create_time = Some(current_time_str());
             }
             sqlx::query(
-                "INSERT INTO wf_process_task (id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, expire_time, form_key, task_parent_id, variable, create_time, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                // ⚠️ `finish_time` 这一列 **2026-09-30 issues/142 A 批补进来**（spec/02 §6.2 第 1bis 条）：
+                // 本语句原先不带它，靠 `update_task` 那条 UPDATE 写——可记录类（`snaker:custom`）那条
+                // DONE 行**只走 INSERT 不走 UPDATE**（生来已完成，没有"办理"那一次更新），
+                // 于是聚合根赋的 finish_time 在 SQL 仓被静默丢掉，`processTask/doneList`
+                // （`task_state<>10 AND operator=?`）按完成时间取数时那格恒 NULL。
+                // 内存仓无此问题（整行存），所以只在真库那一路才看得见——典型的"两层冗余藏病灶"。
+                // `update_time`/`update_user` 仍不在本语句里：那是办理审计，建单时必为 None，
+                // 由 `update_task` 负责（与 java `setTaskParams` 的 17 列全绑不同形，
+                // 本轮只补 1bis 点名的那一列，不顺手改形状）。
+                "INSERT INTO wf_process_task (id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(task.task_id)
             .bind(task.process_instance_id)
@@ -691,6 +700,7 @@ impl ProcessRepository for SqlxRepository {
             .bind(task.perform_type)
             .bind(task.task_state)
             .bind(&task.actor_id)
+            .bind(&task.finish_time)
             .bind(&task.expire_time)
             .bind(&task.form_key)
             .bind(task.parent_task_id)
@@ -3837,5 +3847,105 @@ mod tests {
             column: "business_no".into(), value: "".into(),
         }];
         q
+    }
+
+    /// issues/142 A 批 · spec/02 §6.2 第 1 条的 **sqlx 路**（内存路见
+    /// `jeeflow-core/src/engine.rs::custom_node_tests`）：记录类（`snaker:custom`）那条
+    /// `task_state=20` 的历史行必须**真进 `wf_process_task`**——条文原话
+    /// 「只在聚合内存对象里 append 一条不算做到」，而本栈 HEAD 之前连这条 INSERT 腿都没有
+    /// （custom 与 task 合流建 DOING 待办，正是 §6.1 禁止形状①）。
+    ///
+    /// 一次跑齐四件：① DONE 行查得到（含 `wf_process_task_actor` 里那一条留痕主体）
+    /// ② 待办里没有它 ③ 令牌沿出边流到 end（实例 20）④ 到期列 NULL／血缘列照建单不变量。
+    #[test]
+    fn test_mysql_i142_custom_history_row_lands() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            let define_id = 901421i64;
+            clean_by_define(&pool, define_id).await;
+
+            let mut define = ProcessDefine {
+                id: define_id, name: "rust_i142_custom".into(), display_name: "i142 记录类".into(),
+                define_type: "approval".into(), state: 1,
+                content: r#"{"name":"rust_i142_custom","displayName":"i142","type":"approval",
+                    "nodes":[{"id":"start","type":"snaker:start","text":{"value":"s"}},
+                             {"id":"apply","type":"snaker:task","text":{"value":"申请"},"properties":{"assignee":"applicant"}},
+                             {"id":"custom1","type":"snaker:custom","text":{"value":"通知外部系统"},
+                              "properties":{"clazz":"com.mldong.jeeflow.test.TestCustomHandler","val":"customResult","expireTime":"2h"}},
+                             {"id":"end","type":"snaker:end","text":{"value":"e"}}],
+                    "edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                             {"id":"e2","sourceNodeId":"apply","targetNodeId":"custom1"},
+                             {"id":"e3","sourceNodeId":"custom1","targetNodeId":"end"}]}"#
+                    .as_bytes().to_vec(),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            repo.save_define(&mut define).unwrap();
+
+            let ctx = jeeflow_core::context::ServiceContext::new()
+                .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+                .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+                .with_id_generator(Arc::new(jeeflow_core::id_gen::DefaultIdGenerator::new(1)));
+            let engine = jeeflow_core::engine::JeeflowEngineImpl::new(ctx);
+
+            let inst = engine.start_async(define_id, "i142User",
+                &jeeflow_core::json::FlowData::new()).await.unwrap();
+            let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+                .into_iter().find(|t| t.task_name == "apply").expect("apply 待办应在");
+            engine.execute_task_async(apply.task_id, "i142User",
+                &jeeflow_core::json::FlowData::new()).await.unwrap();
+
+            // ① 真库里查得到那条 DONE 行（find_done_tasks 走的是 SELECT ... task_state = 20）
+            let hist = repo.find_done_tasks(inst.instance_id, &[]).unwrap()
+                .into_iter().find(|t| t.task_name == "custom1")
+                .expect("§6.2 第 1 条：wf_process_task 里必须查得到记录类那条 DONE 行");
+            assert_eq!(hist.task_state, 20, "task_state 必须是 20（已完成）");
+            assert_eq!(hist.actor_ids, vec!["i142User".to_string()],
+                "参与者＝当前操作人（留痕主体，不是待办）");
+            assert_eq!(actor_rows(&pool, hist.task_id).await, vec!["i142User".to_string()],
+                "wf_process_task_actor 里那一条也必须落");
+
+            // ② 待办清空：custom1 没有混进 DOING（§6.1 禁止形状①）
+            let doing_names: Vec<String> = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+                .into_iter().map(|t| t.task_name).collect();
+            assert!(doing_names.is_empty(), "custom1 之后直连 end，待办必须清空，实得 {doing_names:?}");
+
+            // ③ 令牌沿出边继续流转 ⇒ 实例办结
+            let state: i32 = sqlx::query("SELECT state FROM wf_process_instance WHERE id = ?")
+                .bind(inst.instance_id).fetch_one(&pool).await.unwrap().get("state");
+            assert_eq!(state, 20, "记录类不拦路，实例应到终点");
+
+            // ④ 到期列 NULL（判定见内存路同档用例）＋ 血缘列照建单不变量 ＋ 1bis 两列都写
+            let row = sqlx::query("SELECT expire_time, task_parent_id, operator, finish_time FROM wf_process_task WHERE id = ?")
+                .bind(hist.task_id).fetch_one(&pool).await.unwrap();
+            // 两列都是 DATETIME(3)：必须走 `get_opt_datetime`，直接 `row.get::<Option<String>>`
+            // 在**有值**时会以 ColumnDecode 崩掉（NULL 才恰好过），把断言变成解码 panic 就不是判据了。
+            let exp: Option<String> = get_opt_datetime(&row, "expire_time");
+            assert!(exp.is_none(), "记录类行 expire_time 留 NULL（spec/02 §6 无此属性档），实得 {exp:?}");
+            let parent: Option<i64> = row.get("task_parent_id");
+            assert_eq!(parent, Some(apply.task_id), "task_parent_id 照建单不变量落库");
+            let op_col: Option<String> = row.get("operator");
+            assert_eq!(op_col.as_deref(), Some("i142User"), "已办结行的 operator 列＝留痕主体");
+            // §6.2 第 **1bis** 条在 SQL 仓的那一半：本列曾经**不在 INSERT 语句里**，
+            // 聚合根赋的 finish_time 因此到不了库（内存路绿、真库 NULL ⇒ 典型的两层冗余藏病灶）。
+            let fin: Option<String> = get_opt_datetime(&row, "finish_time");
+            assert!(fin.is_some(),
+                "§6.2 1bis：wf_process_task 里那条 DONE 行的 finish_time 必须真落库，实得 NULL");
+            assert_eq!(fin.as_deref(), hist.finish_time.as_deref(),
+                "真库那格的完成时间要与聚合返回行同值");
+
+            // ⑤ §6.2 第 2 条的 sqlx 路：本引擎**没注册**任何 custom 处理器（clazz 未注册档）
+            // ⇒ 不报错、照常落行（上面已断），并且一个流程变量键都不写
+            let inst_now = repo.find_instance_by_id(inst.instance_id).unwrap().unwrap();
+            assert!(inst_now.variables.get_str("customResult").is_none(),
+                "未注册 clazz ⇒ 处理器不执行 ⇒ 不写 val 键");
+            assert!(inst_now.variables.get_str("custom_return_val").is_none(),
+                "未注册 clazz ⇒ 缺省键也不该出现");
+
+            clean_by_define(&pool, define_id).await;
+        });
     }
 }

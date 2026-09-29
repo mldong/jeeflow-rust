@@ -28,6 +28,12 @@ pub struct ServiceContext {
     pub assignment_handlers: HashMap<String, Arc<dyn AssignmentHandler>>,
     /// Decision handlers by name.
     pub decision_handlers: HashMap<String, Arc<dyn DecisionHandler>>,
+    /// 记录类（`snaker:custom`）节点处理器，**按名注册**（issues/142 A 批）。
+    ///
+    /// 注册名＝流程 JSON 里 `properties.clazz` 的原样串（Rust 无反射，见
+    /// [`crate::spi::CustomNodeHandler`] 的理由）。查不到 ⇒ 记一条可诊断日志后照常落历史行、
+    /// 令牌继续流转，**不报错**（spec/02 §6.2 第 2 条）。
+    pub custom_handlers: HashMap<String, Arc<dyn CustomNodeHandler>>,
     /// Flow interceptors (sorted by order).
     pub interceptors: Vec<Arc<dyn FlowInterceptor>>,
     /// Event listeners.
@@ -59,6 +65,7 @@ impl ServiceContext {
             biz_data_reader: None,
             assignment_handlers: HashMap::new(),
             decision_handlers: HashMap::new(),
+            custom_handlers: HashMap::new(),
             interceptors: Vec::new(),
             event_listeners: Vec::new(),
             // 委托自动生效默认开启（issues/116 批次 D）——集成方零配置即生效，
@@ -133,6 +140,20 @@ impl ServiceContext {
 
     pub fn register_decision_handler(&mut self, name: &str, handler: Arc<dyn DecisionHandler>) {
         self.decision_handlers.insert(name.to_string(), handler);
+    }
+
+    /// 注册记录类（`snaker:custom`）节点处理器，注册名＝流程 JSON 里 `clazz` 的原样串。
+    ///
+    /// ```ignore
+    /// ctx.register_custom_handler("com.mldong.jeeflow.test.TestCustomHandler",
+    ///                             Arc::new(MyCustomHandler));
+    /// ```
+    pub fn register_custom_handler(&mut self, name: &str, handler: Arc<dyn CustomNodeHandler>) {
+        self.custom_handlers.insert(name.to_string(), handler);
+    }
+
+    pub fn find_custom_handler(&self, name: &str) -> Option<&Arc<dyn CustomNodeHandler>> {
+        self.custom_handlers.get(name)
     }
 
     pub fn register_interceptor(&mut self, interceptor: Arc<dyn FlowInterceptor>) {

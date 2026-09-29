@@ -1,5 +1,7 @@
-//! Model parser — LogicFlow JSON → ProcessModel (8 node types).
+//! Model parser — LogicFlow JSON → ProcessModel（spec/02 的 8 种节点类型 ＋ 一个未知档）。
 //! spec/01, spec/02: Process model structure.
+//! ⚠️ 类型表**没有**兜底臂：认不出来的类型落 `NodeType::Unknown`（记可诊断日志后由执行腿跳过），
+//! 不再像旧形状那样一律当 Custom —— 详见 [`NodeType::from_snaker_type`]。
 
 use crate::json::{JsonValue, parse_json};
 use crate::error::{JeeflowError, JeeflowResult};
@@ -101,7 +103,7 @@ impl ProcessModel {
 }
 
 // ═══════════════════════════════════════════════════════
-// Node types (8 types)
+// Node types (spec/02 的 8 档 ＋ Unknown)
 // ═══════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,19 +116,67 @@ pub enum NodeType {
     End,
     Custom,
     SubProcess,
+    /// 类型表里没有的档（issues/142 A 批：把旧 `_ => Custom` 兜底臂拆出来的那一半）。
+    ///
+    /// 存在的理由：兜底臂把**任何**未知串（含 `snaker:Custom`／`subProcess` 这类拼错大小写、
+    /// 含 `snaker:custom` 本身）一律收成 Custom，而 spec/02 §6.1 把 custom 定性成**记录类**
+    /// 之后，"兜底臂 = Custom"就等于"未知节点一律按记录类处理"——正是 §6.1 禁止的形状①
+    /// （当任务类建 DOING 行）与 G4 义务 2 点名要防的静默分叉。
+    /// 未知档的行为见 [`NodeType::from_snaker_type`] 与 `engine::execute_node` 的
+    /// `NodeType::Unknown` 分支（记日志＋跳过节点，不建行、不沿出边推进，与 java 同形）。
+    Unknown,
+}
+
+/// 解析期发出的未知类型诊断文案（spec/02「类型键的三条义务」第 2 条 · issues/141 G4 立法）。
+///
+/// 拆成**纯函数**的理由：本栈 core 零依赖、没有可注入的 logger 门面，落点是 stderr
+/// （与 `event.rs::ProcessPublisher`／`surrogate.rs::expand_actors` 那两处同一口径），
+/// 用例只能钉文案本身。形状逐字对齐 java `ModelParser.java:86-88` 那句 WARNING
+/// ——**带节点 id 与实得类型串**，这是"可诊断"的最低要求（旧兜底臂一声不吭）。
+pub fn unknown_node_warning(node_id: &str, raw_type: &str) -> String {
+    format!("[jeeflow] 流程定义里的节点类型不在类型表内，该节点将被跳过（不建行、不沿出边推进）: nodeId={}, type={}", node_id, raw_type)
 }
 
 impl NodeType {
+    /// 类型串 → 类型档。
+    ///
+    /// 两条判据口径（都按 spec/02 的条文走，不在本栈自造语义）：
+    ///
+    /// 1. **先剥 `snaker:` 前缀再查表**——spec/02「节点类型总览」那张表的两列
+    ///      （`snaker:task` / `task`）都是合法写法，java 侧同样是
+    ///      `ModelParser.java:77` 先 `replace(NODE_NAME_PREFIX, "")` 再按裸名查表。
+    ///      ⚠️ 这一支**不是**大小写归一（G4 义务 1 另批做，java `ModelParser.java:81-82`
+    ///      那条注释立的就是同一句"先补别名再谈归一化"）：查表仍逐字精确匹配，
+    ///      所以 `snaker:Task` 这类拼错大小写的串在本栈落进 [`NodeType::Unknown`]，
+    ///      而不再像旧兜底臂那样被当成 Custom。
+    /// 2. **custom 是显式一档**（issues/142 A 批要求拆开的那件事的另一半）：
+    ///      只有 `snaker:custom` / `custom` 才是记录类节点，其余未命中一律 Unknown。
+    ///
+    /// ⚠️ **子流程的大写两档（`subProcess`／`wfSubProcess`，java
+    /// `Configuration.java:49-52` 注册的真别名）本轮**故意**不落 SubProcess**，
+    /// 与 spec/02 义务 3 暂时分叉。理由不是省事：本栈的 SubProcess 执行腿
+    /// （`engine.rs:442`）目前是**空壳**（只取属性、既不建子实例也不推进），
+    /// 把这两档现在并过去，等于把"记一条 WARNING 后跳过"换成"一声不吭地吞掉节点"
+    /// ——义务 3 的别名要和子流程真实现**同一批**落，否则是在扩大静默面。
+    /// 挂账见 issues/141 G4 待办（补 SubProcess 实现时一并收别名）。
+    ///
+    /// 与 java 的一处**有意**差异：java 在解析期就把未知节点**丢掉**（`continue`），
+    /// 本栈把节点留在模型里、标成 `Unknown`，由执行腿跳过。两条路的**可观测结果相同**
+    /// （都不建行、令牌都到不了该节点的下游），留着是为了
+    /// ① 字面兑现"未知档不得静默丢节点"（节点还在模型里，`get_node`/入出边都还查得到）；
+    /// ② 诊断面完整（门面回显 `json_object`、血缘回溯都不必再猜）。
     pub fn from_snaker_type(t: &str) -> Self {
-        match t {
-            "snaker:start" => NodeType::Start,
-            "snaker:task" => NodeType::Task,
-            "snaker:decision" => NodeType::Decision,
-            "snaker:fork" => NodeType::Fork,
-            "snaker:join" => NodeType::Join,
-            "snaker:end" => NodeType::End,
-            "snaker:subprocess" => NodeType::SubProcess,
-            _ => NodeType::Custom,
+        let bare = t.strip_prefix("snaker:").unwrap_or(t);
+        match bare {
+            "start" => NodeType::Start,
+            "task" => NodeType::Task,
+            "decision" => NodeType::Decision,
+            "fork" => NodeType::Fork,
+            "join" => NodeType::Join,
+            "end" => NodeType::End,
+            "custom" => NodeType::Custom,
+            "subprocess" => NodeType::SubProcess,
+            _ => NodeType::Unknown,
         }
     }
 
@@ -140,6 +190,7 @@ impl NodeType {
             NodeType::End => "end",
             NodeType::Custom => "custom",
             NodeType::SubProcess => "subprocess",
+            NodeType::Unknown => "unknown",
         }
     }
 }
@@ -325,6 +376,14 @@ impl ModelParser {
                 let id = node_val.get_str("id").unwrap_or("").to_string();
                 let raw_type = node_val.get_str("type").unwrap_or("snaker:task");
                 let node_type = NodeType::from_snaker_type(raw_type);
+                // G4 义务 2（issues/141 立法 · issues/142 A 批落地）：类型表里没有的串
+                // **必须留一条可诊断记录**再决定跳过。旧形状是兜底臂静默收成 Custom，
+                // 连"这里有个节点我没认出来"都不说，排查时只能靠猜。
+                // 节点本身留在模型里标成 Unknown（java 是解析期直接 continue，
+                // 可观测结果一致，差异与理由见 [`NodeType::from_snaker_type`]）。
+                if node_type == NodeType::Unknown {
+                    eprintln!("{}", unknown_node_warning(&id, raw_type));
+                }
 
                 // Display name from text.value or properties.displayName
                 let display_name = node_val.get("text")
@@ -622,5 +681,92 @@ mod tests {
         let err = JeeflowError::ParseError("读取流程定义 JSON 失败".into());
         assert_eq!(err.message(), "读取流程定义 JSON 失败");
         assert!(err.source().is_none(), "没带底层异常时错误链为空，不该凭空造一层");
+    }
+
+    // ═══ issues/142 A 批 · 类型表拆臂：custom 显式一档 ＋ 未知另立一档 ═══
+
+    /// 八档类型表逐档认，且 spec/02「节点类型总览」的**两列兼容写法**都认
+    /// （`snaker:task` 与 `task`；java 那边同样是先剥 `snaker:` 前缀再按裸名查表）。
+    #[test]
+    fn test_i142_type_table_recognises_all_documented_types() {
+        let cases = [
+            ("snaker:start", NodeType::Start), ("start", NodeType::Start),
+            ("snaker:task", NodeType::Task), ("task", NodeType::Task),
+            ("snaker:decision", NodeType::Decision), ("decision", NodeType::Decision),
+            ("snaker:fork", NodeType::Fork), ("fork", NodeType::Fork),
+            ("snaker:join", NodeType::Join), ("join", NodeType::Join),
+            ("snaker:end", NodeType::End), ("end", NodeType::End),
+            ("snaker:custom", NodeType::Custom), ("custom", NodeType::Custom),
+            ("snaker:subprocess", NodeType::SubProcess), ("subprocess", NodeType::SubProcess),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(NodeType::from_snaker_type(raw), want, "类型串 {raw} 应落 {want:?}");
+        }
+    }
+
+    /// **本单的核心那一半**：未知类型不再被兜底臂收成 Custom。
+    /// 旧形状 `_ => NodeType::Custom` 让 `snaker:Custom` 这类拼错的串
+    /// 一律"按记录类处理"，而 custom 已经定性成记录类（spec/02 §6.1）⇒ 那是把
+    /// "认不出来"当成"认得、而且是记录类"，静默分叉。现在它们落 Unknown。
+    ///
+    /// ⚠️ 后三个串（`subProcess`／`snaker:subProcess`／`wfSubProcess`）在 java 是**真别名**，
+    /// 本栈暂落 Unknown 属**有意分叉**，理由与销账条件写在 [`NodeType::from_snaker_type`]
+    /// 的那段"子流程大写两档故意不落 SubProcess"里（本栈 SubProcess 执行腿还是空壳）。
+    /// 这一档**不是**"归一化已完成"的判据，别照它推断大小写归一的状态。
+    #[test]
+    fn test_i142_unknown_type_is_not_custom_anymore() {
+        for raw in ["snaker:Custom", "snaker:TASK", "SUBPROCESS", "Process",
+                    "snaker:approve", "custom2", "", "snaker:",
+                    "subProcess", "snaker:subProcess", "wfSubProcess"] {
+            let got = NodeType::from_snaker_type(raw);
+            assert_eq!(got, NodeType::Unknown, "未知串 {raw:?} 必须落 Unknown，实得 {got:?}");
+            assert_ne!(got, NodeType::Custom, "未知串 {raw:?} 绝不能再被兜底臂当成记录类");
+        }
+    }
+
+    /// 未知节点：**留在模型里**（"不静默丢节点"的字面兑现）＋落一条带 nodeId 与实得类型串的
+    /// 可诊断日志（G4 义务 2）。旧形状这里既不打日志、又把节点悄悄变成 Custom。
+    #[test]
+    fn test_i142_parse_keeps_unknown_node_and_logs_diagnosis() {
+        let json = r#"{
+            "name": "unknown-flow", "displayName": "U", "type": "approval",
+            "nodes": [
+                {"id": "start", "type": "snaker:start", "text": {"value": "S"}},
+                {"id": "typo1", "type": "snaker:Custom", "text": {"value": "拼错大小写"}},
+                {"id": "end", "type": "snaker:end", "text": {"value": "E"}}
+            ],
+            "edges": [
+                {"id": "e1", "sourceNodeId": "start", "targetNodeId": "typo1"},
+                {"id": "e2", "sourceNodeId": "typo1", "targetNodeId": "end"}
+            ]
+        }"#;
+        let model = ModelParser::parse(json).unwrap();
+        // 节点没被丢：三个节点、边也照旧连得上
+        assert_eq!(model.nodes.len(), 3, "未知档节点必须留在模型里（不许静默丢）");
+        let typo = model.get_node("typo1").expect("typo1 应仍在模型里可查");
+        assert_eq!(typo.node_type, NodeType::Unknown, "落 Unknown 档，而不是 Custom");
+        assert_eq!(typo.node_type, NodeType::from_snaker_type("snaker:Custom"));
+        assert_eq!(model.get_output_edges("typo1").len(), 1, "它的出边也还在（不连带丢出边）");
+    }
+
+    /// 可诊断日志文案单点：带 nodeId ＋ 实得类型串（spec/02 G4 义务 2 的两个必备字段），
+    /// 且与本仓 stderr 日志同一 `[jeeflow]` 前缀口径。落点本身是 eprintln
+    /// （core 零依赖、无可注入 logger 门面，同 `event.rs`／`surrogate.rs` 两处）。
+    #[test]
+    fn test_i142_unknown_node_warning_carries_node_id_and_raw_type() {
+        let msg = unknown_node_warning("typo1", "snaker:Custom");
+        assert!(msg.starts_with("[jeeflow]"), "前缀与本仓既有 stderr 日志同口径：{msg}");
+        assert!(msg.contains("typo1"), "必须带节点 id：{msg}");
+        assert!(msg.contains("snaker:Custom"), "必须带**实得**类型串：{msg}");
+        assert!(msg.contains("跳过"), "要说清楚后果（该节点被跳过）：{msg}");
+    }
+
+    /// 形状哨兵：`as_str` 对九档各给稳定小写名，未知档不得伪装成 "custom"
+    /// （门面/日志/跨栈对账读的就是这个名，落 "unknown" 才不会被误读成记录类）。
+    #[test]
+    fn test_i142_as_str_covers_unknown_without_lying_custom() {
+        assert_eq!(NodeType::Unknown.as_str(), "unknown");
+        assert_ne!(NodeType::Unknown.as_str(), NodeType::Custom.as_str());
+        assert_eq!(NodeType::Custom.as_str(), "custom");
     }
 }

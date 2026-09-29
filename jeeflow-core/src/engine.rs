@@ -323,11 +323,27 @@ impl JeeflowEngineImpl {
                     self.execute_node(exec, &next)?;
                 }
             }
-            NodeType::Task | NodeType::Custom => {
+            NodeType::Task => {
                 // 任务创建不触发节点拦截器（对齐 Java CreateTaskHandler / Go executeNode：
                 // 创建任务 ≠ 节点执行完成）；persist 等 post 拦截器在任务**被执行**时
                 // 由 execute_task_async 显式触发（1.8.0 SYNC 同步演进）
                 self.create_task_with_assignment(exec, node)?;
+            }
+            NodeType::Custom => {
+                // 记录类节点（spec/02 §6.1，issues/142 A 批）：**与任务类分家**。
+                // 旧形状 `NodeType::Task | NodeType::Custom => create_task_with_assignment`
+                // 给它建了一条 DOING 待办行，正是 §6.1「禁止的形状①」；
+                // 正确形状＝执行 clazz → 落一条 task_state=20 的历史行（真落库）→ 令牌续流。
+                // 拦截器同样不触发：它既不建待办也不"办理"，与任务类同口径。
+                self.execute_custom_node(exec, node)?;
+            }
+            NodeType::Unknown => {
+                // 类型表里没有的档（issues/142 A 批把旧 `_ => Custom` 兜底臂拆出来的那一半）。
+                // 解析期已按 G4 义务 2 落过一条可诊断 WARNING（`parser::unknown_node_warning`，
+                // 带 nodeId 与实得类型串），这里的行为照 java `ModelParser.java:86-89`：
+                // **跳过节点**——不建行、不 fire 事件、**也不沿出边推进**
+                // （java 那边节点压根没进模型，令牌同样到不了它的下游，两边可观测结果一致）。
+                // 这里不再补日志：同一个定义每次 start/execute 都会重新解析，再打一遍就是刷屏。
             }
             NodeType::Decision => {
                 // Fire pre-interceptors
@@ -441,17 +457,17 @@ impl JeeflowEngineImpl {
     fn create_task_with_assignment(&self, exec: &mut Execution, node: &NodeModel) -> JeeflowResult<()> {
         let actor_ids = self.resolve_assignee(exec, node);
 
-        if actor_ids.is_empty() && node.candidate_users().is_none() && node.candidate_groups().is_none() {
-            // No actors — skip task creation (continue to next node)
-            let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
-                .iter()
-                .filter_map(|e| exec.process_model.get_target_node(e).cloned())
-                .collect();
-            for next in next_nodes {
-                self.execute_node(exec, &next)?;
-            }
-            return Ok(());
-        }
+        // spec/02 §6.1 表第一行 ＋ §6.2 第 3 条（issues/142 A 批 · owner 2026-09-30 拍）：
+        // **任务类解析不出参与者也必须建单**——建一行参与者为空的 DOING 行，
+        // 照 java `CreateTaskHandler`（:38-63）的无条件建单姿势。
+        // 旧形状「actor_ids 为空 && 无 candidateUsers/candidateGroups ⇒ 一行不建、令牌直接沿出边跑」
+        // 正是 §6.1 点名的死锁黑洞那一族：节点在库里**什么痕迹都不留**，实例走过了却查不到，
+        // 出了问题只能靠猜（go/node/rust/moon 四栈同形，本轮四栈跟改）。
+        // ⚠️ 零参与者这一行谁也办不动（`is_allowed` 恒 false）是**设计如此**：
+        //    它的价值是"实例停在哪个节点"可查，并且还能被 transfer / nextNodeOperator 救活。
+        //    建完即返回、**不沿出边推进**，所以不存在"自动推进逻辑为它反复重入"的形状。
+        // candidateUsers/candidateGroups 按 spec/02 §4 明确**不生成 actor**（只供选人页），
+        // 所以"只配了候选人"的节点也落在这一档＝零参与者行（与 java 同判）。
 
         let perform_type = PerformType::from_code(node.perform_type());
         let task_type = TaskType::from_code(node.task_type());
@@ -459,6 +475,13 @@ impl JeeflowEngineImpl {
         let expr = crate::expire_time::expire_expr_of(node);
 
         let task = if perform_type == PerformType::Countersign {
+            // 会签的建单是**逐成员**一行（java `createCountersignTasks` 同款 for-actor），
+            // 名册为空 ⇒ 天然 0 行，"零参与者建单"那一档在会签上不成立（基准 java 亦然）。
+            // 这里必须早退：下面两支收尾都要 `tasks.last().cloned().unwrap()`，
+            // 空名册时不是 panic（聚合还空着）就是把**别人的**行当本节点的新单返回。
+            if actor_ids.is_empty() {
+                return Ok(());
+            }
             let cs_type = node.countersign_type();
             if cs_type.to_uppercase() == "SEQUENTIAL" || cs_type.to_uppercase() == "SERIAL" {
                 // SEQUENTIAL: only create first actor's task (issues/94)
@@ -516,6 +539,112 @@ impl JeeflowEngineImpl {
             exec.new_tasks.push(task);
         }
 
+        Ok(())
+    }
+
+    /// 记录类（`snaker:custom`）节点执行腿（issues/142 A 批 · spec/02 §6.1／§6.2）。
+    ///
+    /// 三步固定形状，只做满一半即违反 §6.2（"落库不建行、建行不落库、记日志但停在原地都算"）：
+    ///   ① 执行 `clazz` 处理器（按名注册，见 [`crate::spi::CustomNodeHandler`]）；
+    ///   ② 落一条 `task_state=20` 的历史行**并真落库**（`repo.save_task` 那条 INSERT 腿）——
+    ///      只在聚合内存对象里 append 一条不算做到；
+    ///   ③ 令牌沿出边继续流转（java `CustomModel` 收尾那句 `runOutTransition`）。
+    ///
+    /// 三条配套判据：
+    /// - **不解析参与者**：记录类"本来就不该有参与者"（§6.1），历史行的参与者＝当前操作人只是
+    ///   **留痕主体**（java `createHistoryTask` 的 `singletonList(operator)` 同形）。行是 DONE
+    ///   ⇒ 不进待办列表、谁也办不动；**绝不允许**因为"没人可办"就兜底挂给操作人造一条待办。
+    /// - **不 fire 码 3**：`PROCESS_TASK_START` 表达的事实是"新待办产生"（规范 11 §11.3），
+    ///   给一条生来已完成的行发它＝凭空多一条办不动的待办。⇒ 落库走 [`Self::persist_history_task`]
+    ///   这条独立通道，不与 `persist_tasks` 共用（对照件：python `engine.py::_exec_custom_node`、
+    ///   java 本轮 `saveHistoryTasks`）。
+    /// - **`clazz` 解析不了不许打断建单**（§6.2 第 2 条）：空串与"未注册"分两档各记一条可诊断
+    ///   日志后照常落行续流；处理器**自身**返回 `Err` 是业务错误，照旧外抛（末句明写不在豁免内）。
+    fn execute_custom_node(&self, exec: &mut Execution, node: &NodeModel) -> JeeflowResult<()> {
+        // ── ① 执行 clazz（两档日志分开，§6.2 要求"未注册处理器"与"clazz 为空串"分别可诊断，
+        //    不许像 c# 那样合成同一条）──
+        let clazz = node.prop_str("clazz").map(|s| s.trim().to_string()).unwrap_or_default();
+        if clazz.is_empty() {
+            eprintln!("{}", custom_missing_clazz_warning(&node.id));
+        } else if let Some(handler) = self.ctx.find_custom_handler(&clazz) {
+            // 处理器的 Err 用 `?` 原样外抛；panic 也**不**套 catch_unwind——
+            // 套上就等于把"业务错误"降级成"跳过处理器"，把 §6.2 的豁免面做成"什么都吞"。
+            if let Some(value) = handler.handle(exec)? {
+                let var_key = node.prop_str("val")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| crate::spi::CUSTOM_RETURN_VAL.to_string());
+                // 本次执行的表达式/参与者求值读的是 `exec.args` ⇒ 写这儿才对下游生效；
+                // 跨步骤那份是实例变量（`update_instance` 落库）⇒ 同步一份，值才真"落进流程变量"
+                // 而不是随本次 execution 结束蒸发。java/python 只写 args 那一侧，
+                // 本栈两处都写是**超集**，不改变基准侧判据读到的那一档。
+                exec.args.insert(var_key.clone(), value.clone());
+                exec.process_instance.variables.insert(var_key, value);
+            }
+        } else {
+            eprintln!("{}", custom_unregistered_clazz_warning(&node.id, &clazz));
+        }
+
+        // ── ② DONE 历史行：接的就是那个"有形状、一直零调用者"的聚合根工厂（issues/137 B 那一笔）──
+        let mut history = exec.process_instance.create_history_task(
+            &node.id, &node.display_name, &exec.operator, TaskType::from_code(node.task_type()));
+        self.persist_history_task(exec, &mut history)?;
+
+        // ── ③ 令牌继续沿出边流转 ──
+        let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
+            .iter()
+            .filter_map(|e| exec.process_model.get_target_node(e).cloned())
+            .collect();
+        for next in next_nodes {
+            self.execute_node(exec, &next)?;
+        }
+        Ok(())
+    }
+
+    /// 记录类历史行（DONE）的**独立**落库通道 —— 与 [`Self::persist_tasks`] 故意不共用。
+    ///
+    /// 为什么不塞进 `exec.new_tasks` 走现成收口：那条收口是 `save_task` + fire 码 3 的**成对腿**，
+    /// 而码 3 表达的是"新待办产生"。记录类行生来 `task_state=20`，跟着走就会被待办列表/站内信
+    /// 收到一条谁也办不动的假单。委托并腿（issues/116）同样跳过——那是给待办收单人用的。
+    ///
+    /// 建单不变量照 `persist_tasks` 那三件抄（spec/02 §6.2 第 1 条明写"task_parent_id 与行级
+    /// 首节点标记照建单不变量走"）：应用层 id 分配、`process_instance_id`、
+    /// parent＝本次 execution 刚办结的那个任务（发起腿没有当前任务 ⇒ 落 0）、
+    /// 行变量里的 `isFirstTaskNode` 标记（尺子与 `persist_tasks` 同一个
+    /// [`ProcessModel::is_first_task_node`]）。
+    fn persist_history_task(&self, exec: &mut Execution, task: &mut ProcessTask) -> JeeflowResult<()> {
+        if task.task_id == 0 {
+            task.task_id = self.next_id();
+        }
+        task.process_instance_id = exec.process_instance.instance_id;
+        if task.parent_task_id.is_none() {
+            task.parent_task_id = Some(exec.process_task.as_ref().map(|t| t.task_id).unwrap_or(0));
+        }
+        task.variables.insert(
+            "isFirstTaskNode".to_string(),
+            JsonValue::Bool(exec.process_model.is_first_task_node(&task.task_name)));
+        // **到期时间这一档：不写，落 NULL**（issues/137 B 留给本函数的"复活时记得补
+        // apply_expire_time"那句前提经本轮核实**不成立**，判定过程写在本轮收口报告）：
+        //   · spec/02 §6 的 custom 属性字典只有 clazz/methodName/args/val，**没有 expireTime**
+        //     （expireTime 挂在 §4 任务节点那一族，而记录类不解析参与者也不办理）；
+        //   · java `ProcessInstance.createHistoryTask` 结构上就拿不到表达式——它收的是
+        //     `CustomModel`（不是 TaskModel），taskType/performType/formKey/expireTime 四列传 null；
+        //   · python 同判（`model.py::create_history_task` 注释"无 expireTime"）。
+        // ⇒ 与两基准一致留 NULL，不在本栈自造"记录类也算到期"的新语义。
+        self.repo().save_task(task)?;
+        if !task.actor_ids.is_empty() {
+            self.repo().add_task_actor(task.task_id, &task.actor_ids)?;
+        }
+        // 聚合根那一格同步成落库形状：`create_history_task` push 进 tasks 的是**克隆**，
+        // 不回写则 `instance.tasks` 里这条还是 id=0／无 parent／无行变量，
+        // 而同一次调用里后续的 `update_instance`／监听器反查读的就是聚合那份。
+        // 按"最后一格"定位与 `create_history_task` 自己的注释同一理由（push 之后最后一格
+        // 必然是本行），这里再加两道列值自检，避免哪天中间插进第二个 push 时静默错位。
+        if let Some(last) = exec.process_instance.tasks.last_mut() {
+            if last.task_name == task.task_name && last.task_state == task.task_state {
+                *last = task.clone();
+            }
+        }
         Ok(())
     }
 
@@ -691,6 +820,9 @@ impl JeeflowEngineImpl {
     /// **串行会签每一步推进** / 跳转四条建任务路径全部经此落库（9 处 `create_task` 调用点
     /// 都汇入 `exec.new_tasks`），故委托自动生效只挂这一处即全覆盖
     /// （契约 06 §4.5 条款 1；只挂"发起"一处会漏掉流转中产生的新单——实测易犯）。
+    /// ⚠️ 唯一**故意不走这条腿**的是记录类（`snaker:custom`）那条 DONE 历史行，它走
+    /// [`Self::persist_history_task`]：本方法是"save_task + fire 码 3"的成对腿，而码 3 的语义
+    /// 是"新待办产生"，给一条生来已完成的行发它就是 §6.1 禁止的假待办（判据见那个方法的注释）。
     ///
     /// 时序（条款 2 ⚠️）：并入发生在 `save_task` **之前**，落在参与者集合本身，
     /// 随后由同一次收口把"原人 + 代理人"整体写入 `wf_process_task_actor`；
@@ -1429,6 +1561,22 @@ fn countersign_roster(vars: &FlowData, key: &str) -> Vec<String> {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default()
+}
+
+/// 记录类节点「**clazz 为空串/缺键**」那一档的日志文案单点（spec/02 §6.2 第 2 条）。
+///
+/// 两档必须**分开**、各自可诊断（条文原话："未注册处理器"与"clazz 为空串"要分档，
+/// c# 把两者合成同一个异常、覆盖面比 java 宽，本轮跟改）。落点是 stderr——本仓 core 零依赖、
+/// 没有可注入的 logger 门面，与 `event.rs::ProcessPublisher`／`surrogate.rs::expand_actors`
+/// 同口径；拆成纯函数是为了让用例钉得住文案（"记了日志"这件事否则无法断）。
+fn custom_missing_clazz_warning(node_id: &str) -> String {
+    format!("[jeeflow] custom 节点 nodeId={} 未配置 clazz（处理器类名为空），跳过处理器执行；历史行照常落库、令牌继续流转", node_id)
+}
+
+/// 记录类节点「**clazz 有值但注册表里没有**」那一档的日志文案单点（同上，另一档）。
+/// 带上实得的 clazz 串与注册入口名，排障时不必再去猜是拼错还是没注册。
+fn custom_unregistered_clazz_warning(node_id: &str, clazz: &str) -> String {
+    format!("[jeeflow] custom 节点 nodeId={} 的 clazz={} 未注册处理器（注册入口 ServiceContext::register_custom_handler），跳过处理器执行；历史行照常落库、令牌继续流转", node_id, clazz)
 }
 
 /// 取本次刚建出的那条任务（聚合根里 push 的是克隆，两份都要写才算落库）。
@@ -4107,5 +4255,606 @@ mod event_leg_tests {
             "先注册的监听器 panic 不得中断后续监听器，也不得回滚主流程");
         assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
             InstanceState::Finished.code(), "主流程照旧办结落库");
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// issues/142 A 批 · 记录类（snaker:custom）执行形状 ＋ 任务类零参与者建单
+//
+// 判据权威＝spec/02 §6.1（"记录类没有参与者是正常形态"）＋ §6.2 三条硬要求
+// （①历史行必须真落库 ②clazz 解析不了⇒记日志＋照常落行＋续流，严禁打断建单
+//   ③任务类零参与者必须建 DOING 行）。owner 2026-09-30 逐条拍。
+// 对照件＝python `engine.py::_exec_custom_node`（唯一已真落库的那一栈）。
+//
+// 这组用例在 HEAD 上**全部不存在**：custom 在本栈被当任务类建 DOING 行、
+// `create_history_task` 零调用者、零参与者一行不建、`clazz` 根本不执行——
+// 四个形状都没格子钉着，所以本轮一条都不会顶到既有用例（逐处还原病灶的实测见收口报告）。
+// ═══════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod custom_node_tests {
+    use super::*;
+    use crate::id_gen::AtomicIdGenerator;
+    use crate::memory::MemoryRepository;
+    use crate::spi::CustomNodeHandler;
+
+    /// 夹具 `clazz` 的注册名（与共享夹具 `flows/08-custom-node.json` 同一个串，
+    /// 集成方按 `clazz` 原样注册 ⇒ 同一份流程 JSON 不必为 Rust 改）。
+    const CLAZZ: &str = "com.mldong.jeeflow.test.TestCustomHandler";
+
+    /// 全量事件顺序 recorder（照 `event_leg_tests::SeqRecorder` 自带一份，免跨模块耦合）。
+    #[derive(Default)]
+    struct CstRecorder {
+        events: std::sync::Mutex<Vec<ProcessEvent>>,
+    }
+    impl ProcessEventListener for CstRecorder {
+        fn on_event(&self, event: &ProcessEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    fn csm_seq(rec: &CstRecorder) -> Vec<String> {
+        rec.events.lock().unwrap().iter()
+            .map(|e| e.event_type.spec_name().to_string())
+            .collect()
+    }
+
+    /// 正常处理器：返回一个值，由引擎按 `val`／缺省 `custom_return_val` 写进流程变量。
+    struct ProbeHandler;
+    impl CustomNodeHandler for ProbeHandler {
+        fn handle(&self, _exec: &mut Execution) -> JeeflowResult<Option<JsonValue>> {
+            Ok(Some(JsonValue::Str("probe-返回值".into())))
+        }
+    }
+
+    /// 返回 `Ok(None)` 的处理器（对齐 java `IHandler` 那一支：引擎不写返回值）。
+    struct SilentHandler;
+    impl CustomNodeHandler for SilentHandler {
+        fn handle(&self, _exec: &mut Execution) -> JeeflowResult<Option<JsonValue>> {
+            Ok(None)
+        }
+    }
+
+    /// 处理器**自身**失败（业务错误）——spec/02 §6.2 末句明写这一档不在豁免内，照旧外抛。
+    struct ErrHandler;
+    impl CustomNodeHandler for ErrHandler {
+        fn handle(&self, _exec: &mut Execution) -> JeeflowResult<Option<JsonValue>> {
+            Err(JeeflowError::Business("处理器自己跑炸了".into()))
+        }
+    }
+
+    /// 处理器 panic——同样不许被降级成"跳过处理器"（本栈不套 catch_unwind）。
+    struct PanicHandler;
+    impl CustomNodeHandler for PanicHandler {
+        fn handle(&self, _exec: &mut Execution) -> JeeflowResult<Option<JsonValue>> {
+            panic!("custom-handler-panic");
+        }
+    }
+
+    /// 内存仓 ＋ 顺序 recorder ＋ 可选的 custom 处理器注册。
+    fn cst_engine(handler: Option<(&str, Arc<dyn CustomNodeHandler>)>)
+        -> (JeeflowEngineImpl, Arc<MemoryRepository>, Arc<CstRecorder>) {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let rec = Arc::new(CstRecorder::default());
+        ctx.register_event_listener(rec.clone());
+        if let Some((name, h)) = handler {
+            ctx.register_custom_handler(name, h);
+        }
+        (JeeflowEngineImpl::new(ctx), repo, rec)
+    }
+
+    /// 单链夹具流工厂：`nodes` = (id, 类型串, properties 片段)，节点按顺序串成一条链。
+    fn cst_chain(name: &str, nodes: &[(&str, &str, &str)]) -> String {
+        let mut json_nodes: Vec<String> = Vec::new();
+        let mut edges: Vec<String> = Vec::new();
+        for (i, (id, ty, props)) in nodes.iter().enumerate() {
+            json_nodes.push(format!(
+                r#"{{"id":"{id}","type":"{ty}","properties":{{{props}}},"text":{{"value":"节点{id}"}}}}"#));
+            if i > 0 {
+                let prev = nodes[i - 1].0;
+                edges.push(format!(
+                    r#"{{"id":"e{i}","sourceNodeId":"{prev}","targetNodeId":"{id}","properties":{{}}}}"#));
+            }
+        }
+        format!(
+            r#"{{"name":"{name}","displayName":"记录类夹具","type":"approval","nodes":[{}],"edges":[{}]}}"#,
+            json_nodes.join(","), edges.join(","))
+    }
+
+    fn cst_define(repo: &Arc<MemoryRepository>, content: &str) -> i64 {
+        let mut define = ProcessDefine {
+            id: 0, name: "custom-fixture".into(), display_name: "记录类夹具".into(),
+            define_type: "approval".into(), state: 1,
+            content: content.as_bytes().to_vec(),
+            version: 1, create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        repo.save_define(&mut define).unwrap();
+        define.id
+    }
+
+    /// 取某节点的**全部**行（不分状态），条数交给用例自己判。
+    fn cst_rows(repo: &MemoryRepository, iid: i64, node: &str) -> Vec<ProcessTask> {
+        let mut rows: Vec<ProcessTask> = repo.find_history_tasks(iid).unwrap()
+            .into_iter().filter(|t| t.task_name == node).collect();
+        rows.sort_by_key(|t| t.task_id);
+        rows
+    }
+
+    /// 主链：start → apply(applicant) → custom1 → approve(leader) → end。
+    fn cst_main(name: &str) -> String {
+        cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("apply", "snaker:task", r#""assignee":"applicant""#),
+            ("custom1", "snaker:custom",
+             &format!(r#""clazz":"{CLAZZ}","methodName":"execute","args":"param1","val":"customResult""#)),
+            ("approve", "snaker:task", r#""assignee":"leader""#),
+            ("end", "snaker:end", ""),
+        ])
+    }
+
+    // ─── §6.2 第 1 条：DONE 历史行必须**真落库**，且不产生待办、不 fire 码 3 ───
+
+    /// 正向主用例：custom 节点被办到之后
+    /// ① 库里读得到那条 `task_state=20` 的行（聚合里 append 一条不算做到）；
+    /// ② 待办列表里**没有**它（旧形状给它建 DOING 行＝§6.1 禁止形状①）；
+    /// ③ 令牌沿出边继续流转（下游 approve 建单、最终办结）；
+    /// ④ 全程不为它 fire 码 3（spec §11.3：码 3 的事实是"新待办产生"）；
+    /// ⑤ 返回值按节点 `val`（`customResult`）落进流程变量。
+    #[tokio::test]
+    async fn test_i142_custom_lands_done_row_and_continues_token() {
+        let (engine, repo, rec) =
+            cst_engine(Some((CLAZZ, Arc::new(ProbeHandler) as Arc<dyn CustomNodeHandler>)));
+        let name = "i142_main";
+        let did = cst_define(&repo, &cst_main(name));
+
+        // 发起：只该有 apply 一条待办，custom 还没被走到 ⇒ 一行都没有
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        assert_eq!(cst_rows(&repo, inst.instance_id, "custom1").len(), 0,
+            "custom 节点在 apply 之后，发起时不该有任何行");
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").expect("apply 待办应在");
+
+        // 办掉 apply ⇒ 令牌走到 custom1
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+
+        let hist = cst_rows(&repo, inst.instance_id, "custom1").into_iter()
+            .find(|t| t.task_state == TaskState::Finished.code())
+            .expect("§6.2 第 1 条：custom 节点必须有一条 task_state=20 的历史行**查得到**");
+        // 真落库自证：按 id 反查主键行（只进聚合的话这里就是 None）
+        let from_db = repo.find_task_by_id(hist.task_id).unwrap()
+            .expect("历史行必须真落库（find_task_by_id 读得到）");
+        assert_eq!(from_db.task_state, TaskState::Finished.code());
+        assert_eq!(from_db.task_name, "custom1");
+        assert_eq!(hist.actor_ids, vec!["applicant".to_string()],
+            "留痕主体＝当前操作人（java createHistoryTask 的 singletonList(operator) 同形）");
+        assert_eq!(repo.find_task_actors(hist.task_id).unwrap(), vec!["applicant".to_string()],
+            "参与者表里也要有那一条（不然 is_allowed/反查读不到留痕主体）");
+        assert_eq!(hist.parent_task_id, Some(apply.task_id),
+            "建单不变量：parent＝本次 execution 刚办结的那个任务");
+        assert_eq!(hist.variables.get("isFirstTaskNode").and_then(|v| v.as_bool()), Some(false),
+            "建单不变量：行级首节点标记照 persist_tasks 同一把尺子落库");
+        assert!(hist.is_finished(), "行本身是已办结态 ⇒ 谁也办不动");
+        // spec/02 §6.2 第 **1bis** 条：这条 DONE 行必须**同时**带完成时间。
+        // 内存仓整行存 ⇒ 这里能读到；SQL 仓原先的 INSERT 语句不带 finish_time 列，
+        // 聚合根赋的值在真库那一路被静默丢掉（`jeeflow-repository-sqlx/src/lib.rs::save_task`
+        // 本轮补列，同一条判据在 `test_mysql_i142_custom_history_row_lands` 里复查）。
+        assert!(hist.finish_time.is_some(),
+            "§6.2 1bis：doneList/approvalRecord 按 operator＋finish_time 取数，缺列＝留痕没落");
+        assert_eq!(from_db.finish_time, hist.finish_time, "落库行的完成时间不得与返回行分叉");
+        assert!(hist.update_time.is_none() && hist.update_user.is_none(),
+            "只补 finish_time：记录类没有'办理'那一步，update 审计两列继续留空");
+
+        // ②待办数不增加：custom1 不在待办里，链上只有 approve 一条
+        let doing = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
+        assert_eq!(doing.len(), 1, "待办只该有 approve 一条，实得 {:?}",
+            doing.iter().map(|t| (t.task_name.clone(), t.task_state)).collect::<Vec<_>>());
+        assert_eq!(doing[0].task_name, "approve", "令牌必须沿出边继续流转（③）");
+        assert!(!doing.iter().any(|t| t.task_name == "custom1"),
+            "§6.1 禁止形状①：记录类绝不被建成 DOING 待办");
+
+        // ⑤返回值落流程变量：节点写的是 val=customResult
+        let inst_now = repo.find_instance_by_id(inst.instance_id).unwrap().unwrap();
+        assert_eq!(inst_now.variables.get_str("customResult"), Some("probe-返回值"),
+            "val 命中 ⇒ 按 val 键写进流程变量");
+        assert!(inst_now.variables.get_str("custom_return_val").is_none(),
+            "命中 val 时不该再写缺省键");
+
+        // ④码 3 序列：[1,3,5,3,5,2]，且没有任何码 3 指向历史行的 id
+        engine.execute_task_async(doing[0].task_id, "leader", &FlowData::new()).await.unwrap();
+        assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+            InstanceState::Finished.code(), "实例应一路走到终点");
+        assert_eq!(csm_seq(&rec), vec![
+            "PROCESS_INSTANCE_START", "PROCESS_TASK_START", "TASK_COMPLETE",
+            "PROCESS_TASK_START", "TASK_COMPLETE", "PROCESS_INSTANCE_END"],
+            "序列里必须没有第三条 PROCESS_TASK_START（历史行不 fire 码 3）");
+        let task_start_ids: Vec<i64> = rec.events.lock().unwrap().iter()
+            .filter(|e| e.event_type == ProcessEventType::ProcessTaskStart)
+            .map(|e| e.source_id).collect();
+        assert_eq!(task_start_ids.len(), 2, "只有 apply/approve 两条待办能触发码 3");
+        assert!(!task_start_ids.contains(&hist.task_id),
+            "不为记录类历史行 fire 码 3，实得 {task_start_ids:?}");
+    }
+
+    /// 发起腿同样要有 INSERT 腿：`start → custom → end` 这种"发起即命中记录类"的流，
+    /// 走的是 `start_async` 那条 persist 收口——历史行照样必须落库、照样不 fire 码 3、
+    /// 令牌继续走到办结。（java 本轮那句"两条腿都要有 INSERT，漏一条就是半条路径又不落库"。）
+    #[tokio::test]
+    async fn test_i142_custom_at_start_leg_also_lands_row() {
+        let (engine, repo, rec) =
+            cst_engine(Some((CLAZZ, Arc::new(ProbeHandler) as Arc<dyn CustomNodeHandler>)));
+        let name = "i142_start_leg";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("custom1", "snaker:custom", &format!(r#""clazz":"{CLAZZ}""#)),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let hist = cst_rows(&repo, inst.instance_id, "custom1").into_iter()
+            .find(|t| t.task_state == TaskState::Finished.code())
+            .expect("发起腿也必须把 DONE 历史行 INSERT 进库");
+        assert!(repo.find_task_by_id(hist.task_id).unwrap().is_some(), "落库自证");
+        assert_eq!(repo.find_doing_tasks(inst.instance_id, &[]).unwrap().len(), 0,
+            "记录类不产生待办 ⇒ 待办数 0（§6.1 硬结论 2）");
+        assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+            InstanceState::Finished.code(), "令牌必须继续流转到 end");
+        assert_eq!(csm_seq(&rec), vec!["PROCESS_INSTANCE_START", "PROCESS_INSTANCE_END"],
+            "全程不出现码 3");
+        assert_eq!(hist.variables.get("isFirstTaskNode").and_then(|v| v.as_bool()), Some(true),
+            "start 的直接后继 ⇒ 与 persist_tasks 同一把尺子读出 true（不自造判据）");
+    }
+
+    // ─── 到期时间这一档：判定＝不写，落 NULL（issues/137 B 那句 TODO 的核实结论）───
+
+    /// 同一个流程里任务节点配 `expireTime` 正常算出到期时间，而 custom 节点即便也配了
+    /// `expireTime`，那条历史行的 `expire_time` 仍必须是 NULL。
+    /// 判据：spec/02 §6 的 custom 属性字典只有 clazz/methodName/args/val（expireTime 属 §4
+    /// 任务节点那一族）；java `createHistoryTask` 结构上拿不到表达式（四列传 null）、
+    /// python 同判。⇒ issues/137 B 留的"复活时补 apply_expire_time"前提不成立。
+    /// 这一支同时把"不是求值器坏了"钉在对照格上：同一次执行里 task 节点那条有值。
+    #[tokio::test]
+    async fn test_i142_custom_history_row_expire_time_stays_null() {
+        let (engine, repo, _rec) =
+            cst_engine(Some((CLAZZ, Arc::new(ProbeHandler) as Arc<dyn CustomNodeHandler>)));
+        let name = "i142_expire";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("apply", "snaker:task", r#""assignee":"applicant""#),
+            ("custom1", "snaker:custom", &format!(r#""clazz":"{CLAZZ}","expireTime":"2h""#)),
+            ("approve", "snaker:task", r#""assignee":"leader","expireTime":"2h""#),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+
+        let hist = cst_rows(&repo, inst.instance_id, "custom1").into_iter()
+            .find(|t| t.task_state == TaskState::Finished.code()).unwrap();
+        assert!(hist.expire_time.is_none(),
+            "记录类历史行到期列留 NULL（判定见本用例注释），实得 {:?}", hist.expire_time);
+
+        // 对照格：同一一次执行里任务节点的到期写点照常工作 ⇒ NULL 是**这一档**的判定，不是坏了
+        let approve = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "approve").unwrap();
+        assert!(approve.expire_time.is_some(),
+            "写点①（普通建单）必须照常算出到期时间，否则本用例的对照失去意义：实得 NULL");
+    }
+
+    // ─── §6.2 第 2 条：clazz 解析不了 ⇒ 记日志 ＋ 照常落行 ＋ 续流，两档分开 ───
+
+    /// 未注册处理器：不炸、历史行照落、令牌继续；日志文案带 nodeId ＋ 实得 clazz ＋ 注册入口。
+    #[tokio::test]
+    async fn test_i142_unregistered_clazz_lands_row_and_continues() {
+        let (engine, repo, _rec) = cst_engine(None);   // 一个处理器都没注册
+        let name = "i142_unregistered";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("custom1", "snaker:custom", r#""clazz":"com.example.NotRegistered""#),
+            ("approve", "snaker:task", r#""assignee":"leader""#),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await
+            .expect("§6.2 第 2 条：clazz 未注册严禁抛错打断建单");
+
+        let hist = cst_rows(&repo, inst.instance_id, "custom1").into_iter()
+            .find(|t| t.task_state == TaskState::Finished.code())
+            .expect("未注册也要照常落历史行（不许「记了日志但停在原地」）");
+        assert!(repo.find_task_by_id(hist.task_id).unwrap().is_some(), "行必须真落库");
+        assert_eq!(repo.find_doing_tasks(inst.instance_id, &[]).unwrap().len(), 1,
+            "令牌必须继续流转到 approve");
+        assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+            InstanceState::Doing.code(), "还停在 approve 待办上");
+
+        let msg = custom_unregistered_clazz_warning("custom1", "com.example.NotRegistered");
+        assert!(msg.contains("custom1") && msg.contains("com.example.NotRegistered"),
+            "未注册档必须带 nodeId 与实得 clazz：{msg}");
+        assert!(msg.contains("register_custom_handler"), "要给出注册入口，排障不必猜：{msg}");
+    }
+
+    /// `clazz` 为空串／缺键／纯空白三形 ⇒ 同一档（"没配"），既不炸也不并入"未注册"那一档；
+    /// 两档文案**分别**可诊断（§6.2 点名 c# 把两者合成一条、覆盖面比 java 宽）。
+    #[tokio::test]
+    async fn test_i142_empty_clazz_is_its_own_leg_and_rows_still_land() {
+        for (tag, props) in [
+            ("缺键", r#""methodName":"execute""#),
+            ("空串", r#""clazz":"""#),
+            ("纯空白", r#""clazz":"   ""#),
+        ] {
+            let (engine, repo, _rec) =
+                cst_engine(Some((CLAZZ, Arc::new(ProbeHandler) as Arc<dyn CustomNodeHandler>)));
+            let content = cst_chain("i142_empty_clazz", &[
+                ("start", "snaker:start", ""),
+                ("custom1", "snaker:custom", props),
+                ("approve", "snaker:task", r#""assignee":"leader""#),
+                ("end", "snaker:end", ""),
+            ]);
+            let did = cst_define(&repo, &content);
+            let inst = engine.start_async(did, "applicant", &FlowData::new()).await
+                .unwrap_or_else(|e| panic!("{tag} 这一档不该打断建单，实得 Err: {e:?}"));
+            let rows = cst_rows(&repo, inst.instance_id, "custom1");
+            assert_eq!(rows.len(), 1, "{tag}：历史行必须照常落一条");
+            assert_eq!(rows[0].task_state, TaskState::Finished.code(), "{tag}：行是 DONE");
+            assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+                InstanceState::Doing.code(), "{tag}：令牌继续流转到 approve");
+            // 空串档不解析处理器 ⇒ 注册着 ProbeHandler 也不该被调用 ⇒ 不写返回值
+            let inst_now = repo.find_instance_by_id(inst.instance_id).unwrap().unwrap();
+            assert!(inst_now.variables.get_str("custom_return_val").is_none(),
+                "{tag}：clazz 为空 ⇒ 处理器不执行，缺省键也不该出现");
+        }
+
+        // 两档文案各写各的，不许合成同一条（c# 那一档的教训）
+        let missing = custom_missing_clazz_warning("custom1");
+        let unregistered = custom_unregistered_clazz_warning("custom1", "com.example.Nope");
+        assert_ne!(missing, unregistered, "两档日志必须分别可诊断");
+        assert!(missing.contains("未配置 clazz"), "空串档要说清是「没配」：{missing}");
+        assert!(!missing.contains("com.example.Nope"), "空串档不该带 clazz 值");
+        assert!(unregistered.contains("未注册处理器"), "未注册档要说清是「没注册」：{unregistered}");
+    }
+
+    /// 处理器返回 `Ok(None)` ⇒ 引擎一个键都不写（对齐 java `IHandler` 那一支自己填 args）。
+    #[tokio::test]
+    async fn test_i142_handler_returning_none_writes_no_variable() {
+        let (engine, repo, _rec) =
+            cst_engine(Some((CLAZZ, Arc::new(SilentHandler) as Arc<dyn CustomNodeHandler>)));
+        let did = cst_define(&repo, &cst_main("i142_silent"));
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+        let inst_now = repo.find_instance_by_id(inst.instance_id).unwrap().unwrap();
+        assert!(inst_now.variables.get_str("customResult").is_none()
+            && inst_now.variables.get_str("custom_return_val").is_none(),
+            "Ok(None) ⇒ 两个键都不写，实得 {:?}", inst_now.variables.inner().keys().cloned()
+                .collect::<Vec<_>>());
+        assert_eq!(cst_rows(&repo, inst.instance_id, "custom1").len(), 1,
+            "但历史行照落——返回值与留痕是两件事");
+    }
+
+    /// 节点没配 `val` ⇒ 缺省键逐字用 java `FlowConst.CUSTOM_RETURN_VAL`＝`custom_return_val`。
+    #[tokio::test]
+    async fn test_i142_return_val_falls_back_to_custom_return_val() {
+        let (engine, repo, _rec) =
+            cst_engine(Some((CLAZZ, Arc::new(ProbeHandler) as Arc<dyn CustomNodeHandler>)));
+        let name = "i142_default_key";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("custom1", "snaker:custom", &format!(r#""clazz":"{CLAZZ}""#)),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let inst_now = repo.find_instance_by_id(inst.instance_id).unwrap().unwrap();
+        assert_eq!(inst_now.variables.get_str("custom_return_val"), Some("probe-返回值"),
+            "缺省键必须是 custom_return_val（逐字对齐 java 常量）");
+        assert_eq!(crate::spi::CUSTOM_RETURN_VAL, "custom_return_val", "常量本体也钉一下");
+    }
+
+    // ─── §6.2 第 2 条末句：处理器**自身**失败不在豁免内 ⇒ 照旧外抛（负向对照）───
+
+    #[tokio::test]
+    async fn test_i142_handler_error_propagates_and_breaks_the_step() {
+        let (engine, repo, rec) =
+            cst_engine(Some((CLAZZ, Arc::new(ErrHandler) as Arc<dyn CustomNodeHandler>)));
+        let name = "i142_handler_err";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("apply", "snaker:task", r#""assignee":"applicant""#),
+            ("custom1", "snaker:custom", &format!(r#""clazz":"{CLAZZ}""#)),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").unwrap();
+
+        let err = engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await
+            .err().expect("处理器自身 Err 是业务错误，必须外抛（不许被记日志的豁免吞掉）");
+        assert_eq!(err.message(), "处理器自己跑炸了", "外抛时文案原样透出，实得 {:?}", err.message());
+        assert!(cst_rows(&repo, inst.instance_id, "custom1").is_empty(),
+            "外抛发生在落行之前 ⇒ 这次执行没有半条 DONE 行（豁免只管配错，不管业务炸）");
+        assert!(!csm_seq(&rec).iter().any(|n| n == "PROCESS_INSTANCE_END"),
+            "整次执行被打断 ⇒ 不该有码 2");
+    }
+
+    /// 处理器 panic 同样不许被降级（本栈不套 catch_unwind；对照 `event.rs` 里**监听器** panic
+    /// 才做隔离——那是"通知失败不回滚主流程"的另一条哲学，别混用）。
+    #[tokio::test]
+    #[should_panic(expected = "custom-handler-panic")]
+    async fn test_i142_handler_panic_propagates() {
+        let (engine, repo, _rec) =
+            cst_engine(Some((CLAZZ, Arc::new(PanicHandler) as Arc<dyn CustomNodeHandler>)));
+        let name = "i142_handler_panic";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("custom1", "snaker:custom", &format!(r#""clazz":"{CLAZZ}""#)),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let _ = engine.start_async(did, "applicant", &FlowData::new()).await;
+        panic!("不该走到这里");
+    }
+
+    // ─── §6.2 第 3 条：任务类零参与者必须建 DOING 行（撤掉"空 ⇒ 不建并继续"）───
+
+    /// 一个什么都没配的 task 节点（无 assignee/assignmentHandler/candidateUsers/candidateGroups）
+    /// ⇒ **必须**建一行参与者为空的 DOING 行：
+    ///   · 行读得到、`task_state=10`、`actor_ids` 是空 Vec（不是 None、也不是兜底挂操作人）；
+    ///   · **发起人不在参与者里**（§6.1 硬结论 1：兜底挂当前操作人八栈一律不许有）；
+    ///   · 令牌**不**推进（下游节点没有行）⇒ 不存在"自动推进为它反复重入"的形状；
+    ///   · 它仍是待办 ⇒ 照 `persist_tasks` 收口 fire 码 3，载荷 `actors` 为空数组。
+    /// 旧形状是"一行不建、令牌沿出边跑掉"＝§6.1 点名的死锁黑洞（库里查不到节点到过）。
+    #[tokio::test]
+    async fn test_i142_zero_actor_task_node_still_creates_doing_row() {
+        let (engine, repo, rec) = cst_engine(None);
+        let name = "i142_zero_actor";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("silence", "snaker:task", ""),
+            ("approve", "snaker:task", r#""assignee":"leader""#),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await
+            .expect("零参与者不得让发起报错");
+
+        let rows = cst_rows(&repo, inst.instance_id, "silence");
+        assert_eq!(rows.len(), 1, "任务类零参与者必须建一行，实得 {} 行", rows.len());
+        let row = &rows[0];
+        assert_eq!(row.task_state, TaskState::Doing.code(), "建的是待办行（10）");
+        assert!(row.actor_ids.is_empty(), "参与者集合为空 Vec，实得 {:?}", row.actor_ids);
+        assert_eq!(row.actor_id, None, "进行中任务该列恒无值");
+        assert_eq!(repo.find_task_actors(row.task_id).unwrap(), Vec::<String>::new(),
+            "参与者表里零行——**不是**兜底挂给当前操作人");
+        assert!(!row.actor_ids.iter().any(|a| a == "applicant"),
+            "§6.1 硬结论 1：发起人不在参与者里（不许兜底挂当前操作人）");
+        assert!(!row.is_allowed("applicant"), "零参与者行谁也办不动（设计如此，不是缺陷）");
+
+        assert_eq!(repo.find_doing_tasks(inst.instance_id, &[]).unwrap().len(), 1,
+            "只有这一条待办：令牌停在这里，不替它往下推（否则又回到「跳过建行」那一档）");
+        assert_eq!(cst_rows(&repo, inst.instance_id, "approve").len(), 0,
+            "下游节点没有行 ⇒ 自动推进逻辑不会为一个办不动的行反复重入");
+        assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+            InstanceState::Doing.code(), "实例停在 10，且这一停**可查**（库里有一行指着它）");
+
+        assert_eq!(csm_seq(&rec), vec!["PROCESS_INSTANCE_START", "PROCESS_TASK_START"]);
+        let actors_payload = rec.events.lock().unwrap().iter()
+            .filter(|e| e.event_type == ProcessEventType::ProcessTaskStart)
+            .map(|e| e.data.get("actors").and_then(|v| v.as_array()).map(|a| a.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(actors_payload, vec![Some(0)], "码 3 载荷 actors 为空数组（新待办确实产生了）");
+    }
+
+    /// 只配 `candidateGroups` 的节点：`resolve_assignee` 不把候选组折进参与者（Priority 4 只收
+    /// candidateUsers）⇒ 与"什么都没配"同档：**建一行零参与者的 DOING 行**。
+    /// 旧形状这里因为守卫里的 `candidate_groups().is_some()` 而**一行都不建**——
+    /// 那条件本身就是"配了候选人/候选组就别建行"的旧判据，本轮撤掉守卫后由这一格钉住新形状。
+    #[tokio::test]
+    async fn test_i142_candidate_group_only_node_creates_zero_actor_row() {
+        let (engine, repo, _rec) = cst_engine(None);
+        let name = "i142_candidate_group";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("pick", "snaker:task", r#""candidateGroups":"dept_leader""#),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let rows = cst_rows(&repo, inst.instance_id, "pick");
+        assert_eq!(rows.len(), 1, "候选组不解析成参与者 ⇒ 也必须建那一行零参与者待办");
+        assert_eq!(rows[0].task_state, TaskState::Doing.code());
+        assert!(rows[0].actor_ids.is_empty(), "候选组不生成 actor，实得 {:?}", rows[0].actor_ids);
+    }
+
+    /// **本轮没动的形状，钉在这里以免被误读成已修**：`resolve_assignee` 的 Priority 4
+    /// 把 `candidateUsers` 直接折进参与者集合，而 spec/02 §4 明确
+    /// 「candidateUsers ——**不生成 actor**，供 candidatePage 选人」。
+    /// 这不是 issues/142 A 批的四件事之一（本案只管"零参与者要不要建行"），
+    /// 改动面涉及所有拿 candidateUsers 当"预分配处理人"用的存量流程 ⇒ 记为待拍/另批，
+    /// 这一格按**现状**断言，将来谁改这条判据就会在这里红。
+    #[tokio::test]
+    async fn test_i142_candidate_users_current_shape_folds_into_actors_pending_ruling() {
+        let (engine, repo, _rec) = cst_engine(None);
+        let name = "i142_candidate_users";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("pick", "snaker:task", r#""candidateUsers":"u1,u2""#),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let rows = cst_rows(&repo, inst.instance_id, "pick");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].actor_ids, vec!["u1".to_string(), "u2".to_string()],
+            "现状：candidateUsers 被折进 actor（与 spec/02 §4 那条「不生成 actor」分叉，本轮未改）");
+    }
+
+    /// **共享夹具**那一格：`flows/08-custom-node.json` 是八语言同一份（编辑源在 jeeflow-java，
+    /// `flowsdir` 精确镜像进本仓），里面的 `clazz` 写的是 JVM 类名
+    /// `com.mldong.jeeflow.test.TestCustomHandler` ⇒ 本栈必然落「未注册」档。
+    /// 这条链（start → apply → custom1 → end）在 HEAD 上的形状是：custom1 建一条 **DOING 待办**，
+    /// 流程永远办不完（申请人之外没人能办它，而它本来也不该有人办）。
+    /// 改后：一条 DONE 留痕、令牌直连 end、实例办结、`val` 那个键一个都不写。
+    #[tokio::test]
+    async fn test_i142_shared_fixture_08_custom_node_completes() {
+        let (engine, repo, rec) = cst_engine(None);
+        let path = format!("{}/08-custom-node.json", crate::flowsdir::dir().to_string_lossy());
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("共享夹具读不到 {path}: {e}"));
+        let did = cst_define(&repo, &content);
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let apply = repo.find_doing_tasks(inst.instance_id, &[]).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").expect("apply 待办应在");
+        engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await.unwrap();
+
+        let hist = cst_rows(&repo, inst.instance_id, "custom1").into_iter()
+            .find(|t| t.task_state == TaskState::Finished.code())
+            .expect("夹具里的 snaker:custom 节点必须留下 DONE 留痕");
+        assert_eq!(hist.task_name, "custom1");
+        assert!(repo.find_doing_tasks(inst.instance_id, &[]).unwrap().is_empty(),
+            "custom1 → end，待办必须清空（HEAD 形状在这里会剩一条办不动的假待办）");
+        assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+            InstanceState::Finished.code(), "同一份夹具在本栈也能跑到终点");
+        let inst_now = repo.find_instance_by_id(inst.instance_id).unwrap().unwrap();
+        assert!(inst_now.variables.get_str("customResult").is_none(),
+            "未注册处理器 ⇒ 夹具配的 val=customResult 不该被写");
+        assert_eq!(csm_seq(&rec), vec![
+            "PROCESS_INSTANCE_START", "PROCESS_TASK_START", "TASK_COMPLETE", "PROCESS_INSTANCE_END"],
+            "夹具这条链的事件序列是 [1,3,5,2]，历史行不在码 3 里");
+    }
+
+    // ─── 未知档在执行腿上的形状：既不是记录类也不是任务类 ───
+
+    /// `snaker:Custom`（拼错大小写）在 HEAD 上被兜底臂收成 Custom ⇒ 被当任务类建了一条
+    /// DOING 待办。拆臂后它落 Unknown：执行腿**跳过**——不建行、不 fire 事件、
+    /// 也不沿出边推进（与 java 解析期 continue 的可观测结果一致），库里什么行都没有。
+    #[tokio::test]
+    async fn test_i142_unknown_node_is_skipped_without_any_row() {
+        let (engine, repo, rec) = cst_engine(None);
+        let name = "i142_unknown";
+        let content = cst_chain(name, &[
+            ("start", "snaker:start", ""),
+            ("typo1", "snaker:Custom", &format!(r#""clazz":"{CLAZZ}""#)),
+            ("approve", "snaker:task", r#""assignee":"leader""#),
+            ("end", "snaker:end", ""),
+        ]);
+        let did = cst_define(&repo, &content);
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+
+        assert!(cst_rows(&repo, inst.instance_id, "typo1").is_empty(),
+            "未知档不建行：既不被当记录类（无 DONE 行），也不被当任务类（无 DOING 行）");
+        assert!(repo.find_doing_tasks(inst.instance_id, &[]).unwrap().is_empty(),
+            "没有待办（旧形状这里恰恰会多出一条办不动的假待办）");
+        assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
+            InstanceState::Doing.code(), "实例停在未知节点处（照 java 跳过节点＝令牌不前进）");
+        assert_eq!(csm_seq(&rec), vec!["PROCESS_INSTANCE_START"], "未知档不产生任何任务事件");
     }
 }

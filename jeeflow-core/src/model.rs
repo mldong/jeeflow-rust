@@ -403,28 +403,48 @@ impl ProcessInstance {
 
     /// Create a history task (already FINISHED, for custom nodes).
     ///
-    /// ⚠️ **当前零调用者，但承担契约形状义务（issues/137 B）**：全仓 grep 只有本定义
-    /// （建单族里 rust 的自动/自定义节点走 `create_task` ＋ `finish`，没人调这一支）。
-    /// owner 2026-09-29 裁定**不删**——签名是引擎对"给一个操作人即得一行已办结历史任务"
-    /// 这一形状的承诺，别的栈（java `createHistoryTask` 被 `CustomModel` 调用）以此为对照基准，
-    /// 将来复活自动节点建单也照这个形状接。用例见
-    /// `tests::test_i137b_create_history_task_matches_main_path`（直调与主路径逐维比对）。
-    /// 复活时记得补 `expire_time::apply_expire_time`（Java 同名方法 `createHistoryTask` 是
-    /// issues/126 五处写点之一）——本签名没有节点引用 ⇒ 拿不到到期表达式。
+    /// **2026-09-30 issues/142 A 批接线**：调用者＝`engine.rs::execute_custom_node`
+    /// （记录类节点 `snaker:custom` 的执行腿，spec/02 §6.1／§6.2）。此前它是"有形状、
+    /// 引擎零调用者"（issues/137 B 拍板不删、当时不接线），接线的那一单就是本轮。
+    /// 公开签名没动；**行形状动了一列**（下面 1bis 那段：`finish_time` 改为赋值），
+    /// 钉它的 `tests::test_i137b_create_history_task_matches_main_path` 与
+    /// `..._does_not_disturb_sibling_rows` 两处**跟着裁定改判**（不是把断言改松：
+    /// 改的是"审计三列都不写"这条已被 §6.2 1bis 作废的旧期望）。
+    ///
+    /// ⚠️ issues/137 B 留的那句"复活时记得补 `expire_time::apply_expire_time`
+    /// （Java 同名方法是 126 的五处写点之一）"经本轮核实**前提不成立**，按基准落 NULL：
+    /// java HEAD 的 `applyExpireTime` 调用点是 createTask / 串行首成员 / 并行全员 /
+    /// rejectTask 四处 ＋ 一处 `applyNodeExpireTime`（给 CountersignHandler 用），
+    /// **不含** `createHistoryTask`；它收的是 `CustomModel`（无 expireTime 属性，
+    /// spec/02 §6 的 custom 字典只有 clazz/methodName/args/val），四列传 null。
+    /// python 同判（其 `create_history_task` 注释明写"无 expireTime"）。
+    /// ⇒ 到期判定落在调用侧的注释与用例里（`engine.rs::persist_history_task`），
+    ///   本签名继续不引节点引用，公开形状不破。
     pub fn create_history_task(&mut self, task_name: &str, display_name: &str,
                                 operator: &str, task_type: TaskType) -> ProcessTask {
         let mut task = self.create_task(task_name, display_name, &[operator.to_string()],
                                          operator, task_type, PerformType::Normal, None, None);
         task.task_state = TaskState::Finished.code();
         task.actor_id = Some(operator.to_string());
+        // spec/02 §6.2 第 **1bis** 条（issues/142 A 批收口补，owner 2026-09-30 拍）：
+        // 这条 DONE 行必须写处理人**与完成时间**。`processTask/doneList`
+        // （`task_state<>10 AND operator=?`）与 `processInstance/approvalRecord` 都按
+        // `operator`／`finish_time` 两列取数，已完成行不带完成时间，在用户面上等于这条留痕没落过
+        // ——与第 1 条"查不到的留痕＝没留痕"同一把尺子。java `createHistoryTask`（本轮 33ba48f）
+        // 与 python 同形。⚠️ **只补这两列，`update_time`/`update_user` 继续留 None**：
+        // 记录类没有"办理"这一步，那两列是办理审计，写它就是自造第三形状。
+        // 反过来 **`expire_time` 保持 NULL**（§6 的 custom 属性字典无 expireTime）。
+        task.finish_time = Some(current_time_str());
         // Update in the tasks list —— **按刚 push 的那一格定位**，不按 task_id 找：
         // 本函数返回的行 id 是 0（真 id 由 `persist_tasks` 后置分配），拿 `task_id == 0` 去
         // `find` 会命中聚合里**第一条**未分配 id 的行——实例先建了别的 DOING 行时就会把
         // 别人的行改成 FINISHED，而返回的那一行反而是已办结的，两行分叉（issues/137 B
         // 直调对拍用例实测到的形状）。push 之后最后一格必然是本行。
         if let Some(t) = self.tasks.last_mut() {
-            t.task_state = task.task_state;
-            t.actor_id = task.actor_id.clone();
+            // 整格覆盖而不是逐列挑着写：本函数在 `task` 上动了三列（state/actor_id/finish_time），
+            // 逐列写就要在每一处新增列上重复一次，漏一列就是"返回行已办结、聚合里那格还差一列"
+            // 的分叉——1bis 加 finish_time 时正是这个形状最容易复发的时候。
+            *t = task.clone();
         }
         task
     }
@@ -1398,7 +1418,8 @@ mod tests {
     }
 
     /// `create_history_task` 直调 ⇒ 除办理审计三列外逐维等于"主路径建单后办结"，
-    /// 且那三列的差异**有据**（自动/自定义节点没有办理人，不写办理留痕）。
+    /// 三列里 **`finish_time` 现在也写**（spec/02 §6.2 1bis，2026-09-30 裁定，本用例同批改判），
+    /// 另两列（`update_time`/`update_user`）差异仍有据：记录类没有"办理"这一步。
     #[test]
     fn test_i137b_create_history_task_matches_main_path() {
         let _scope = crate::clock::ClockScope::injected(i137b_clock);
@@ -1423,8 +1444,16 @@ mod tests {
         assert_eq!(hist.actor_id.as_deref(), Some("flow.auto"), "已办结行必须挂处理人");
         assert_eq!(hist.actor_id, main.actor_id);
         assert_eq!(hist.actor_ids, vec!["flow.auto".to_string()]);
-        // 有据差异：自动节点没有"办理"这一步 ⇒ 不写办理审计三列（主路径那边三列必须已写）
-        assert_eq!(hist.finish_time, None);
+        // 有据差异：记录类没有"办理"这一步 ⇒ **只补 finish_time 一列**，
+        // `update_time`/`update_user` 两列办理审计继续留 None（spec/02 §6.2 1bis 原话
+        // "两列写、一列不写，别顺手一起补"里的"别顺手"这半）。
+        // ⚠️ 本行期望值 **2026-09-30 跟着裁定改判**：issues/137 B 当时这里钉的是
+        // `assert_eq!(hist.finish_time, None)`，理由写的"自动节点没有办理这一步 ⇒ 不写办理审计三列"
+        // 已被 §6.2 1bis 作废（同一把尺子：查不到的留痕＝没留痕；doneList/approvalRecord
+        // 按 operator＋finish_time 取数）。改判只动这一条期望，不是把断言改松。
+        assert_eq!(hist.finish_time.as_deref(), Some("2026-09-29 10:00:00"),
+            "§6.2 1bis：DONE 留痕行必须带完成时间（注入钟与主路径同一读数）");
+        assert_eq!(hist.finish_time, main.finish_time, "与主路径办结写的同一列、同一基准");
         assert_eq!(hist.update_time, None);
         assert_eq!(hist.update_user, None);
         assert_eq!(main.finish_time.as_deref(), Some("2026-09-29 10:00:00"), "主路径办结写审计列（对照用）");
@@ -1456,6 +1485,12 @@ mod tests {
         assert_eq!(inst.tasks[0].task_name, "apply");
         assert!(inst.tasks[1].is_finished(), "后建的自己那一行才该是已办结");
         assert_eq!(inst.tasks[1].actor_id.as_deref(), Some("flow.auto"));
+        // 聚合里那一格与返回行必须是**同一形状**（整格覆盖的理由见被测函数注释）：
+        // 1bis 的 finish_time 只写在返回行、不写聚合那一格，就等于留了个"落库行缺列"的口子
+        // ——`persist_history_task` 后面 INSERT 绑的是聚合外的 task 副本，但监听器/回显读的是聚合那份。
+        assert_eq!(inst.tasks[1].finish_time.as_deref(), Some("2026-09-29 10:00:00"),
+            "§6.2 1bis：聚合里那格也得带完成时间，不许与返回行分叉");
+        assert_eq!(inst.tasks[0].finish_time, None, "先建那行不得被顺手写上办理时间");
         assert_eq!(inst.get_doing_tasks().len(), 1, "进行中仍是一行");
         assert_eq!(inst.get_finished_tasks().len(), 1, "已办结仍是一行");
     }
