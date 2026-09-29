@@ -300,8 +300,14 @@ pub struct ModelParser;
 impl ModelParser {
     /// Parse LogicFlow JSON string into ProcessModel.
     pub fn parse(json_str: &str) -> JeeflowResult<ProcessModel> {
+        // issues/139：对外 msg 逐字用基准（jeeflow-java `ModelParser`）那句
+        // 「读取流程定义 JSON 失败」，底层解析器的原文只挂错误链（`Error::source`）。
+        // 旧形状 `ParseError(format!("JSON parse error: {}", e))` 既拼底层文本又是英文，
+        // 经门面 `error_response(&e.message())` 一字不差透出到 msg（deploy/redeploy/designRedeploy
+        // 三条腿同一个收口，13 栈 L2 的对外文案因此对不齐 java）。
         let root = parse_json(json_str)
-            .map_err(|e| JeeflowError::ParseError(format!("JSON parse error: {}", e)))?;
+            .map_err(|e| JeeflowError::parse_failure(
+                crate::error::MSG_READ_PROCESS_DEFINE_JSON_FAILED, e))?;
 
         let name = root.get_str("name").unwrap_or("unknown").to_string();
         let display_name = root.get_str("displayName").unwrap_or(&name).to_string();
@@ -388,6 +394,7 @@ impl ModelParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
 
     #[test]
     fn test_parse_simple_flow() {
@@ -577,5 +584,43 @@ mod tests {
         let model = ModelParser::parse(json).unwrap();
         let task_count = model.nodes.iter().filter(|n| n.node_type == NodeType::Task).count();
         assert_eq!(task_count, 2);
+    }
+
+    // ═══ issues/139 · 解析失败的对外 msg 用 java 逐字原文，底层文本只上错误链 ═══
+
+    /// 正向＋负向：`msg` 逐字＝「读取流程定义 JSON 失败」，既不含底层英文原文也不含包装前缀；
+    /// 底层文本仍在错误链上（`Error::source`），排障不丢信息。
+    /// 改前实测：`msg = "解析错误: JSON parse error: Unexpected character at position 2"`
+    /// ——拼底层文本＋英文，经门面逐字透出到对外 msg。
+    #[test]
+    fn test_i139_parse_failure_msg_is_java_verbatim() {
+        let bad = "{ 这不是合法的流程定义 JSON";
+        let err = ModelParser::parse(bad).unwrap_err();
+
+        assert_eq!(err.message(), crate::error::MSG_READ_PROCESS_DEFINE_JSON_FAILED,
+            "对外 msg 必须逐字＝java 基准原文，实得 {:?}", err.message());
+        assert_eq!(err.message(), "读取流程定义 JSON 失败", "同上，把基准文案钉死在字面量上");
+        assert_eq!(err.code(), crate::error::ERR_BUSINESS, "仍走业务失败码 99999999");
+
+        let shown = format!("{}", err);
+        assert!(!shown.contains("JSON parse error"), "msg 里不许有底层英文原文：{shown}");
+        assert!(!shown.contains("解析错误"), "msg 里不许有包装前缀：{shown}");
+        assert!(!shown.contains("position"), "msg 里不许有底层位置细节：{shown}");
+
+        // 原始异常只留在错误链上（java 的 RuntimeException(msg, e) 那一档）
+        let src = err.source().expect("底层解析文本必须挂在 Error::source 上，不能直接丢掉");
+        let src_text = src.to_string();
+        assert!(!src_text.is_empty(), "错误链上的底层原文不得为空");
+        assert_ne!(src_text, err.message(), "链上那份必须是与对外 msg 不同的底层原文");
+    }
+
+    /// 改动面哨兵：`ParseError` 那一档也改成"payload 即 msg"（不再套前缀），
+    /// 与 `Business` 同规则；既有格 `error::tests::test_parse_error_message` 用的是
+    /// `contains`，两边都不破。
+    #[test]
+    fn test_i139_parse_error_payload_is_the_message() {
+        let err = JeeflowError::ParseError("读取流程定义 JSON 失败".into());
+        assert_eq!(err.message(), "读取流程定义 JSON 失败");
+        assert!(err.source().is_none(), "没带底层异常时错误链为空，不该凭空造一层");
     }
 }

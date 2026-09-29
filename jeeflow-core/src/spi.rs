@@ -42,10 +42,72 @@ pub trait ProcessRepository: Send + Sync {
     fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()>;
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()>;
 
+    /// issues/141 G2 写侧判重的**读侧**（spec 06 §4「抄送写侧判重＝幂等空操作」）：
+    /// 取某实例**已存在**的 cc 行 actor id，供建 cc 的三条入口判重用。
+    ///
+    /// default 返回空集＝不判重——未覆写的第三方仓储维持旧行为（全量建行、全量 fire），
+    /// SPI 源码兼容不破。jeeflow 自带的两仓（内存仓 / sqlx 仓）**必须**覆写：
+    /// 否则 issues/141 G1 那条「同一栈两个仓储两个答案」的分叉在写侧重演一遍。
+    fn find_cc_actor_ids(&self, instance_id: i64) -> JeeflowResult<Vec<String>> {
+        let _ = instance_id;
+        Ok(Vec::new())
+    }
+
+    /// issues/141 G2：写侧幂等建 cc 行，返回**实际新建**的 actor 子集。
+    ///
+    /// 同一 `(instance_id, actor_id)` 已有 cc 行时**跳过**——①不新增行、②不重置未读状态
+    /// （`state` 保持原值，owner 2026-09-29 明确「不需要重置」，不产生"再提醒一次"语义）、
+    /// ③不更新原行时间（`create_time`/`update_time` 逐字不变）；重复抄送同一个人在数据面上
+    /// 是 no-op。**判重在写侧**：查询侧不引入 DISTINCT，历史重复行也不清理。
+    /// 同一次调用内重复给同一个人也折叠（只落一行）。
+    ///
+    /// 为什么返回子集而不是 `()`：spec 11.2 原则 1「码值表达发生了什么事实」⇒
+    /// 没发生"创建"就不得 fire `CC_CREATE`（码 4）。三条入口（发起 `f_ccActors`／办理
+    /// `tf_ccActors`／门面手动 `processInstance/createCCInstance`）逐人 fire 的入参一律换成
+    /// 这个子集，子集为空则整支不 fire（不空转、也不照旧按原始请求全量 fire）。
+    ///
+    /// 未覆写 [`Self::find_cc_actor_ids`] 的第三方仓储走本 default ⇒ 与旧
+    /// `create_cc_instance` 逐字一致（全量插入、全量返回），不静默改变既有集成方行为。
+    fn create_cc_instance_if_absent(
+        &self,
+        instance_id: i64,
+        creator: &str,
+        actor_ids: &[String],
+    ) -> JeeflowResult<Vec<String>> {
+        // 先取快照再写：不在持锁期间做插入（本仓内存仓有"持锁跨 await 自死锁"的前科）。
+        let mut existing = self.find_cc_actor_ids(instance_id)?;
+        let mut fresh: Vec<String> = Vec::new();
+        for actor_id in actor_ids {
+            if existing.iter().any(|a| a == actor_id) {
+                continue; // 已有 cc 行 ⇒ 幂等空操作
+            }
+            existing.push(actor_id.clone()); // 同一次调用内的重复也算"已存在"
+            fresh.push(actor_id.clone());
+        }
+        if !fresh.is_empty() {
+            self.create_cc_instance(instance_id, creator, &fresh)?;
+        }
+        Ok(fresh)
+    }
+
     // ═══ Page queries ═══
     fn page_todo_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>>;
     fn page_done_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>>;
     fn page_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>>;
+
+    /// 我的抄送（`processInstance/ccList` 的取数腿）。
+    ///
+    /// **归属条件必填**（issues/141 G1 · spec 06 §2.5「抄送分页同一条尺子」）：查询必须带
+    /// 归属列 `cc.actor_id` 的**有效**条件；条件**整条没给**或**给了但是空值**时
+    /// **返回空页**（`record_count=0`、`rows=[]`），严禁退化成"这条条件不加"而把全部实例摊出去。
+    ///
+    /// 有效条件＝值非 null／字符串去空白后非空／集合非空。判据的**唯一出口**是
+    /// [`crate::model::has_effective_cc_ownership`]，本仓两腿（内存仓 / sqlx 仓）共用它，
+    /// 第三方仓储覆写本方法时**也必须**用它——"同一栈两个仓储两个答案"正是
+    /// issues/117 场景 27 立过法的那一类（那把尺子本轮从 `pageInstances` 扩到 ccList）。
+    ///
+    /// 只收归属谓词：**非归属列的空值放行不变**（`m_like_business_no=""` 这类"没填"
+    /// 依旧按各仓既有语义处理，不得顺手改成空页）。
     fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>>;
     fn page_defines(&self, query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>>;
     fn count_todo_tasks(&self, user_id: &str) -> JeeflowResult<i64>;

@@ -1371,12 +1371,18 @@ impl JeeflowFacade {
         if actors.is_empty() {
             return Err(JeeflowError::Business("actorIds 缺失".into()));
         }
-        self.repo.create_cc_instance(id, &operator, &actors)?;
+        // issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：手动腿与引擎两条腿同一条判据
+        // （spec §11.7「三条入口共用一支」）——已有 cc 行的 (实例, 人) 跳过，不新增行、
+        // 不重置未读、不更新原行时间；只有**实际新建的子集**拿去 fire。
+        let created = self.repo.create_cc_instance_if_absent(id, &operator, &actors)?;
         // CC_CREATE（4）——**手动支与引擎支归一**（规范 11 §11.2 原则 1／§11.7，issues/132 §4.5
         // rust 条目）：本路径与引擎的发起 `f_ccActors`、办理 `tf_ccActors` 两条腿共用
         // `JeeflowEngineImpl::notify_cc_create` 这唯一收口，逐抄送人在 **cc 行落库之后** fire。
         // "新增了一条抄送记录"这个事实成立就发，路径不进事件名（Java 旧状"手动不 fire"是缺不是基准）。
-        self.engine.notify_cc_create(id, &actors);
+        // 入参＝实际新建子集（issues/141 G2）：重复抄送没发生"创建"⇒ 不发码 4，子集为空整支不 fire。
+        if !created.is_empty() {
+            self.engine.notify_cc_create(id, &created);
+        }
         Ok(json!({}))
     }
 

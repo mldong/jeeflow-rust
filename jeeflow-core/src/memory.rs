@@ -310,20 +310,41 @@ impl ProcessRepository for MemoryRepository {
     }
 
     fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()> {
+        // issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与 SqlxRepository::create_cc_instance
+        // 同一条判据：同一 `(实例, 被抄送人)` 已有 cc 行 ⇒ 直接跳过——①不新增行、②不重置未读
+        // （state 保持原值）、③不更新原行时间（连 UPDATE 都不发，create_time/update_time 逐字不变）。
+        // 判重放在**写侧**而不是查询侧：查询不引入 DISTINCT，历史重复行也不清理。
+        // ⚠️ 本函数不 await（同步 SPI），锁只在函数体内取放一次；判重的读侧走
+        //    `ProcessRepository::create_cc_instance_if_absent` 的 default，两次加锁也是**串行**
+        //    而非嵌套——本仓有"持锁跨 await 自死锁"的前科（engine.rs 事件腿），不得在此处再犯。
         let mut ccs = self.cc_instances.lock().unwrap();
         for actor_id in actor_ids {
+            if ccs.iter().any(|c| c.process_instance_id == instance_id && &c.actor_id == actor_id) {
+                continue;
+            }
+            let now = current_time_str();
             ccs.push(CcInstance {
                 id: self.next_id(),
                 process_instance_id: instance_id,
                 actor_id: actor_id.clone(),
                 state: 0,
-                create_time: None,
+                // 行形状对齐 `wf_process_cc_instance`（issues/141 G2）：时间列真填，
+                // "重复抄送不得刷新原行时间"那一档才照得出来；sqlx 仓那边一直是真列。
+                create_time: Some(now.clone()),
                 create_user: Some(creator.to_string()),
-                update_time: None,
+                update_time: Some(now),
                 update_user: None,
             });
         }
         Ok(())
+    }
+
+    /// issues/141 G2 写侧判重的读侧（覆写 trait default）：逐行返回，**不加 DISTINCT**
+    /// ——判重只看"这个人在这条实例上有没有行"，存量重复行原样留着（owner 2026-09-29 拍）。
+    fn find_cc_actor_ids(&self, instance_id: i64) -> JeeflowResult<Vec<String>> {
+        let ccs = self.cc_instances.lock().unwrap();
+        Ok(ccs.iter().filter(|c| c.process_instance_id == instance_id)
+            .map(|c| c.actor_id.clone()).collect())
     }
 
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()> {
@@ -331,6 +352,8 @@ impl ProcessRepository for MemoryRepository {
         for cc in ccs.iter_mut() {
             if cc.process_instance_id == instance_id && cc.actor_id == actor_id {
                 cc.state = 1;
+                // 已读是"人主动读"这个新事实，才动 update_time；重复抄送不动（issues/141 G2 ③）。
+                cc.update_time = Some(current_time_str());
             }
         }
         Ok(())
@@ -519,18 +542,35 @@ impl ProcessRepository for MemoryRepository {
     ///   · cc 行自己的 `create_user`（"这条抄送是谁发给我的"）按条文**不得占用 `operator` 键名**，
     ///     而实例行结构里也没有它的槽位 ⇒ 不透出（与 sqlx / boot2 的 `t.*` 同形）。
     /// 唯一分叉：孤儿 cc（实例不在）这里出**降级行**、sqlx 的 INNER JOIN 直接丢弃，理由见函数体注释。
+    ///
+    /// **issues/141 G1 归属条件必填**（spec 06 §2.5）：判据一律走
+    /// [`crate::model::has_effective_cc_ownership`]，与 `SqlxRepository::page_cc_instances`
+    /// 同一条——归属列 `cc.actor_id` 没给有效条件（整条没给 / 空值）⇒ **空页**，
+    /// 不得退化成"这条不加"把实例摊出去。非归属列的空值放行语义不变。
     fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
-        // issues/129：抄送列表也不得把"没传 operator"折叠成"看全部"。空值一律空页。
-        let op = query.operator.as_deref().map(str::trim).unwrap_or("");
-        if op.is_empty() {
+        // issues/129（空 operator 不得折叠成"看全部"）＋ issues/141 G1（条件整条没给同样空页，
+        // 且 `m_cc_actorId` 这条通道也算归属条件）：判据收在 has_effective_cc_ownership 一支里。
+        if !crate::model::has_effective_cc_ownership(query) {
             return Ok(PageResult::new(query.page_num, query.page_size, 0, vec![]));
         }
+        let op = query.operator.as_deref().map(str::trim).unwrap_or("");
+        // 归属列上的 m_ 条件打在 cc.actor_id 上（sqlx 那边同一条：白名单把它解析成 cc.actor_id）；
+        // 其余条件继续打在实例行上（issues/106 白名单语义不变）。
+        let cc_filters = query.cc_ownership_filters();
+        let row_filters = query.non_cc_ownership_filters();
         let ccs = self.cc_instances.lock().unwrap();
         let instances = self.instances.lock().unwrap();
         let defines = self.defines.lock().unwrap();
         let mut seen_instance_ids: Vec<i64> = Vec::new();
         let mut rows: Vec<InstanceRow> = Vec::new();
-        for cc in ccs.iter().filter(|cc| cc.actor_id == op) {
+        for cc in ccs.iter() {
+            if !op.is_empty() && cc.actor_id != op {
+                continue;
+            }
+            if !cc_filters.iter()
+                .all(|f| crate::filter_sql::op_matches(&f.op, &cc.actor_id, &f.value)) {
+                continue;
+            }
             if seen_instance_ids.contains(&cc.process_instance_id) {
                 continue; // DISTINCT pi.id
             }
@@ -546,8 +586,8 @@ impl ProcessRepository for MemoryRepository {
                 None => rows.push(InstanceRow { id: cc.process_instance_id, ..Default::default() }),
             }
         }
-        if !query.filters.is_empty() {
-            rows.retain(|r| query.filters.iter().all(|f| instance_row_matches(f, r)));
+        if !row_filters.is_empty() {
+            rows.retain(|r| row_filters.iter().all(|f| instance_row_matches(*f, r)));
         }
         let total = rows.len() as i64;
         let start = ((query.page_num - 1) * query.page_size) as usize;
@@ -1247,5 +1287,354 @@ mod cc_row_shape_i138_tests {
         assert_eq!(hit("state", "10"), vec![f.instance_id], "m_state 过滤实例状态");
         assert_eq!(hit("operator", CC_SENDER), Vec::<i64>::new(), "抄送发送人不在 operator 列上");
         assert_eq!(hit("operator", CC_ACTOR), Vec::<i64>::new(), "被抄送人也不在 operator 列上");
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// issues/141 G1 ＋ G2 · 抄送分页归属必填 ／ 写侧判重＝幂等空操作（内存仓储这一支）
+// 基准形状＝jeeflow-java `3d1fc98`（内存仓 `CcPageOwnershipTest` ＋ `CcWriteIdempotentTest`）；
+// sqlx 仓那一条腿与"两仓同答案"的对拍在 `jeeflow-repository-sqlx`（真库 MySQL）里钉。
+// ═══════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod cc_i141_tests {
+    use super::*;
+    use crate::clock::ClockScope;
+    use crate::json::FlowData;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const APPLICANT: &str = "i141_applicant";
+    const SENDER: &str = "i141_sender";
+    const ACTOR_A: &str = "i141_actor_a";
+    const ACTOR_B: &str = "i141_actor_b";
+
+    /// 逐次取值的注入钟：让"原行时间被刷新"与"没被刷新"在断言上**立刻**分得开
+    /// （默认 UTC 钟是秒级分辨率，靠它就得 sleep 1s 以上，还会撞上同批并发的用例）。
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    fn tick_clock() -> String {
+        let n = TICK.fetch_add(1, Ordering::SeqCst);
+        format!("2026-09-29 10:00:{:02}", n % 60)
+    }
+
+    fn cc_filter(column: &str, value: &str) -> QueryFilter {
+        QueryFilter { alias: "cc".into(), op: crate::model::FilterOp::Eq, column: column.into(), value: value.into() }
+    }
+
+    /// 一条实例（发起人 APPLICANT），返回实例 id。
+    fn new_instance(repo: &MemoryRepository) -> i64 {
+        let mut define = ProcessDefine {
+            id: 0, name: "i141-flow".into(), display_name: "I141 Flow".into(),
+            define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+            version: 1, create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        repo.save_define(&mut define).unwrap();
+        let mut inst = ProcessInstance {
+            instance_id: 0, parent_id: None, define_id: define.id, state: 10,
+            parent_node_name: None, business_no: Some("i141-biz".into()),
+            operator: APPLICANT.into(), expire_time: None, variables: FlowData::new(),
+            tasks: vec![], create_time: Some("2026-09-29 10:00:00".into()),
+            create_user: Some(APPLICANT.into()), update_time: None, update_user: None,
+            define: None,
+        };
+        repo.save_instance(&mut inst).unwrap();
+        inst.instance_id
+    }
+
+    fn cc_rows(repo: &MemoryRepository, instance_id: i64) -> Vec<CcInstance> {
+        repo.cc_instances.lock().unwrap()
+            .iter().filter(|c| c.process_instance_id == instance_id).cloned().collect()
+    }
+
+    fn cc_of(repo: &MemoryRepository, instance_id: i64, actor: &str) -> Option<CcInstance> {
+        cc_rows(repo, instance_id).into_iter().find(|c| c.actor_id == actor)
+    }
+
+    fn ids(page: &PageResult<InstanceRow>) -> Vec<i64> {
+        page.rows.iter().map(|r| r.id).collect()
+    }
+
+    // ─────────── G1 · 归属条件必填（内存仓这一支）───────────
+
+    /// 缺条件（整条不给）⇒ 空页。改前这一格在内存仓已经绿（issues/129 那一档顶住了
+    /// "空 operator 看全库"），本格把它从"实现顺带对"升格为**trait 文档写明的义务**并留读数；
+    /// 同一份数据在 sqlx 仓旧形状下是 LEFT JOIN 不过滤＝全实例，两仓两个答案。
+    #[test]
+    fn test_i141_g1_missing_ownership_is_empty_page() {
+        let repo = MemoryRepository::new();
+        let first = new_instance(&repo);
+        let second = new_instance(&repo);
+        repo.create_cc_instance(first, SENDER, &[ACTOR_A.into()]).unwrap();
+        repo.create_cc_instance(second, SENDER, &[ACTOR_B.into()]).unwrap();
+
+        let page = repo.page_cc_instances(&PageQuery::new(1, 50)).unwrap();
+        assert_eq!(page.record_count, 0, "缺归属条件必须空页，实得 {:?}", ids(&page));
+        assert!(page.rows.is_empty(), "空页的 rows 也必须是空集合");
+
+        let bare = repo.page_cc_instances(&PageQuery::default()).unwrap();
+        assert_eq!(bare.record_count, 0, "默认分页参数同样缺归属条件 ⇒ 空页");
+    }
+
+    /// 空值三形（空串／全空白）与"整条没给"同档 ⇒ 空页。
+    #[test]
+    fn test_i141_g1_blank_ownership_values_are_empty_page() {
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+
+        for blank in ["", "   ", "\t"] {
+            let mut q = PageQuery::new(1, 50);
+            q.operator = Some(blank.to_string());
+            let page = repo.page_cc_instances(&q).unwrap();
+            assert_eq!(page.record_count, 0, "空值归属条件（{blank:?}）必须空页，实得 {:?}", ids(&page));
+        }
+        // 归属列上给的是空值条件（m_cc_actorId_EQ_""）⇒ 同样空页，且不得被当成"这条不加"
+        let mut q = PageQuery::new(1, 50);
+        q.operator = Some(ACTOR_A.into());
+        q.filters = vec![cc_filter("actor_id", "")];
+        assert_eq!(repo.page_cc_instances(&q).unwrap().record_count, 0,
+            "空值归属条件不得退化成\"这条不加\"把 {ACTOR_A} 的行摊出来");
+    }
+
+    /// 归属条件的第二个通道（`m_cc_actorId_EQ_xxx`）单独给定时必须**生效**：
+    /// 旧形状是内存仓只认 `query.operator`，这一档直接空页（改前实测红）。
+    #[test]
+    fn test_i141_g1_cc_actor_filter_alone_is_honored() {
+        let repo = MemoryRepository::new();
+        let mine = new_instance(&repo);
+        let theirs = new_instance(&repo);
+        repo.create_cc_instance(mine, SENDER, &[ACTOR_A.into()]).unwrap();
+        repo.create_cc_instance(theirs, SENDER, &[ACTOR_B.into()]).unwrap();
+
+        let mut q = PageQuery::new(1, 50);
+        q.filters = vec![cc_filter("actor_id", ACTOR_A)];
+        let page = repo.page_cc_instances(&q).unwrap();
+        assert_eq!(ids(&page), vec![mine], "只给 m_cc_actorId 这一条有效归属条件也必须命中我自己的那一行");
+
+        // 两通道给**同一个人** ⇒ 判据是 AND，照常命中（旧形状下 m_ 通道打不到 cc 列 ⇒ 0 行）
+        let mut both = PageQuery::new(1, 50);
+        both.operator = Some(ACTOR_A.into());
+        both.filters = vec![cc_filter("actor_id", ACTOR_A)];
+        assert_eq!(ids(&repo.page_cc_instances(&both).unwrap()), vec![mine],
+            "两通道同一个人 ⇒ 同答案，不得互相抵消成空");
+
+        // 两通道给**不同的人** ⇒ AND ⇒ 空页（谁都不是"这条不加"）
+        let mut conflict = PageQuery::new(1, 50);
+        conflict.operator = Some(ACTOR_A.into());
+        conflict.filters = vec![cc_filter("actor_id", ACTOR_B)];
+        assert_eq!(repo.page_cc_instances(&conflict).unwrap().record_count, 0,
+            "两通道不同的人 ⇒ AND，不得返回任一方的行");
+    }
+
+    /// 改动面哨兵：只收归属谓词，**非归属列的空值放行不变**。
+    #[test]
+    fn test_i141_g1_non_ownership_blank_filter_still_ignored() {
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+
+        let mut q = PageQuery::new(1, 50);
+        q.operator = Some(ACTOR_A.into());
+        q.filters = vec![QueryFilter {
+            alias: "t".into(), op: crate::model::FilterOp::Like,
+            column: "business_no".into(), value: "".into(),
+        }];
+        let page = repo.page_cc_instances(&q).unwrap();
+        assert_eq!(page.record_count, 1, "空值非归属条件应被放行（LIKE 空串＝没填），归属条件照常生效");
+        assert_eq!(ids(&page), vec![iid]);
+    }
+
+    // ─────────── G2 · 写侧判重＝幂等空操作（内存仓这一支）───────────
+
+    /// ①不新增行：同一 `(实例, 人)` 连抄两次只有一行；`find_cc_actor_ids` 也只有一个。
+    #[test]
+    fn test_i141_g2_repeat_cc_adds_no_row() {
+        let _scope = ClockScope::injected(tick_clock);
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+
+        assert_eq!(cc_rows(&repo, iid).len(), 1, "①重复抄送不得新增第二行");
+        assert_eq!(repo.find_cc_actor_ids(iid).unwrap(), vec![ACTOR_A.to_string()],
+            "读侧也只能看到那一个 actor");
+    }
+
+    /// ②不重置未读：先置已读，再重复抄送，`state` 必须仍是已读（不产生"再提醒一次"语义）。
+    #[test]
+    fn test_i141_g2_repeat_cc_does_not_reset_unread() {
+        let _scope = ClockScope::injected(tick_clock);
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+        assert_eq!(cc_of(&repo, iid, ACTOR_A).unwrap().state, 0, "新行应是未读");
+
+        repo.update_cc_status(iid, ACTOR_A).unwrap();
+        let read = cc_of(&repo, iid, ACTOR_A).unwrap();
+        assert_eq!(read.state, 1, "置读后 state 应为 1");
+
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+        let after = cc_of(&repo, iid, ACTOR_A).unwrap();
+        assert_eq!(after.state, 1, "②重复抄送不得把已读抹回未读");
+        assert_eq!(after.update_time, read.update_time,
+            "②已读那一格的 update_time 也不得被重复抄送再刷一次（与③同源）");
+    }
+
+    /// ③不更新原行时间：`create_time`/`update_time` 逐字不变（注入钟逐次取值 ⇒ 刷新一定照得出来）。
+    #[test]
+    fn test_i141_g2_repeat_cc_does_not_touch_original_row_times() {
+        let _scope = ClockScope::injected(tick_clock);
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+
+        let before = cc_of(&repo, iid, ACTOR_A).expect("首抄应已建行");
+        assert!(before.create_time.is_some(), "cc 行必须带建行时间（③这一档才照得出来）");
+        assert!(before.update_time.is_some(), "cc 行必须带更新时间（对齐 wf_process_cc_instance 行形状）");
+
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+        let after = cc_of(&repo, iid, ACTOR_A).unwrap();
+        assert_eq!(after.create_time, before.create_time, "③重复抄送不得刷新原行 create_time");
+        assert_eq!(after.update_time, before.update_time, "③重复抄送不得刷新原行 update_time");
+        assert_eq!(after.id, before.id, "③原行就是原行（主键不变，也没被删掉重建）");
+    }
+
+    /// ④的子集档：`create_cc_instance_if_absent` 返回**实际新建**的子集，顺序与入参一致。
+    #[test]
+    fn test_i141_g2_if_absent_returns_only_the_new_subset() {
+        let _scope = ClockScope::injected(tick_clock);
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+
+        let first = repo.create_cc_instance_if_absent(iid, SENDER, &[ACTOR_A.into(), ACTOR_B.into()]).unwrap();
+        assert_eq!(first, vec![ACTOR_A.to_string(), ACTOR_B.to_string()], "全新的一批 ⇒ 子集＝全量、顺序随入参");
+
+        let c = "i141_actor_c".to_string();
+        let second = repo.create_cc_instance_if_absent(iid, SENDER, &[ACTOR_A.into(), c.clone()]).unwrap();
+        assert_eq!(second, vec![c.clone()], "第二次只给新人 ⇒ 子集只有新人（旧人不得混进去被再 fire）");
+        assert_eq!(cc_rows(&repo, iid).len(), 3, "落库的行数＝A/B/C 三行");
+        assert_eq!(repo.find_cc_actor_ids(iid).unwrap(), vec![ACTOR_A.to_string(), ACTOR_B.to_string(), c],
+            "读侧顺序与建行顺序一致");
+
+        let third = repo.create_cc_instance_if_absent(iid, SENDER, &[ACTOR_A.into(), ACTOR_B.into()]).unwrap();
+        assert!(third.is_empty(), "全是已知人 ⇒ 子集为空（调用点据此整支不 fire 码 4）");
+        assert_eq!(cc_rows(&repo, iid).len(), 3, "子集为空也不得多落一行");
+    }
+
+    /// 同一次调用内重复给同一个人 ⇒ 折叠（只落一行、子集里只出现一次）。
+    #[test]
+    fn test_i141_g2_duplicate_within_one_call_collapses() {
+        let _scope = ClockScope::injected(tick_clock);
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+
+        let fresh = repo.create_cc_instance_if_absent(iid, SENDER, &[ACTOR_A.into(), ACTOR_A.into()]).unwrap();
+        assert_eq!(fresh, vec![ACTOR_A.to_string()], "同一次调用内的重复只能算一次创建");
+        assert_eq!(cc_rows(&repo, iid).len(), 1, "同一次调用内的重复不得新增第二行");
+
+        // 直调旧入口（两条腿共用同一条判据）也幂等：判重在仓储写侧，不在调用点
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into(), ACTOR_A.into()]).unwrap();
+        assert_eq!(cc_rows(&repo, iid).len(), 1, "create_cc_instance 自身也必须判重");
+    }
+
+    /// 反向哨兵：判重**按实例**作用域，别把别的实例上同一个人的行也吃掉。
+    #[test]
+    fn test_i141_g2_dedup_is_scoped_to_instance() {
+        let _scope = ClockScope::injected(tick_clock);
+        let repo = MemoryRepository::new();
+        let first = new_instance(&repo);
+        let second = new_instance(&repo);
+
+        assert_eq!(repo.create_cc_instance_if_absent(first, SENDER, &[ACTOR_A.into()]).unwrap().len(), 1);
+        assert_eq!(repo.create_cc_instance_if_absent(second, SENDER, &[ACTOR_A.into()]).unwrap().len(), 1,
+            "同一个人换一个实例照样新建");
+        assert_eq!(cc_rows(&repo, first).len(), 1);
+        assert_eq!(cc_rows(&repo, second).len(), 1);
+        assert_eq!(repo.find_cc_actor_ids(999_999).unwrap(), Vec::<String>::new(),
+            "没有 cc 行的实例读侧给空集");
+    }
+
+    /// 查询侧不引入 DISTINCT、历史重复行不清（owner 2026-09-29 拍：接受既成事实）：
+    /// 手工造两条重复行 ⇒ 仓储照旧读得到两行，判重只管今后。
+    #[test]
+    fn test_i141_g2_query_side_adds_no_distinct_and_keeps_legacy_dupes() {
+        let _scope = ClockScope::injected(tick_clock);
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+        repo.create_cc_instance(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+        // 绕过判重的存量形状（＝库里既成的重复行）：直接塞进 cc 台账
+        repo.cc_instances.lock().unwrap().push(CcInstance {
+            id: repo.next_id(), process_instance_id: iid, actor_id: ACTOR_A.into(),
+            state: 0, create_time: Some("2026-01-01 00:00:00".into()),
+            create_user: Some(SENDER.into()), update_time: None, update_user: None,
+        });
+
+        assert_eq!(cc_rows(&repo, iid).len(), 2, "存量重复行不得被清理");
+        assert_eq!(repo.find_cc_actor_ids(iid).unwrap(), vec![ACTOR_A.to_string(), ACTOR_A.to_string()],
+            "读侧照旧逐行返回，不加 DISTINCT");
+        // 分页那一侧仍按实例聚合出一行（issues/138 既有语义，本轮不动）
+        let mut q = PageQuery::new(1, 50);
+        q.operator = Some(ACTOR_A.into());
+        assert_eq!(repo.page_cc_instances(&q).unwrap().record_count, 1,
+            "同一实例两条 cc 命中同一接收人仍出一行（DISTINCT pi.id 不变）");
+    }
+
+    /// 第三方仓储不覆写新能力 ⇒ 走 trait default ⇒ 与旧 `create_cc_instance` 逐字一致
+    /// （全量建行、全量返回）。这条钉的是 SPI 源码兼容不破，也是 changelog 里
+    /// "不覆写就吃不到判重"那句话的证据。
+    #[test]
+    fn test_i141_g2_third_party_repo_without_override_keeps_old_behaviour() {
+        #[derive(Default)]
+        struct NaiveRepo {
+            rows: std::sync::Mutex<Vec<(i64, String)>>,
+        }
+        impl ProcessRepository for NaiveRepo {
+            fn create_cc_instance(&self, instance_id: i64, _creator: &str, actor_ids: &[String]) -> JeeflowResult<()> {
+                // 旧形状：来人就插，不判重
+                let mut rows = self.rows.lock().unwrap();
+                for a in actor_ids { rows.push((instance_id, a.clone())); }
+                Ok(())
+            }
+            // find_cc_actor_ids / create_cc_instance_if_absent **不覆写** ⇒ 吃 default
+            fn find_define_by_id(&self, _: i64) -> JeeflowResult<Option<ProcessDefine>> { unimplemented!() }
+            fn save_define(&self, _: &mut ProcessDefine) -> JeeflowResult<()> { unimplemented!() }
+            fn update_define(&self, _: &ProcessDefine) -> JeeflowResult<()> { unimplemented!() }
+            fn update_define_state(&self, _: i64, _: i32) -> JeeflowResult<()> { unimplemented!() }
+            fn remove_define(&self, _: i64) -> JeeflowResult<()> { unimplemented!() }
+            fn find_instance_by_id(&self, _: i64) -> JeeflowResult<Option<ProcessInstance>> { unimplemented!() }
+            fn save_instance(&self, _: &mut ProcessInstance) -> JeeflowResult<()> { unimplemented!() }
+            fn update_instance(&self, _: &ProcessInstance) -> JeeflowResult<()> { unimplemented!() }
+            fn find_task_by_id(&self, _: i64) -> JeeflowResult<Option<ProcessTask>> { unimplemented!() }
+            fn save_task(&self, _: &mut ProcessTask) -> JeeflowResult<()> { unimplemented!() }
+            fn update_task(&self, _: &ProcessTask) -> JeeflowResult<()> { unimplemented!() }
+            fn find_doing_tasks(&self, _: i64, _: &[String]) -> JeeflowResult<Vec<ProcessTask>> { unimplemented!() }
+            fn find_done_tasks(&self, _: i64, _: &[String]) -> JeeflowResult<Vec<ProcessTask>> { unimplemented!() }
+            fn find_history_tasks(&self, _: i64) -> JeeflowResult<Vec<ProcessTask>> { unimplemented!() }
+            fn find_task_actors(&self, _: i64) -> JeeflowResult<Vec<String>> { unimplemented!() }
+            fn add_task_actor(&self, _: i64, _: &[String]) -> JeeflowResult<()> { unimplemented!() }
+            fn remove_task_actor(&self, _: i64, _: &[String]) -> JeeflowResult<()> { unimplemented!() }
+            fn update_cc_status(&self, _: i64, _: &str) -> JeeflowResult<()> { Ok(()) }
+            fn page_todo_tasks(&self, _: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> { unimplemented!() }
+            fn page_done_tasks(&self, _: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> { unimplemented!() }
+            fn page_instances(&self, _: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> { unimplemented!() }
+            fn page_cc_instances(&self, _: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> { unimplemented!() }
+            fn page_defines(&self, _: &PageQuery) -> JeeflowResult<PageResult<DefineRow>> { unimplemented!() }
+            fn count_todo_tasks(&self, _: &str) -> JeeflowResult<i64> { unimplemented!() }
+            fn get_all_instances(&self) -> JeeflowResult<Vec<ProcessInstance>> { unimplemented!() }
+            fn get_all_tasks(&self) -> JeeflowResult<Vec<ProcessTask>> { unimplemented!() }
+        }
+
+        let repo = NaiveRepo::default();
+        // 两次都抄给同样的两个人：覆写了判重的仓储第二次该拿到空子集，这里照旧全量 ⇒ 旧行为不破
+        assert_eq!(repo.create_cc_instance_if_absent(1, SENDER, &[ACTOR_A.into(), ACTOR_B.into()]).unwrap(),
+            vec![ACTOR_A.to_string(), ACTOR_B.to_string()], "不覆写 ⇒ 全量返回");
+        assert_eq!(repo.create_cc_instance_if_absent(1, SENDER, &[ACTOR_A.into(), ACTOR_B.into()]).unwrap(),
+            vec![ACTOR_A.to_string(), ACTOR_B.to_string()],
+            "不覆写 find_cc_actor_ids 的第三方仓储读不到既有 cc 行 ⇒ 第二次仍全量返回、全量 fire");
+        assert_eq!(repo.rows.lock().unwrap().len(), 4, "旧行为不破：全量建行（2＋2）");
+        // default 唯一的加固是"同一次调用内重复折叠"（与 java default 同一条，不依赖读侧）
+        let folded = repo.create_cc_instance_if_absent(2, SENDER, &[ACTOR_A.into(), ACTOR_A.into()]).unwrap();
+        assert_eq!(folded, vec![ACTOR_A.to_string()], "同一次调用内的重复在 default 里就折叠");
     }
 }

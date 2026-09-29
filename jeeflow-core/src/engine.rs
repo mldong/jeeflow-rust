@@ -117,6 +117,10 @@ impl JeeflowEngineImpl {
     /// **三条抄送路径共用本函数**（规范 11 §11.2 原则 1 ＋ §11.7）：发起 `f_ccActors`、
     /// 办理 `tf_ccActors`、门面手动 `processInstance/createCCInstance`——"新增了一条抄送记录"
     /// 这个事实成立就 fire `CC_CREATE`(4)，路径不进事件名。
+    ///
+    /// **入参一律是"实际新建的 actor 子集"**（issues/141 G2 · spec 06 §4）：调用点先走
+    /// [`ProcessRepository::create_cc_instance_if_absent`] 拿子集，子集为空整支不 fire——
+    /// §11.2 原则 1「码=事实」，重复抄送没发生"创建"就不该发码 4，严禁照旧按原始请求全量 fire。
     pub fn notify_cc_create(&self, instance_id: i64, cc_actors: &[String]) {
         for actor in cc_actors {
             let event = ProcessEvent::new(ProcessEventType::CcCreate, instance_id)
@@ -849,9 +853,15 @@ impl JeeflowEngineImpl {
         // 旧版仅 get_str+split，数组走 get_str=None → cc 实例从不创建（L3 S6）。
         let cc_actors = parse_cc_actors(full_args.inner().get("f_ccActors"));
         if !cc_actors.is_empty() {
-            self.repo().create_cc_instance(instance.instance_id, operator, &cc_actors)?;
-            // CC_CREATE（issues/102·104，六语言统一）：逐抄送人 fire，与 cc 行粒度一一对应
-            self.notify_cc_create(instance.instance_id, &cc_actors);
+            // issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：同一 (实例, 被抄送人) 已有 cc 行时
+            // 跳过——不新增行、不重置未读、不更新原行时间；**新建子集**才拿去 fire。
+            let created = self.repo().create_cc_instance_if_absent(instance.instance_id, operator, &cc_actors)?;
+            // CC_CREATE（issues/102·104，六语言统一）：逐抄送人 fire，与 cc 行粒度一一对应。
+            // 入参＝实际新建的子集而不是原始 cc_actors（spec §11.2 原则 1「码=事实」）：
+            // 重复抄送没发生"创建"就不该发这个事件；子集为空整支不 fire（不空转、也不照旧全量 fire）。
+            if !created.is_empty() {
+                self.notify_cc_create(instance.instance_id, &created);
+            }
         }
 
         // 9. Execute from start node
@@ -1096,9 +1106,14 @@ impl JeeflowEngineImpl {
         // 正是 issues/56 E28 在发起腿踩过的同一个坑。
         let cc_actors = parse_cc_actors(exec.args.inner().get("tf_ccActors"));
         if !cc_actors.is_empty() {
-            self.repo().create_cc_instance(exec.process_instance.instance_id, operator, &cc_actors)?;
-            // CC_CREATE（issues/102·104，六语言统一）：办理时抄送同样逐抄送人 fire
-            self.notify_cc_create(exec.process_instance.instance_id, &cc_actors);
+            // issues/141 G2：办理腿与发起腿**同一条判重判据**（spec §11.7「三条入口共用一支」）——
+            // 已有 cc 行的 (实例, 人) 跳过，不新增行、不重置未读、不更新原行时间。
+            let created = self.repo()
+                .create_cc_instance_if_absent(exec.process_instance.instance_id, operator, &cc_actors)?;
+            // CC_CREATE（issues/102·104，六语言统一）：逐**实际新建**的抄送人 fire，子集空则不发。
+            if !created.is_empty() {
+                self.notify_cc_create(exec.process_instance.instance_id, &created);
+            }
         }
 
         // 12. Persist new tasks + update instance (sync) — assigns IDs in-place
@@ -3637,6 +3652,97 @@ mod event_leg_tests {
         let cc = events.iter().find(|e| e.event_type == ProcessEventType::CcCreate).unwrap();
         assert_eq!(cc.source_id, inst.instance_id, "码 4 sourceId＝instanceId");
         assert_eq!(cc.cc_actor_id.as_deref(), Some("u7"));
+    }
+
+    // ─── issues/141 G2 · cc 写侧判重＝幂等空操作（三条入口共用一条判据，本模块打引擎两条腿）───
+
+    /// 只收 CC_CREATE 的 `cc_actor_id` 序列（逐人 fire 的入参＝实际新建子集，本案的判据本体）。
+    fn cc_fired_actors(rec: &SeqRecorder) -> Vec<String> {
+        let events = rec.events.lock().unwrap().clone();
+        events.iter().filter(|e| e.event_type == ProcessEventType::CcCreate)
+            .map(|e| e.cc_actor_id.clone().unwrap_or_default()).collect()
+    }
+
+    /// ④＋子集空档：**全是已知人**的一批抄送 ⇒ 不新增行、**整支不 fire 码 4**
+    /// （spec 11.2 原则 1「码=事实」；旧形状是照旧按原始请求全量 fire）。
+    #[tokio::test]
+    async fn test_i141_g2_repeat_cc_fires_nothing() {
+        let (engine, repo, rec) = ev_engine();
+        let name = "i141_g2_repeat";
+        let did = ev_define(&repo, name, &ev_flow(name, &[("apply", r#""assignee":"zhangsan""#)]));
+
+        let mut start = FlowData::new();
+        start.insert("f_ccActors".to_string(),
+            JsonValue::Array(vec![JsonValue::Str("u1".into()), JsonValue::Str("u2".into())]));
+        let inst = engine.start_async(did, "zhangsan", &start).await.unwrap();
+        assert_eq!(cc_fired_actors(&rec), vec!["u1".to_string(), "u2".to_string()],
+            "首抄：全新的一批照旧逐人 fire");
+        assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(),
+            vec!["u1".to_string(), "u2".to_string()]);
+
+        // 办理腿把**同样两个人**再抄一遍 ⇒ 幂等空操作
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        let mut args = ev_submit(1);
+        args.insert("tf_ccActors".to_string(),
+            JsonValue::Array(vec![JsonValue::Str("u1".into()), JsonValue::Str("u2".into())]));
+        engine.execute_task_async(apply.task_id, "zhangsan", &args).await.unwrap();
+
+        assert_eq!(cc_fired_actors(&rec), vec!["u1".to_string(), "u2".to_string()],
+            "重复抄送没发生\"创建\"⇒ 一支新的码 4 都不发（改前这里多出发 u1/u2 两支）");
+        assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(),
+            vec!["u1".to_string(), "u2".to_string()], "①cc 行数与人员集合都不变（不新增行）");
+    }
+
+    /// ④的子集档：第二次同时给「已知人＋新人」⇒ 只为新人建行、只为新人 fire。
+    /// 两形态（数组＝vben 多选、逗号串＝旧客户端）共用同一条判重腿。
+    #[tokio::test]
+    async fn test_i141_g2_subset_fire_on_engine_legs() {
+        for (i, second_leg) in [
+            JsonValue::Array(vec![JsonValue::Str("u1".into()), JsonValue::Str("u3".into())]),
+            JsonValue::Str("u1,u3".into()),
+        ].into_iter().enumerate() {
+            let (engine, repo, rec) = ev_engine();
+            let name = format!("i141_g2_subset{i}");
+            let did = ev_define(&repo, &name, &ev_flow(&name, &[("apply", r#""assignee":"zhangsan""#)]));
+
+            let mut start = FlowData::new();
+            start.insert("f_ccActors".to_string(),
+                JsonValue::Array(vec![JsonValue::Str("u1".into()), JsonValue::Str("u2".into())]));
+            let inst = engine.start_async(did, "zhangsan", &start).await.unwrap();
+            assert_eq!(cc_fired_actors(&rec), vec!["u1".to_string(), "u2".to_string()],
+                "第 {i} 档首抄应逐人 fire");
+
+            let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+            let mut args = ev_submit(1);
+            args.insert("tf_ccActors".to_string(), second_leg.clone());
+            engine.execute_task_async(apply.task_id, "zhangsan", &args).await.unwrap();
+
+            assert_eq!(cc_fired_actors(&rec),
+                vec!["u1".to_string(), "u2".to_string(), "u3".to_string()],
+                "第 {i} 档：办理腿只能为实际新建的子集（u3）fire，已知人 u1 不得再发");
+            assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(),
+                vec!["u1".to_string(), "u2".to_string(), "u3".to_string()],
+                "第 {i} 档：落库行＝u1/u2/u3，u1 不得有第二行");
+        }
+    }
+
+    /// 反向哨兵：判重只在**同一实例**内成立——换一条实例，同一个人照旧建行照旧 fire。
+    #[tokio::test]
+    async fn test_i141_g2_dedup_scoped_per_instance_on_engine_legs() {
+        let (engine, repo, rec) = ev_engine();
+        let name = "i141_g2_scope";
+        let did = ev_define(&repo, name, &ev_flow(name, &[("apply", r#""assignee":"zhangsan""#)]));
+        let mut start = FlowData::new();
+        start.insert("f_ccActors".to_string(), JsonValue::Str("u1".into()));
+
+        let first = engine.start_async(did, "zhangsan", &start).await.unwrap();
+        let second = engine.start_async(did, "zhangsan", &start).await.unwrap();
+        assert_ne!(first.instance_id, second.instance_id, "夹具前提：两条实例");
+
+        assert_eq!(cc_fired_actors(&rec), vec!["u1".to_string(), "u1".to_string()],
+            "不同实例上的同一个人各 fire 一次（判重不得升级成全局）");
+        assert_eq!(repo.find_cc_actor_ids(first.instance_id).unwrap(), vec!["u1".to_string()]);
+        assert_eq!(repo.find_cc_actor_ids(second.instance_id).unwrap(), vec!["u1".to_string()]);
     }
 
     // ─── 5 / 6 互斥（08 场景 30·31）───

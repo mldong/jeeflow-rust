@@ -216,6 +216,18 @@ fn resolve_instance_col(alias: &str, column: &str) -> Option<String> {
     None
 }
 
+/// `page_cc_instances` 的白名单：实例列 ＋ **归属列 `cc.actor_id`**（issues/141 G1）。
+///
+/// 归属列必须在白名单里——旧形状用 `resolve_instance_col`，`cc.actor_id` 查不到就整条条件
+/// 静默丢掉＝"这条不加"，与内存仓同查询返 0 行分叉。java 基准 `CC_INSTANCE_WHITELIST`
+/// 同样把 `cc.actor_id` 列在内。
+fn resolve_cc_instance_col(alias: &str, column: &str) -> Option<String> {
+    if jeeflow_core::model::is_cc_ownership_col(alias, column) {
+        return Some("cc.actor_id".to_string());
+    }
+    resolve_instance_col(alias, column)
+}
+
 /// task 主表别名 t；pi 实例表；pd 定义表
 fn resolve_task_col(alias: &str, column: &str) -> Option<String> {
     if alias == "t" && TASK_MAIN_COLS.contains(&column) { return Some(format!("t.{}", column)); }
@@ -400,6 +412,17 @@ fn map_surrogate(r: &sqlx::mysql::MySqlRow) -> ProcessSurrogate {
     }
 }
 
+
+/// issues/141 G2 写侧判重的读侧 SQL（`create_cc_instance` 与 `find_cc_actor_ids` 共用一支，
+/// 判据只有一份）。逐行返回、不加 DISTINCT。
+async fn select_cc_actor_ids(pool: &MySqlPool, instance_id: i64) -> JeeflowResult<Vec<String>> {
+    let rows = sqlx::query("SELECT actor_id FROM wf_process_cc_instance WHERE process_instance_id = ?")
+        .bind(instance_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+    Ok(rows.iter().map(|r| r.get::<String, _>("actor_id")).collect())
+}
 
 impl ProcessRepository for SqlxRepository {
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>> {
@@ -794,7 +817,18 @@ impl ProcessRepository for SqlxRepository {
 
     fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()> {
         self.block_on(async {
+            // issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与内存仓 `create_cc_instance`
+            // 同一条判据：同一 `(实例, 被抄送人)` 已有 cc 行 ⇒ 直接跳过——①不新增行、
+            // ②不重置未读（state 保持原值）、③不更新原行时间（连 UPDATE 都不发，
+            // create_time/update_time 逐字不变）。判重放在**写侧**而不是查询侧：
+            // 查询保持现状不引入 DISTINCT，历史重复行也不清理（owner 2026-09-29 拍）。
+            let mut existing: Vec<String> = select_cc_actor_ids(&self.pool, instance_id).await?;
             for actor in actor_ids {
+                if existing.iter().any(|a| a == actor) {
+                    continue;
+                }
+                // 同一次调用内的重复也算"已存在"，只落一行
+                existing.push(actor.clone());
                 // 规范表无 AUTO_INCREMENT：抄送行 id 由应用层雪花生成
                 let cc_id = self.next_id();
                 sqlx::query("INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state, create_time, create_user) VALUES (?, ?, ?, 0, ?, ?)")
@@ -809,6 +843,12 @@ impl ProcessRepository for SqlxRepository {
             }
             Ok(())
         })
+    }
+
+    /// issues/141 G2 写侧判重的读侧（覆写 trait default）：逐行返回，**不加 DISTINCT**
+    /// ——判重只看"这个人在这条实例上有没有行"，存量重复行原样留着。
+    fn find_cc_actor_ids(&self, instance_id: i64) -> JeeflowResult<Vec<String>> {
+        self.block_on(async { select_cc_actor_ids(&self.pool, instance_id).await })
     }
 
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()> {
@@ -995,27 +1035,53 @@ impl ProcessRepository for SqlxRepository {
         })
     }
 
+    /// 我的抄送（`processInstance/ccList` 取数腿）。
+    ///
+    /// **issues/141 G1 归属条件必填**（spec 06 §2.5）：判据走
+    /// [`jeeflow_core::model::has_effective_cc_ownership`]，与内存仓同一条——归属列
+    /// `cc.actor_id` 没有有效条件（整条没给 / 空值）⇒ **空页**。
+    /// 旧形状是 `WHERE cc.actor_id = ?` 只认 `query.operator` 一个通道，`m_cc_actorId_EQ_x`
+    /// 那条条件被白名单静默丢掉＝"这条不加"，与内存仓同一查询返 0 行——同一栈两仓储两个答案，
+    /// 正是 issues/117 场景 27 立过法的那一类。
+    ///
+    /// issues/129（空 operator 不得折叠成"看全部"）那一档由同一条判据接住：
+    /// 空 operator 且没有别的归属条件 ⇒ 空页，且不再下推 `(? IS NULL OR …)` 旁路。
     fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
-            // issues/129：空 operator → 空页，且不再下推 `(? IS NULL OR …)` 旁路。
-            // 只补门面兜底不够：自定义 SPI 仓储/直连仓储传空时，旁路仍会把全库摊出去。
-            let op = match query.operator.as_deref().map(str::trim) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => return Ok(PageResult::new(page_num, page_size, 0, Vec::new())),
-            };
-            // m_ 过滤下推（issues/106）：加 WHERE 后 DISTINCT 语义不受影响；bind 顺序 operator×2 → filters → limit
-            let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_instance_col);
-            let where_extra = if frags.is_empty() { String::new() } else { format!(" AND {}", frags.join(" AND ")) };
+            if !jeeflow_core::model::has_effective_cc_ownership(query) {
+                return Ok(PageResult::new(page_num, page_size, 0, Vec::new()));
+            }
+            // 归属谓词的两个通道都落到 `cc.actor_id`：①operator，②打在 cc.actor_id 上的 m_ 条件
+            // （下面 resolve_cc_instance_col 把它解析进白名单）。两通道同时给＝AND。
+            let mut conds: Vec<String> = Vec::new();
+            let mut vals: Vec<String> = Vec::new();
+            if let Some(op) = query.operator.as_deref().map(str::trim) {
+                if !op.is_empty() {
+                    conds.push("cc.actor_id = ?".to_string());
+                    vals.push(op.to_string());
+                }
+            }
+            // m_ 过滤下推（issues/106）：加 WHERE 后 DISTINCT 语义不受影响；bind 顺序＝条件顺序 → limit
+            let (frags, fvals) =
+                jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_cc_instance_col);
+            conds.extend(frags);
+            vals.extend(fvals);
+            // 双保险：判据已保证至少有一条归属谓词；真为空宁可空页，绝不摊出全库
+            if conds.is_empty() {
+                return Ok(PageResult::new(page_num, page_size, 0, Vec::new()));
+            }
+            let where_sql = format!(" AND {}", conds.join(" AND "));
+
             let count_sql = format!(
                 "SELECT COUNT(DISTINCT pi.id) AS cnt \
                  FROM wf_process_cc_instance cc \
                  INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE cc.actor_id = ?{where_extra}"
+                 WHERE 1=1{where_sql}"
             );
-            let mut count_q = sqlx::query(&count_sql).bind(op.clone());
-            for v in &fvals { count_q = count_q.bind(v); }
+            let mut count_q = sqlx::query(&count_sql);
+            for v in &vals { count_q = count_q.bind(v); }
             let count_row = count_q
                 .fetch_one(&self.pool)
                 .await
@@ -1030,11 +1096,11 @@ impl ProcessRepository for SqlxRepository {
                  FROM wf_process_cc_instance cc \
                  INNER JOIN wf_process_instance pi ON cc.process_instance_id = pi.id \
                  LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id \
-                 WHERE cc.actor_id = ?{where_extra} \
+                 WHERE 1=1{where_sql} \
                  ORDER BY pi.id DESC LIMIT ? OFFSET ?"
             );
-            let mut rows_q = sqlx::query(&select_sql).bind(op.clone());
-            for v in &fvals { rows_q = rows_q.bind(v); }
+            let mut rows_q = sqlx::query(&select_sql);
+            for v in &vals { rows_q = rows_q.bind(v); }
             let rows = rows_q
                 .bind(page_size)
                 .bind(offset)
@@ -3146,5 +3212,433 @@ mod tests {
             assert!(code.contains("current_time_str()"),
                 "{} 没走引擎时钟出口 current_time_str()", head);
         }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/141 G1 ＋ G2 · 抄送分页归属必填／写侧判重＝幂等空操作（sqlx 真库这一支）
+    //   ID 段：9141xx（本组独占，避开 900xxx／9011xx／911xxx／9129xx 既有用例段）
+    //   基准形状＝jeeflow-java `3d1fc98`（JdbcProcessRepository ＋ JdbcCcOwnershipIdempotentTest）；
+    //   "两仓同答案"那一档在同一趟里把内存仓（jeeflow_core::MemoryRepository）也跑一遍对拍。
+    // ═══════════════════════════════════════════════════════
+
+    const I141_ACTOR_A: &str = "u141a";
+    const I141_ACTOR_B: &str = "u141b";
+    const I141_ACTOR_C: &str = "u141c";
+    const I141_SENDER: &str = "u141sender";
+
+    /// 本组用例共用 9141xx 段 ＋ 同一批 actor 名 ⇒ 必须串行（共享测试库上并行跑会撞主键、
+    /// 也会互相把别人的 cc 行读进来；129/117 那些用例各占独立段，本组按段太碎，直接上锁）。
+    static I141_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn i141_serial() -> tokio::sync::MutexGuard<'static, ()> {
+        I141_LOCK.lock().await
+    }
+
+    async fn clean_i141(pool: &MySqlPool) {
+        for sql in [
+            "DELETE FROM wf_process_task_actor WHERE process_task_id BETWEEN 914100 AND 914199",
+            "DELETE FROM wf_process_cc_instance WHERE process_instance_id BETWEEN 914100 AND 914199",
+            "DELETE FROM wf_process_task WHERE id BETWEEN 914100 AND 914199",
+            "DELETE FROM wf_process_instance WHERE id BETWEEN 914100 AND 914199",
+            "DELETE FROM wf_process_define WHERE id BETWEEN 914100 AND 914199",
+        ] {
+            sqlx::query(sql).execute(pool).await.unwrap();
+        }
+    }
+
+    /// 两条实例（发起人各自不同）＋各自一条 cc 行，返回 (实例A, 实例B)。
+    /// A 抄给 I141_ACTOR_A、B 抄给 I141_ACTOR_B；business_no 给非空值（NULL 列在 SQL 三值逻辑里
+    /// 是"任何条件都不命中"那一档，会让"非归属列空值放行"那一格两仓各说各话）。
+    async fn seed_i141(pool: &MySqlPool) -> (i64, i64) {
+        clean_i141(pool).await;
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut mk = |id: i64, name: &str, operator: &str, actor: &str| {
+                let mut define = ProcessDefine {
+                    id, name: name.into(), display_name: "141 抄送归属".into(),
+                    define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                    version: 1, create_time: None, create_user: Some(I141_SENDER.into()),
+                    update_time: None, update_user: None,
+                };
+                repo.save_define(&mut define).unwrap();
+                let mut inst = ProcessInstance {
+                    instance_id: id + 1, parent_id: None, define_id: define.id, state: 10,
+                    parent_node_name: None, business_no: Some(format!("biz-{}", id)),
+                    operator: operator.into(), expire_time: None,
+                    variables: jeeflow_core::json::FlowData::new(),
+                    tasks: vec![], create_time: None, create_user: Some(operator.into()),
+                    update_time: None, update_user: None, define: None,
+                };
+                repo.save_instance(&mut inst).unwrap();
+                repo.create_cc_instance(inst.instance_id, I141_SENDER, &[actor.to_string()]).unwrap();
+                inst.instance_id
+            };
+            let a = mk(914100, "rust_141_a", "i141_op_a", I141_ACTOR_A);
+            let b = mk(914110, "rust_141_b", "i141_op_b", I141_ACTOR_B);
+            (a, b)
+        }).await
+    }
+
+    async fn cc_page(pool: &MySqlPool, q: PageQuery) -> PageResult<InstanceRow> {
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.page_cc_instances(&q).unwrap()
+        }).await
+    }
+
+    fn cc_filter(op: jeeflow_core::model::FilterOp, value: &str) -> QueryFilter {
+        QueryFilter { alias: "cc".into(), op, column: "actor_id".into(), value: value.into() }
+    }
+
+    /// cc 台账原始行（判重三档①②③的读侧工具，绕开分页的实例聚合）。
+    async fn cc_raw_rows(pool: &MySqlPool, instance_id: i64) -> Vec<(i64, String, i32, Option<String>, Option<String>)> {
+        let rows = sqlx::query(
+            "SELECT id, actor_id, state, \
+                    DATE_FORMAT(create_time, '%Y-%m-%d %H:%i:%s.%f') AS ct, \
+                    DATE_FORMAT(update_time, '%Y-%m-%d %H:%i:%s.%f') AS ut \
+             FROM wf_process_cc_instance WHERE process_instance_id = ? ORDER BY id"
+        ).bind(instance_id).fetch_all(pool).await.unwrap();
+        rows.iter().map(|r| (
+            r.get::<i64, _>("id"),
+            r.get::<String, _>("actor_id"),
+            r.get::<i32, _>("state"),
+            r.try_get::<Option<String>, _>("ct").ok().flatten(),
+            r.try_get::<Option<String>, _>("ut").ok().flatten(),
+        )).collect()
+    }
+
+    /// G1 正向对照 ＋ 缺条件档：带归属条件照旧只出我的；条件整条没给／空值 ⇒ 空页。
+    #[tokio::test]
+    async fn test_mysql_i141_g1_ownership_required_on_sqlx_repo() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        let (a, b) = seed_i141(&pool).await;
+
+        // 正向：带条件 ⇒ 只出自己的那一行
+        let mut mine = PageQuery::new(1, 50);
+        mine.operator = Some(I141_ACTOR_A.into());
+        let page = cc_page(&pool, mine).await;
+        assert_eq!(page.record_count, 1, "带归属条件应命中 1 条");
+        assert_eq!(page.rows[0].id, a, "命中的应是 A 那条实例");
+
+        // 缺条件（整条没给）⇒ 空页，不得退化成 LEFT JOIN 不过滤那样返回全部实例
+        let none = cc_page(&pool, PageQuery::new(1, 50)).await;
+        assert_eq!(none.record_count, 0, "缺归属条件必须空页，实得 {:?}", ids_of(&none));
+        assert!(none.rows.is_empty(), "空页的 rows 也必须是空集合");
+
+        // 空值三形同档
+        for blank in ["", "   ", "\t"] {
+            let mut q = PageQuery::new(1, 50);
+            q.operator = Some(blank.into());
+            assert_eq!(cc_page(&pool, q).await.record_count, 0, "空值归属条件（{blank:?}）必须空页");
+        }
+        assert_ne!(a, b, "夹具前提：两条实例各一行");
+        clean_i141(&pool).await;
+    }
+
+    /// G1 · 归属条件的第二通道（m_cc_actorId_EQ_xxx）：sqlx 仓旧形状把它当"这条不加"直接丢掉
+    /// ⇒ 白名单外静默失效（内存仓那边同一个查询返 0 行，两仓两个答案）。
+    #[tokio::test]
+    async fn test_mysql_i141_g1_cc_actor_filter_channel_is_honored() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        let (a, b) = seed_i141(&pool).await;
+
+        // 只给 m_cc_actorId 这一条有效归属条件 ⇒ 必须命中 A 那一行（旧形状：空页）
+        let mut q = PageQuery::new(1, 50);
+        q.filters = vec![cc_filter(jeeflow_core::model::FilterOp::Eq, I141_ACTOR_A)];
+        let page = cc_page(&pool, q).await;
+        assert_eq!(ids_of(&page), vec![a], "m_cc_actorId 单通道也必须命中，实得 {:?}", ids_of(&page));
+
+        // 两通道同一个人 ⇒ AND 同答案（旧形状：过滤条件被丢 ⇒ 这一档侥幸绿）
+        let mut both = PageQuery::new(1, 50);
+        both.operator = Some(I141_ACTOR_A.into());
+        both.filters = vec![cc_filter(jeeflow_core::model::FilterOp::Eq, I141_ACTOR_A)];
+        assert_eq!(ids_of(&cc_page(&pool, both).await), vec![a], "两通道同一个人 ⇒ 照常命中");
+
+        // 两通道不同的人 ⇒ AND ⇒ 空页
+        let mut conflict = PageQuery::new(1, 50);
+        conflict.operator = Some(I141_ACTOR_A.into());
+        conflict.filters = vec![cc_filter(jeeflow_core::model::FilterOp::Eq, I141_ACTOR_B)];
+        assert_eq!(cc_page(&pool, conflict).await.record_count, 0,
+            "两通道不同的人 ⇒ 不得返回任一方的行（改前 sqlx 把过滤条件丢掉 ⇒ 返回 A 那一行）");
+
+        // 归属列上给空值条件 ⇒ 空页，不得当成"这条不加"把 operator 那一档摊出来
+        let mut blank = PageQuery::new(1, 50);
+        blank.operator = Some(I141_ACTOR_A.into());
+        blank.filters = vec![cc_filter(jeeflow_core::model::FilterOp::Eq, "")];
+        assert_eq!(cc_page(&pool, blank).await.record_count, 0,
+            "空值归属条件不得退化为\"这条不加\"（改前 sqlx 返回 A 那一行）");
+
+        // IN 空集合＝没有人 ⇒ 空页（与 java「集合非空」同一档）
+        let mut empty_in = PageQuery::new(1, 50);
+        empty_in.filters = vec![cc_filter(jeeflow_core::model::FilterOp::In, " , ")];
+        assert_eq!(cc_page(&pool, empty_in).await.record_count, 0, "空集合归属条件 ⇒ 空页");
+        assert_eq!(b, 914111, "夹具自检");
+        clean_i141(&pool).await;
+    }
+
+    /// G1 改动面哨兵：非归属列的空值放行不变（这一档只保证"没被本轮改掉"）。
+    #[tokio::test]
+    async fn test_mysql_i141_g1_non_ownership_blank_filter_still_ignored() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        let (a, _b) = seed_i141(&pool).await;
+
+        let mut q = PageQuery::new(1, 50);
+        q.operator = Some(I141_ACTOR_A.into());
+        q.filters = vec![QueryFilter {
+            alias: "t".into(), op: jeeflow_core::model::FilterOp::Like,
+            column: "business_no".into(), value: "".into(),
+        }];
+        let page = cc_page(&pool, q).await;
+        assert_eq!(ids_of(&page), vec![a], "空值非归属条件应被放行，归属条件照常生效");
+        clean_i141(&pool).await;
+    }
+
+    /// G1 · 两仓同答案：同一份数据在内存仓与 sqlx 仓上逐档读数必须一致（117 场景 27 那把尺子）。
+    #[tokio::test]
+    async fn test_mysql_i141_g1_two_repos_same_answer() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        let (a, b) = seed_i141(&pool).await;
+
+        // 内存仓造同一份数据：两条实例，A 抄给 ACTOR_A、B 抄给 ACTOR_B
+        let mem = jeeflow_core::MemoryRepository::new();
+        let mut define = ProcessDefine {
+            id: 0, name: "mem_141".into(), display_name: "141".into(),
+            define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+            version: 1, create_time: None, create_user: None, update_time: None, update_user: None,
+        };
+        mem.save_define(&mut define).unwrap();
+        let mut mem_ids: Vec<i64> = Vec::new();
+        for op in ["i141_op_a", "i141_op_b"] {
+            let mut inst = ProcessInstance {
+                instance_id: 0, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: Some(format!("biz-{}", op)),
+                operator: op.into(), expire_time: None,
+                variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some(op.into()),
+                update_time: None, update_user: None, define: None,
+            };
+            mem.save_instance(&mut inst).unwrap();
+            mem_ids.push(inst.instance_id);
+        }
+        mem.create_cc_instance(mem_ids[0], I141_SENDER, &[I141_ACTOR_A.into()]).unwrap();
+        mem.create_cc_instance(mem_ids[1], I141_SENDER, &[I141_ACTOR_B.into()]).unwrap();
+
+        // 每一档给出"命中第几条实例"的符号化标签（0 基索引），两仓各自换算后直比
+        let label_sqlx = |rows: &[InstanceRow]| -> Vec<i8> {
+            rows.iter().map(|r| if r.id == a { 0 } else if r.id == b { 1 } else { -9 }).collect()
+        };
+        let label_mem = |rows: &[InstanceRow]| -> Vec<i8> {
+            rows.iter().map(|r| if r.id == mem_ids[0] { 0 } else if r.id == mem_ids[1] { 1 } else { -9 }).collect()
+        };
+
+        let cases: Vec<(String, PageQuery)> = vec![
+            ("条件整条没给".to_string(), PageQuery::new(1, 50)),
+            ("operator 空串".to_string(), with_operator("")),
+            ("operator 全空白".to_string(), with_operator("   ")),
+            ("operator=A".to_string(), with_operator(I141_ACTOR_A)),
+            ("operator=B".to_string(), with_operator(I141_ACTOR_B)),
+            ("只有 m_cc_actorId=A".to_string(), with_cc_filter(jeeflow_core::model::FilterOp::Eq, I141_ACTOR_A)),
+            ("只有 m_cc_actorId=B".to_string(), with_cc_filter(jeeflow_core::model::FilterOp::Eq, I141_ACTOR_B)),
+            ("两通道同人".to_string(), with_both(I141_ACTOR_A, I141_ACTOR_A)),
+            ("两通道异人".to_string(), with_both(I141_ACTOR_A, I141_ACTOR_B)),
+            ("m_cc_actorId 空值".to_string(), with_cc_filter(jeeflow_core::model::FilterOp::Eq, "")),
+            ("m_cc_actorId IN A,B".to_string(), with_cc_filter(jeeflow_core::model::FilterOp::In, "u141a,u141b")),
+            ("非归属列空值 LIKE".to_string(), with_non_ownership_blank_like()),
+        ];
+        for (label, q) in cases {
+            let sqlx_page = cc_page(&pool, q.clone()).await;
+            let mem_page = mem.page_cc_instances(&q).unwrap();
+            assert_eq!(sqlx_page.record_count, mem_page.record_count,
+                "141 G1 两仓不同答案[{label}]：sqlx={:?} memory={:?}", ids_of(&sqlx_page), ids_of(&mem_page));
+            // 比的是**命中哪一批实例**（排序后直比）：行序是另一维度（sqlx `ORDER BY pi.id DESC`
+            // vs 内存仓插入序），G1 判据只管"归属条件必填 ⇒ 空页/非空页"，不把行序混进来。
+            let mut s = label_sqlx(&sqlx_page.rows); s.sort_unstable();
+            let mut m = label_mem(&mem_page.rows); m.sort_unstable();
+            assert_eq!(s, m, "141 G1 两仓命中的实例必须同一批[{label}]");
+        }
+        clean_i141(&pool).await;
+    }
+
+    /// G2 · 写侧判重＝幂等空操作（①不新增行 ②不重置未读 ③不更新原行时间）。
+    #[tokio::test]
+    async fn test_mysql_i141_g2_repeat_cc_is_idempotent_noop() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        let (a, _b) = seed_i141(&pool).await;
+
+        // ②先置已读，让"重复抄送把 state 抹回未读"这一档照得出来
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.update_cc_status(a, I141_ACTOR_A).unwrap();
+        }).await;
+        let before = cc_raw_rows(&pool, a).await;
+        assert_eq!(before.len(), 1, "夹具：A 那条实例应只有一行 cc");
+        assert_eq!(before[0].2, 1, "置读后 state 应为 1");
+        assert!(before[0].3.is_some(), "cc 行必须带 create_time（③这一档才照得出来）");
+
+        // 隔一秒再重复抄同一人：任何"刷新原行时间"的假修都会在这一档露出来
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let pool3 = pool.clone();
+        let actor = I141_ACTOR_A.to_string();
+        let created = run_sync(move || {
+            let repo = SqlxRepository::new(pool3);
+            repo.create_cc_instance_if_absent(a, I141_SENDER, &[actor]).unwrap()
+        }).await;
+
+        let after = cc_raw_rows(&pool, a).await;
+        assert!(created.is_empty(), "全是已知人 ⇒ 实际新建子集为空（调用点据此不发码 4），实得 {created:?}");
+        assert_eq!(after.len(), before.len(), "①重复抄送不得新增第二行");
+        assert_eq!(after[0].2, 1, "②重复抄送不得把已读抹回未读");
+        assert_eq!(after[0].0, before[0].0, "③原行就是原行（主键不变，也没被删掉重建）");
+        assert_eq!(after[0].3, before[0].3, "③重复抄送不得刷新原行 create_time");
+        assert_eq!(after[0].4, before[0].4, "③重复抄送不得刷新原行 update_time");
+
+        // 直调旧入口也必须判重（两腿共用判据：判重在仓储写侧，不在调用点）
+        let pool4 = pool.clone();
+        let actor2 = I141_ACTOR_A.to_string();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool4);
+            repo.create_cc_instance(a, I141_SENDER, &[actor2]).unwrap()
+        }).await;
+        assert_eq!(cc_raw_rows(&pool, a).await.len(), 1, "create_cc_instance 自身也必须判重");
+        clean_i141(&pool).await;
+    }
+
+    /// G2 · 读侧与子集：`find_cc_actor_ids` 逐行返回（不加 DISTINCT），
+    /// `create_cc_instance_if_absent` 只返回实际新建的子集，且作用域按实例。
+    #[tokio::test]
+    async fn test_mysql_i141_g2_subset_and_scope() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        let (a, b) = seed_i141(&pool).await;
+
+        let pool2 = pool.clone();
+        let (first, second, third) = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            // 同一次调用内重复给同一个人 ⇒ 折叠
+            let first = repo.create_cc_instance_if_absent(
+                a, I141_SENDER, &[I141_ACTOR_C.into(), I141_ACTOR_C.into()]).unwrap();
+            // 已知人 + 新人 ⇒ 子集只含新人
+            let second = repo.create_cc_instance_if_absent(
+                a, I141_SENDER, &[I141_ACTOR_A.into(), I141_ACTOR_C.into()]).unwrap();
+            // 换一个实例，同一个人照样新建（判重按实例作用域）
+            let third = repo.create_cc_instance_if_absent(
+                b, I141_SENDER, &[I141_ACTOR_A.into()]).unwrap();
+            (first, second, third)
+        }).await;
+
+        assert_eq!(first, vec![I141_ACTOR_C.to_string()], "同一次调用内的重复只算一次新建");
+        assert_eq!(second, Vec::<String>::new(), "已知人不进子集");
+        assert_eq!(third, vec![I141_ACTOR_A.to_string()], "同一个人换实例照样新建");
+        assert_eq!(cc_raw_rows(&pool, a).await.len(), 2, "A 那条实例＝首抄 A ＋ 新建 C 两行");
+        assert_eq!(cc_raw_rows(&pool, b).await.len(), 2, "B 那条实例不受 A 影响");
+
+        let pool3 = pool.clone();
+        let actors = run_sync(move || {
+            let repo = SqlxRepository::new(pool3);
+            repo.find_cc_actor_ids(a).unwrap()
+        }).await;
+        assert_eq!(actors, vec![I141_ACTOR_A.to_string(), I141_ACTOR_C.to_string()],
+            "读侧逐行返回（查询侧不加 DISTINCT）");
+        clean_i141(&pool).await;
+    }
+
+    /// G2 · 两仓同答案：同样一串写侧调用，内存仓与 sqlx 仓的落库人员集合必须一致。
+    #[tokio::test]
+    async fn test_mysql_i141_g2_two_repos_same_answer() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        let (a, _b) = seed_i141(&pool).await;
+
+        let pool2 = pool.clone();
+        let sqlx_actors = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let iid = repo.find_instance_by_id(a).unwrap().unwrap().instance_id;
+            repo.create_cc_instance_if_absent(iid, I141_SENDER, &[I141_ACTOR_A.into(), I141_ACTOR_C.into()]).unwrap();
+            repo.create_cc_instance_if_absent(iid, I141_SENDER, &[I141_ACTOR_A.into(), I141_ACTOR_B.into()]).unwrap();
+            repo.find_cc_actor_ids(iid).unwrap()
+        }).await;
+
+        let mem = jeeflow_core::MemoryRepository::new();
+        let iid = {
+            let mut define = ProcessDefine {
+                id: 0, name: "mem_141_g2".into(), display_name: "141".into(),
+                define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+                version: 1, create_time: None, create_user: None, update_time: None, update_user: None,
+            };
+            mem.save_define(&mut define).unwrap();
+            let mut inst = ProcessInstance {
+                instance_id: 0, parent_id: None, define_id: define.id, state: 10,
+                parent_node_name: None, business_no: Some("biz-mem-141-g2".into()),
+                operator: "i141_op_a".into(), expire_time: None,
+                variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: None,
+                update_time: None, update_user: None, define: None,
+            };
+            mem.save_instance(&mut inst).unwrap();
+            inst.instance_id
+        };
+        mem.create_cc_instance_if_absent(iid, I141_SENDER, &[I141_ACTOR_A.into()]).unwrap();
+        mem.create_cc_instance_if_absent(iid, I141_SENDER, &[I141_ACTOR_A.into(), I141_ACTOR_C.into()]).unwrap();
+        mem.create_cc_instance_if_absent(iid, I141_SENDER, &[I141_ACTOR_A.into(), I141_ACTOR_B.into()]).unwrap();
+        let mem_actors = mem.find_cc_actor_ids(iid).unwrap();
+
+        assert_eq!(sqlx_actors, mem_actors,
+            "141 G2 两仓写侧判重必须同答案（sqlx={:?} memory={:?}）", sqlx_actors, mem_actors);
+        clean_i141(&pool).await;
+    }
+
+    // ─── 141 用例的 PageQuery 夹具（两仓共用同一支构造，判据才可比）───
+
+    fn ids_of(page: &PageResult<InstanceRow>) -> Vec<i64> {
+        page.rows.iter().map(|r| r.id).collect()
+    }
+
+    fn with_operator(op: &str) -> PageQuery {
+        let mut q = PageQuery::new(1, 50);
+        q.operator = Some(op.to_string());
+        q
+    }
+
+    fn with_cc_filter(op: jeeflow_core::model::FilterOp, value: &str) -> PageQuery {
+        let mut q = PageQuery::new(1, 50);
+        q.filters = vec![cc_filter(op, value)];
+        q
+    }
+
+    fn with_both(op: &str, filter_value: &str) -> PageQuery {
+        let mut q = with_operator(op);
+        q.filters = vec![cc_filter(jeeflow_core::model::FilterOp::Eq, filter_value)];
+        q
+    }
+
+    fn with_non_ownership_blank_like() -> PageQuery {
+        let mut q = with_operator(I141_ACTOR_A);
+        q.filters = vec![QueryFilter {
+            alias: "t".into(), op: jeeflow_core::model::FilterOp::Like,
+            column: "business_no".into(), value: "".into(),
+        }];
+        q
     }
 }

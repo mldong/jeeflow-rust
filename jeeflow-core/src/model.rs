@@ -402,26 +402,41 @@ impl ProcessInstance {
     }
 
     /// Create a history task (already FINISHED, for custom nodes).
+    ///
+    /// ⚠️ **当前零调用者，但承担契约形状义务（issues/137 B）**：全仓 grep 只有本定义
+    /// （建单族里 rust 的自动/自定义节点走 `create_task` ＋ `finish`，没人调这一支）。
+    /// owner 2026-09-29 裁定**不删**——签名是引擎对"给一个操作人即得一行已办结历史任务"
+    /// 这一形状的承诺，别的栈（java `createHistoryTask` 被 `CustomModel` 调用）以此为对照基准，
+    /// 将来复活自动节点建单也照这个形状接。用例见
+    /// `tests::test_i137b_create_history_task_matches_main_path`（直调与主路径逐维比对）。
+    /// 复活时记得补 `expire_time::apply_expire_time`（Java 同名方法 `createHistoryTask` 是
+    /// issues/126 五处写点之一）——本签名没有节点引用 ⇒ 拿不到到期表达式。
     pub fn create_history_task(&mut self, task_name: &str, display_name: &str,
                                 operator: &str, task_type: TaskType) -> ProcessTask {
         let mut task = self.create_task(task_name, display_name, &[operator.to_string()],
                                          operator, task_type, PerformType::Normal, None, None);
         task.task_state = TaskState::Finished.code();
         task.actor_id = Some(operator.to_string());
-        // Update in the tasks list
-        if let Some(t) = self.tasks.iter_mut().find(|t| t.task_id == task.task_id) {
-            t.task_state = TaskState::Finished.code();
-            t.actor_id = Some(operator.to_string());
+        // Update in the tasks list —— **按刚 push 的那一格定位**，不按 task_id 找：
+        // 本函数返回的行 id 是 0（真 id 由 `persist_tasks` 后置分配），拿 `task_id == 0` 去
+        // `find` 会命中聚合里**第一条**未分配 id 的行——实例先建了别的 DOING 行时就会把
+        // 别人的行改成 FINISHED，而返回的那一行反而是已办结的，两行分叉（issues/137 B
+        // 直调对拍用例实测到的形状）。push 之后最后一格必然是本行。
+        if let Some(t) = self.tasks.last_mut() {
+            t.task_state = task.task_state;
+            t.actor_id = task.actor_id.clone();
         }
         task
     }
 
     /// Create a reject task (退回上一步 — new task for previous node).
     ///
-    /// ⚠️ issues/126 案 A 普查：本函数**全仓零调用者**（回退新建实际走 `engine.rs` 的
-    /// `rollback_to_parent`，那条已接到期写点④）。按启动词 §1.9-1 口径**不接线、不删、不为它造测试**：
-    /// 本签名没有节点引用 ⇒ 拿不到到期表达式，接一次就要改公开签名（发布 crate 的破坏性改动）。
-    /// 将来复活它时记得补 `expire_time::apply_expire_time`（Java 同名方法 `rejectTask` 是五处写点之一）。
+    /// ⚠️ **当前零调用者，但承担契约形状义务（issues/137 B ＋ 126 案 A 普查）**：本函数
+    /// 全仓无人调用——回退新建实际走 `engine.rs` 的 `rollback_to_parent`（那条已接到期写点④）。
+    /// owner 2026-09-29 裁定**不删、不接线、补用例钉形状**：接一次就要改公开签名（发布 crate
+    /// 的破坏性改动），而形状本身是别栈的对照基准。用例见
+    /// `tests::test_i137b_reject_task_matches_main_path`。将来复活它时记得补
+    /// `expire_time::apply_expire_time`（Java 同名方法 `rejectTask` 是五处写点之一）。
     pub fn reject_task(&mut self, task_name: &str, display_name: &str,
                         actor_ids: &[String], operator: &str,
                         parent_task_id: i64) -> ProcessTask {
@@ -696,6 +711,77 @@ impl PageQuery {
             ..Default::default()
         }
     }
+
+    /// issues/141 G1：落在**归属列** `cc.actor_id` 上的 m_ 过滤条件。
+    ///
+    /// 本仓的抄送归属有两个等价通道（门面 `ccList` 走①，直连仓储/自定义 SPI 两条都可能走②）：
+    /// ① [`PageQuery::operator`]——两仓都把它绑到 `cc.actor_id`；
+    /// ② `m_cc_actorId_EQ_xxx` 形态的 [`QueryFilter`]（alias `cc` / column `actor_id`）。
+    /// 判据 [`has_effective_cc_ownership`] 两通道一起看，两仓共用同一条，不自创第三种形状。
+    pub fn cc_ownership_filters(&self) -> Vec<&QueryFilter> {
+        self.filters.iter().filter(|f| is_cc_ownership_col(&f.alias, &f.column)).collect()
+    }
+
+    /// 归属列之外的那些 m_ 过滤条件（继续打在实例行上，语义不变）。
+    pub fn non_cc_ownership_filters(&self) -> Vec<&QueryFilter> {
+        self.filters.iter().filter(|f| !is_cc_ownership_col(&f.alias, &f.column)).collect()
+    }
+}
+
+/// issues/141 G1 · 抄送分页的归属列（spec 06 §2.5；java 基准 `hasEffectiveCondition` 钉的同一列）。
+pub const CC_OWNERSHIP_COLUMN: &str = "cc.actor_id";
+
+/// 某一 `(alias, column)` 是不是归属列 `cc.actor_id`。
+pub fn is_cc_ownership_col(alias: &str, column: &str) -> bool {
+    alias == "cc" && (column == "actor_id" || column == "actorId")
+}
+
+/// 字符串条件值算不算"填了"：去空白后非空即算（空串／全空白＝没填）。
+/// `In`/`Nin` 的值是逗号集合，与 java「集合非空」同一档：拆完一个非空段都没有＝空集合＝没填。
+pub fn is_effective_filter_value(op: &FilterOp, value: &str) -> bool {
+    match op {
+        FilterOp::In | FilterOp::Nin =>
+            value.split(',').any(|s| !s.trim().is_empty()),
+        _ => !value.trim().is_empty(),
+    }
+}
+
+/// JSON 条件值算不算"填了"：非 null、字符串去空白后非空、集合非空（对齐 java `hasEffectiveCondition`）。
+pub fn is_effective_json_value(value: &JsonValue) -> bool {
+    match value {
+        JsonValue::Null => false,
+        JsonValue::Str(s) => !s.trim().is_empty(),
+        JsonValue::Array(items) => !items.iter().any(|v| matches!(v, JsonValue::Null))
+            && !items.is_empty(),
+        _ => true,
+    }
+}
+
+/// **抄送分页归属条件必填**的唯一判据出口（issues/141 G1 · spec 06 §2.5）。
+///
+/// `page_cc_instances` 只有在返回 `true` 时才许出行；`false`（条件整条没给，或给了是空值）
+/// 一律**空页**（`record_count=0`、`rows=[]`），不得退化成"这条条件不加"返回全部实例。
+/// 内存仓与 sqlx 仓必须调这同一支，两仓在同一条判据上给同一个答案
+/// （issues/117 场景 27 那把尺子扩到 ccList）。
+///
+/// 只管归属列：**非归属列的空值放行不在本函数职责内**，各仓既有语义不变。
+pub fn has_effective_cc_ownership(query: &PageQuery) -> bool {
+    // 通道①：PageQuery.operator（门面 ccList 恒挂这一条）
+    if let Some(op) = query.operator.as_deref() {
+        if !op.trim().is_empty() {
+            return true;
+        }
+    }
+    // 通道②：m_ 过滤直接打在 cc.actor_id 上
+    if query.cc_ownership_filters().iter()
+        .any(|f| is_effective_filter_value(&f.op, &f.value)) {
+        return true;
+    }
+    // 通道③：conditions 台账（java 基准 `PageQuery.add("cc.actor_id", …)` 的同形通道）
+    if let Some(v) = query.conditions.get(CC_OWNERSHIP_COLUMN) {
+        return is_effective_json_value(v);
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -1185,5 +1271,152 @@ mod tests {
         assert!(!t.is_empty());
         assert_ne!(t, "NOW()");
         assert_eq!(t.len(), 19);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/137 B · 零调用者的建单函数（不删，补"直调＝主路径"的逐维用例）
+    // 判据形状照 jeeflow-moon `core/model/i137b_zero_caller_create_test.mbt`：
+    // ProcessTask 没有 PartialEq derive ⇒ "全字段等价"显式写成逐列断言，别只比一列。
+    // 时钟经 ClockScope 注入定住（两条路各自一个实例，逐次取值的钟会让 create_time 假分叉）。
+    // ═══════════════════════════════════════════════════════
+
+    static I137B_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// 恒定注入钟：两条路各自取时间也必须落到**同一个读数**，否则"逐维等价"会被时间戳假分叉吃掉
+    /// （本文件只钉行形状，不钉"两次取钟相同"）。计数器留作可切换的极端形态，勿删即换。
+    fn i137b_clock() -> String {
+        let _ = I137B_TICK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        "2026-09-29 10:00:00".to_string()
+    }
+
+    /// 建单行**全部 18 列**逐列等价（两条路形状完全同谱时用这一支）。
+    fn assert_row_shape_full(a: &ProcessTask, b: &ProcessTask) {
+        assert_row_shape_except_audit(a, b);
+        assert_eq!(a.finish_time, b.finish_time, "finish_time");
+        assert_eq!(a.update_time, b.update_time, "update_time");
+        assert_eq!(a.update_user, b.update_user, "update_user");
+    }
+
+    /// 除办理审计三列（`finish_time`/`update_time`/`update_user`）外的逐列等价——
+    /// 建单行形状本体。审计三列是"谁办过"的留痕，不属于建单形状，由各自用例显式钉
+    /// （jeeflow-moon `i137b_zero_caller_create_test.mbt::assert_row_shape_same` 同一划分）。
+    fn assert_row_shape_except_audit(a: &ProcessTask, b: &ProcessTask) {
+        assert_eq!(a.task_id, b.task_id, "task_id");
+        assert_eq!(a.process_instance_id, b.process_instance_id, "process_instance_id");
+        assert_eq!(a.task_name, b.task_name, "task_name");
+        assert_eq!(a.display_name, b.display_name, "display_name");
+        assert_eq!(a.task_type, b.task_type, "task_type");
+        assert_eq!(a.perform_type, b.perform_type, "perform_type");
+        assert_eq!(a.task_state, b.task_state, "task_state");
+        assert_eq!(a.actor_id, b.actor_id, "actor_id");
+        assert_eq!(a.actor_ids, b.actor_ids, "actor_ids");
+        assert_eq!(a.expire_time, b.expire_time, "expire_time");
+        assert_eq!(a.form_key, b.form_key, "form_key");
+        assert_eq!(a.parent_task_id, b.parent_task_id, "parent_task_id");
+        assert_eq!(a.variables.len(), b.variables.len(), "行变量条数");
+        assert_eq!(a.create_time, b.create_time, "create_time");
+        assert_eq!(a.create_user, b.create_user, "create_user");
+    }
+
+    /// `reject_task` 直调 ⇒ 行形状逐维等于主路径建单
+    /// （`create_task(同名单/同参与者/Major/Normal/form_key=None/parent=Some)`）。
+    #[test]
+    fn test_i137b_reject_task_matches_main_path() {
+        let _scope = crate::clock::ClockScope::injected(i137b_clock);
+        let define = make_define(1, "i137b");
+        let actors = vec!["user2".to_string(), "user3".to_string()];
+
+        // A 组：直调被测函数
+        let mut inst_a = ProcessInstance::create(&define, "user1", &FlowData::new());
+        let via_fn = inst_a.reject_task("approve", "审批", &actors, "user1", 900);
+        // B 组：主路径那一手建单（引擎各建单点调的就是这八个入参的 create_task）
+        let mut inst_b = ProcessInstance::create(&define, "user1", &FlowData::new());
+        let via_main = inst_b.create_task("approve", "审批", &actors, "user1",
+                                          TaskType::Major, PerformType::Normal, None, Some(900));
+
+        assert_row_shape_full(&via_fn, &via_main);
+        // 再钉一遍契约本体（将来新增列若绕过上面的逐维比，这组硬判据仍照得住）
+        assert_eq!(via_fn.task_id, 0, "建单行 id 由 persist_tasks 后置分配");
+        assert_eq!(via_fn.task_state, TaskState::Doing.code(), "新建行必须是进行中");
+        assert_eq!(via_fn.task_type, TaskType::Major.code());
+        assert_eq!(via_fn.perform_type, PerformType::Normal.code());
+        assert_eq!(via_fn.parent_task_id, Some(900), "退回上一步必须带血缘父任务");
+        assert_eq!(via_fn.actor_ids, actors, "参与者集合按入参原样");
+        assert_eq!(via_fn.actor_id, None, "进行中任务该列恒无值");
+        assert_eq!(via_fn.form_key, None);
+        assert_eq!(via_fn.expire_time, None, "本签名拿不到节点表达式 ⇒ 到期留空（126 案 A 普查那句）");
+        assert_eq!(via_fn.create_user.as_deref(), Some("user1"));
+        assert!(via_fn.variables.is_empty(), "reject_task 不塞行变量");
+        // 建单审计三列都还没写（与主路径同为"未办"）
+        assert_eq!(via_fn.finish_time, None);
+        assert_eq!(via_fn.update_time, None);
+        assert_eq!(via_fn.update_user, None);
+        // 行同样落进聚合的 tasks 集合（主路径靠它做 assign_ids / save_task）
+        assert_eq!(inst_a.tasks.len(), 1);
+        assert_eq!(inst_a.tasks[0].task_name, "approve");
+        assert!(inst_a.tasks[0].is_doing());
+        assert_eq!(inst_b.tasks.len(), 1, "两条路各自只建一行，互不串");
+    }
+
+    /// `create_history_task` 直调 ⇒ 除办理审计三列外逐维等于"主路径建单后办结"，
+    /// 且那三列的差异**有据**（自动/自定义节点没有办理人，不写办理留痕）。
+    #[test]
+    fn test_i137b_create_history_task_matches_main_path() {
+        let _scope = crate::clock::ClockScope::injected(i137b_clock);
+        let define = make_define(2, "i137b-hist");
+
+        // A 组：直调被测函数（自动节点：一落地就是 FINISHED）
+        let mut inst_a = ProcessInstance::create(&define, "user1", &FlowData::new());
+        let hist = inst_a.create_history_task("auto", "自动节点", "flow.auto", TaskType::Major);
+        // B 组：主路径那一手——先建 DOING 行，再经 ProcessTask::finish 办结
+        // （注入钟恒定 ⇒ 两边 create_time 同一读数，不需要事先对齐）
+        let mut inst_b = ProcessInstance::create(&define, "user1", &FlowData::new());
+        let main = inst_b.create_task("auto", "自动节点", &["flow.auto".to_string()],
+                                      "flow.auto", TaskType::Major, PerformType::Normal, None, None);
+        inst_b.tasks = vec![main];
+        inst_b.tasks[0].finish("flow.auto", &FlowData::new()).unwrap();
+        let main = &inst_b.tasks[0];
+
+        assert_row_shape_except_audit(&hist, main);
+        // 一致的核心两列：办结行的 state 与处理人列（与 finish 写的同一判据）
+        assert_eq!(hist.task_state, TaskState::Finished.code(), "历史行一落地就是已办结");
+        assert_eq!(hist.task_state, main.task_state);
+        assert_eq!(hist.actor_id.as_deref(), Some("flow.auto"), "已办结行必须挂处理人");
+        assert_eq!(hist.actor_id, main.actor_id);
+        assert_eq!(hist.actor_ids, vec!["flow.auto".to_string()]);
+        // 有据差异：自动节点没有"办理"这一步 ⇒ 不写办理审计三列（主路径那边三列必须已写）
+        assert_eq!(hist.finish_time, None);
+        assert_eq!(hist.update_time, None);
+        assert_eq!(hist.update_user, None);
+        assert_eq!(main.finish_time.as_deref(), Some("2026-09-29 10:00:00"), "主路径办结写审计列（对照用）");
+        assert_eq!(main.update_user.as_deref(), Some("flow.auto"));
+        // 下游读路径认它（已办/历史按 task_state==FINISHED 取行）
+        assert_eq!(inst_a.get_finished_tasks().len(), 1);
+        assert!(hist.is_finished());
+        assert_eq!(inst_a.tasks.len(), 1, "聚合里也只有一行");
+    }
+
+    /// 聚合内已有别的未分配 id 行时，`create_history_task` 只动自己那一行
+    /// （旧形状按 `task_id == 0` 找行 ⇒ 命中聚合里**第一条**未落 id 的行，把别人的 DOING
+    /// 改成 FINISHED，返回行与落库行分叉。改前实测红）。
+    #[test]
+    fn test_i137b_create_history_task_does_not_disturb_sibling_rows() {
+        let _scope = crate::clock::ClockScope::injected(i137b_clock);
+        let define = make_define(3, "i137b-sibling");
+        let mut inst = ProcessInstance::create(&define, "user1", &FlowData::new());
+
+        let sibling = inst.create_task("apply", "申请", &["user9".to_string()], "user9",
+                                       TaskType::Major, PerformType::Normal, None, None);
+        let hist = inst.create_history_task("auto", "自动节点", "flow.auto", TaskType::Major);
+
+        assert_eq!(sibling.task_id, hist.task_id, "夹具前提：两行都还没分配 id（都是 0）");
+        assert_eq!(inst.tasks.len(), 2, "两行都在聚合里");
+        assert!(inst.tasks[0].is_doing(),
+            "先建的那一行必须还是进行中（旧形状在这里被改成 FINISHED）");
+        assert_eq!(inst.tasks[0].actor_id, None, "先建那行的处理人列不得被历史行占用");
+        assert_eq!(inst.tasks[0].task_name, "apply");
+        assert!(inst.tasks[1].is_finished(), "后建的自己那一行才该是已办结");
+        assert_eq!(inst.tasks[1].actor_id.as_deref(), Some("flow.auto"));
+        assert_eq!(inst.get_doing_tasks().len(), 1, "进行中仍是一行");
+        assert_eq!(inst.get_finished_tasks().len(), 1, "已办结仍是一行");
     }
 }
