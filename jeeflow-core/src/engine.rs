@@ -4445,8 +4445,11 @@ mod custom_node_tests {
         assert!(hist.finish_time.is_some(),
             "§6.2 1bis：doneList/approvalRecord 按 operator＋finish_time 取数，缺列＝留痕没落");
         assert_eq!(from_db.finish_time, hist.finish_time, "落库行的完成时间不得与返回行分叉");
+        // update 审计两列本栈建单就不写（`create_task` 的形状，与 java `ProcessTask.create`
+        // 顺手写 update_time/update_user 不同）⇒ 这里钉的是**本栈既有形状**，不是 §6.2 的判据；
+        // §6.2 1bis 明令留空的那一列是 **expire_time**（下面到期档那格钉）。
         assert!(hist.update_time.is_none() && hist.update_user.is_none(),
-            "只补 finish_time：记录类没有'办理'那一步，update 审计两列继续留空");
+            "本栈 create_task 不写 update 审计两列（记录类更没有'办理'那一步）");
 
         // ②待办数不增加：custom1 不在待办里，链上只有 approve 一条
         let doing = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();

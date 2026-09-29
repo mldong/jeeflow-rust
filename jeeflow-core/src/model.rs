@@ -431,9 +431,11 @@ impl ProcessInstance {
         // （`task_state<>10 AND operator=?`）与 `processInstance/approvalRecord` 都按
         // `operator`／`finish_time` 两列取数，已完成行不带完成时间，在用户面上等于这条留痕没落过
         // ——与第 1 条"查不到的留痕＝没留痕"同一把尺子。java `createHistoryTask`（本轮 33ba48f）
-        // 与 python 同形。⚠️ **只补这两列，`update_time`/`update_user` 继续留 None**：
-        // 记录类没有"办理"这一步，那两列是办理审计，写它就是自造第三形状。
-        // 反过来 **`expire_time` 保持 NULL**（§6 的 custom 属性字典无 expireTime）。
+        // 与 python 同形。
+        // ⚠️ 条文里"两列写、**一列不写**"那一列指的是 **`expire_time`**（§6 的 custom 属性字典
+        // 无 expireTime，写它就得臆造属性，也与 issues/126 owner 口径"节点没配就保持 NULL"同向）
+        // ⇒ 别顺手把时间列全补上。`update_time`/`update_user` 本栈 `create_task` 本就不写
+        // （与 java `ProcessTask.create` 顺手写这两列不同形），属本栈既有形状，不在本条判据内。
         task.finish_time = Some(current_time_str());
         // Update in the tasks list —— **按刚 push 的那一格定位**，不按 task_id 找：
         // 本函数返回的行 id 是 0（真 id 由 `persist_tasks` 后置分配），拿 `task_id == 0` 去
