@@ -317,8 +317,12 @@ impl ProcessRepository for MemoryRepository {
         // ⚠️ 本函数不 await（同步 SPI），锁只在函数体内取放一次；判重的读侧走
         //    `ProcessRepository::create_cc_instance_if_absent` 的 default，两次加锁也是**串行**
         //    而非嵌套——本仓有"持锁跨 await 自死锁"的前科（engine.rs 事件腿），不得在此处再犯。
+        // issues/141 G10「空不创建行」（spec 06 §2.10）写侧兜底：归一在取锁之前——
+        // 空串/纯空白一律丢弃、落库值取 trim 后的串（`" 123 "` 与 `"123"` 判为同一个人，
+        // 与上面的 G2 判重同一条尺子）。绕过引擎漏斗与门面直连仓储的调用方同样建不出空行。
+        let actors = crate::model::normalize_cc_actors(actor_ids);
         let mut ccs = self.cc_instances.lock().unwrap();
-        for actor_id in actor_ids {
+        for actor_id in &actors {
             if ccs.iter().any(|c| c.process_instance_id == instance_id && &c.actor_id == actor_id) {
                 continue;
             }
@@ -1636,5 +1640,78 @@ mod cc_i141_tests {
         // default 唯一的加固是"同一次调用内重复折叠"（与 java default 同一条，不依赖读侧）
         let folded = repo.create_cc_instance_if_absent(2, SENDER, &[ACTOR_A.into(), ACTOR_A.into()]).unwrap();
         assert_eq!(folded, vec![ACTOR_A.to_string()], "同一次调用内的重复在 default 里就折叠");
+    }
+
+    // ─────────── issues/141 G10 · 空抄送人不建 cc 行（内存仓写侧兜底这一支）───────────
+
+    /// 写侧兜底：绕过引擎漏斗与门面、直连仓储灌空值 ⇒ 一行都建不出来（spec §2.10 实现要求①第二层）。
+    /// 改前实测：`create_cc_instance(&[""])` 真落一条 `actor_id=''` 的行——空归属值正是
+    /// issues/129 那族"空 operator 读全库"的病根。
+    #[test]
+    fn test_i141_g10_repo_write_side_drops_blank_actors() {
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+
+        repo.create_cc_instance(iid, SENDER,
+            &["".into(), "   ".into(), "\t".into(), ACTOR_A.into()]).unwrap();
+
+        assert_eq!(cc_rows(&repo, iid).len(), 1, "G10：空串/纯空白一律不建行，只落有效那一行");
+        assert_eq!(repo.find_cc_actor_ids(iid).unwrap(), vec![ACTOR_A.to_string()],
+            "G10：内存仓写侧不得落出 actor_id='' 的行");
+    }
+
+    /// 全空值一批 ⇒ 零行（与"没给抄送人"同形状）。
+    #[test]
+    fn test_i141_g10_all_blank_batch_creates_no_rows_at_all() {
+        for batch in [vec!["".to_string()], vec!["   ".to_string()], vec!["\t".to_string()],
+                      vec!["".to_string(), " ".to_string()]] {
+            let repo = MemoryRepository::new();
+            let iid = new_instance(&repo);
+            repo.create_cc_instance(iid, SENDER, &batch).unwrap();
+            assert!(cc_rows(&repo, iid).is_empty(), "G10：{batch:?} 不得建任何 cc 行");
+            // 同一批再走判重 default ⇒ 子集也必须为空（子集是拿去 fire 码 4 的那一批）
+            let fresh = repo.create_cc_instance_if_absent(iid, SENDER, &batch).unwrap();
+            assert!(fresh.is_empty(), "G10：{batch:?} 走 if_absent 也拿不到空值子集，实得 {fresh:?}");
+        }
+    }
+
+    /// 落库值取 trim 后的串，且与 G2 判重咬合：`" 8401 "` 与 `"8401"` 是同一个人 ⇒ 只一行。
+    #[test]
+    fn test_i141_g10_write_side_trims_and_hits_g2_dedup() {
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+
+        repo.create_cc_instance(iid, SENDER, &["  ".to_string() + ACTOR_A + "  "]).unwrap();
+        assert_eq!(repo.find_cc_actor_ids(iid).unwrap(), vec![ACTOR_A.to_string()],
+            "G10：入库值必须是 trim 后的串");
+
+        let fresh = repo.create_cc_instance_if_absent(iid, SENDER, &[ACTOR_A.into()]).unwrap();
+        assert!(fresh.is_empty(), "G10＋G2：带空格与不带空格判为同一人 ⇒ 子集为空、不 fire");
+        assert_eq!(cc_rows(&repo, iid).len(), 1, "G10＋G2：带空格的同一人不得再建第二行");
+    }
+
+    /// `create_cc_instance_if_absent` 返回的子集只含有效且 trim 后的人（子集直接拿去 fire 码 4）。
+    #[test]
+    fn test_i141_g10_if_absent_subset_excludes_blank_actors() {
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+
+        let fresh = repo.create_cc_instance_if_absent(iid, SENDER,
+            &["".into(), ACTOR_A.into(), "  ".into(), "  ".to_string() + ACTOR_B + " "]).unwrap();
+
+        assert_eq!(fresh, vec![ACTOR_A.to_string(), ACTOR_B.to_string()],
+            "G10：实际新建子集只含有效且 trim 后的人");
+        assert_eq!(repo.find_cc_actor_ids(iid).unwrap(), fresh, "G10：子集与落库行一致");
+    }
+
+    /// 反向哨兵（内存仓这一支）：`"0"` 是正常用户 id，写侧归一不得吃掉它。
+    #[test]
+    fn test_i141_g10_zero_actor_id_still_written_on_repo_side() {
+        let repo = MemoryRepository::new();
+        let iid = new_instance(&repo);
+
+        repo.create_cc_instance(iid, SENDER, &["0".into()]).unwrap();
+        assert_eq!(repo.find_cc_actor_ids(iid).unwrap(), vec!["0".to_string()],
+            "G10 只丢空串/纯空白：'0' 不得被当成空值丢掉");
     }
 }

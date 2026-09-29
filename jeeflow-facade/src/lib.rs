@@ -1367,7 +1367,12 @@ impl JeeflowFacade {
         let id = arg_id(args, &["processInstanceId", "id"])?
             .ok_or(JeeflowError::Business("缺少processInstanceId参数".into()))?;
         let operator = arg_str_or(args, "operator", "user1");
-        let actors = arg_actor_ids(args);
+        // issues/141 G10「空不创建行」（spec 06 §2.10）：手动腿与引擎两条腿走同一个归一判据
+        // （`jeeflow_core::model::normalize_cc_actors`，与 `parse_cc_actors` 同一条腿）——
+        // 逗号串与数组两形的空串/纯空白/空元素一律丢弃，落库与比较值取 trim 后的串。
+        // 丢完为空 ⇒ 不建行、不 fire，并且**与上面那条"空集合＝actorIds 缺失"同档**
+        // （spec §2.10 实现要求③：沿用既有文案，不新造错误码/错误语义）。
+        let actors = normalize_cc_actors(&arg_actor_ids(args));
         if actors.is_empty() {
             return Err(JeeflowError::Business("actorIds 缺失".into()));
         }

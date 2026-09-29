@@ -784,6 +784,46 @@ pub fn has_effective_cc_ownership(query: &PageQuery) -> bool {
     false
 }
 
+/// **抄送人集合归一**的唯一判据出口（issues/141 G10「空不创建行」· spec 06-facade.md §2.10；
+/// 基准＝jeeflow-java `5fbd5ac` 的 `StringUtils.normalizeCcActors`）。
+///
+/// 逐元素 **trim ⇒ 空串/纯空白丢弃 ⇒ 同一次调用内的重复折叠（顺序保持）**。
+/// 三条入口（发起 `f_ccActors`／办理 `tf_ccActors`／门面手动
+/// `processInstance/createCCInstance`）解析出的**逗号串与数组两种形态**都必须过这一支，
+/// 丢完为空 ⇒ 调用方**不建任何 cc 行、也不 fire `CC_CREATE`(码 4)**。
+///
+/// 本仓的两处旧形状正是这一条要堵的洞（普查读数见 `docs`／收口报告）：
+/// - [`crate::engine`] 的 `parse_cc_actors` 与门面 `arg_actor_ids` 的**数组腿**只做
+///   `retain(!is_empty())`——纯空白元素（`"  "`／`"\t"`）原样活着 ⇒ 真落一条
+///   `actor_id='  '` 的 cc 行并照旧 fire；同一支的逗号串腿却 trim＋丢空。
+///   **两条腿两个答案**，正是条文点名的"只修一条腿"。
+/// - 数组元素不 trim ⇒ `" a "` 与 `"a"` 落成两行，把 issues/141 G2 的写侧判重
+///   （本仓 `53c1d28` 的 `find_cc_actor_ids`／`create_cc_instance_if_absent`）直接打穿。
+/// - 空归属值正是 issues/129 那族"空 operator 读全库"的病根，不能从抄送侧继续往里灌。
+///
+/// 判据落在**两层**，缺一层就还能灌进空值（spec §2.10 实现要求①）：
+/// ① 漏斗层＝`parse_cc_actors`（引擎两条腿共用）＋门面手动腿；
+/// ② 写侧层＝两仓 `create_cc_instance`（[`crate::memory::MemoryRepository`] /
+///    `SqlxRepository`）与 [`crate::spi::ProcessRepository::create_cc_instance_if_absent`]
+///    default——绕过引擎/门面直连仓储的第三方调用方同样建不出空行。
+///
+/// 反向哨兵（spec §2.10 实现要求④）：这一支**只吃空值**，`"0"` 这类"看起来像空"的正常 id
+/// 不得被丢掉。
+pub fn normalize_cc_actors(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for actor in raw {
+        let trimmed = actor.trim();
+        if trimmed.is_empty() {
+            continue; // 空串／纯空白：丢弃（G10）
+        }
+        let trimmed = trimmed.to_string();
+        if !out.contains(&trimmed) {
+            out.push(trimmed); // 同一次调用内的重复折叠；值取 trim 后的串（与 G2 判重同一条尺子）
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct PageResult<T> {
     pub page_num: i64,
@@ -1418,5 +1458,66 @@ mod tests {
         assert_eq!(inst.tasks[1].actor_id.as_deref(), Some("flow.auto"));
         assert_eq!(inst.get_doing_tasks().len(), 1, "进行中仍是一行");
         assert_eq!(inst.get_finished_tasks().len(), 1, "已办结仍是一行");
+    }
+
+    // ─────────── issues/141 G10 · 抄送人归一判据本体 ───────────
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 正向对照：非空抄送人原样保留、顺序不动（判据不吃正常值）。
+    #[test]
+    fn test_i141_g10_normalize_keeps_valid_actors_in_order() {
+        assert_eq!(normalize_cc_actors(&v(&["7501", "7502"])), v(&["7501", "7502"]));
+        assert_eq!(normalize_cc_actors(&v(&["a", "b", "c"])), v(&["a", "b", "c"]),
+            "顺序必须保持（fire 码 4 的入参顺序＝请求顺序，engine.rs 既有判据）");
+    }
+
+    /// 空串／纯空白（空格·制表·换行）全部丢弃；丢完为空 ⇒ 空集合（调用方据此不建行、不 fire）。
+    #[test]
+    fn test_i141_g10_normalize_drops_empty_and_whitespace_only() {
+        for blank in ["", " ", "   ", "\t", "\n", "\r\n", " \t\n "] {
+            assert!(normalize_cc_actors(&v(&[blank])).is_empty(),
+                "G10：纯空白 {blank:?} 必须丢完 ⇒ 空集合，实得 {:?}", normalize_cc_actors(&v(&[blank])));
+        }
+        assert!(normalize_cc_actors(&v(&["", "  ", "\t"])).is_empty(), "全空白一批 ⇒ 空集合");
+        assert!(normalize_cc_actors(&v(&[])).is_empty(), "空入参 ⇒ 空集合");
+    }
+
+    /// 混给只丢空的：有效元素一个不少、顺序保持。
+    #[test]
+    fn test_i141_g10_normalize_drops_only_the_blanks() {
+        assert_eq!(normalize_cc_actors(&v(&["7601", "", "  ", "7602"])), v(&["7601", "7602"]));
+    }
+
+    /// 落库与比较值取 trim 后的串（spec §2.10 实现要求②）。
+    #[test]
+    fn test_i141_g10_normalize_trims_values() {
+        assert_eq!(normalize_cc_actors(&v(&[" 8301 ", "8302"])), v(&["8301", "8302"]),
+            "G10：带空格的入参归一为 trim 后的串");
+        assert_eq!(normalize_cc_actors(&v(&["\tu9\n"])), v(&["u9"]), "Unicode 空白一并 trim");
+    }
+
+    /// 同一次调用内的重复折叠（trim 之后同值＝同一个人，与 issues/141 G2 写侧判重同一条尺子）。
+    #[test]
+    fn test_i141_g10_normalize_folds_duplicates_after_trim() {
+        assert_eq!(normalize_cc_actors(&v(&["8401", " 8401 ", "8401"])), v(&["8401"]),
+            "G10：'8401' 与 ' 8401 ' 判为同一个人 ⇒ 折叠成一条（否则 G2 判重被打穿，落两行）");
+    }
+
+    /// 反向哨兵（spec §2.10 实现要求④）：判据只吃空值，不吃 "0" 这类"看起来像空"的正常 id。
+    #[test]
+    fn test_i141_g10_normalize_does_not_eat_looks_like_empty_ids() {
+        assert_eq!(normalize_cc_actors(&v(&["0"])), v(&["0"]),
+            "G10 反向哨兵：'0' 是正常用户 id，不得被当成空值丢掉");
+        assert_eq!(normalize_cc_actors(&v(&["0", "", "user-1", "  "])), v(&["0", "user-1"]),
+            "反向哨兵混给空值：只丢空的，'0' 与 'user-1' 都在");
+        for not_blank in ["0", "false", "null", "None", "null-id"] {
+            let one = not_blank.trim();
+            let got = normalize_cc_actors(&v(&[not_blank]));
+            if one.is_empty() { continue; }
+            assert_eq!(got, v(&[one]), "{not_blank:?} 不该被判成空值");
+        }
     }
 }

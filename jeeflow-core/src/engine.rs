@@ -1434,9 +1434,13 @@ fn countersign_roster(vars: &FlowData, key: &str) -> Vec<String> {
 /// 取本次刚建出的那条任务（聚合根里 push 的是克隆，两份都要写才算落库）。
 /// 解析发起时抄送人（对齐 Go facade.go:203 issues/56 E28）：
 /// 支持 JSON 数组（vben 多选 ApiSelect 提交）与逗号分隔字符串两种形态。
+///
+/// 形状判定（trim／丢空／折叠）不在本函数里自造——拆成原始串集合后统一交给
+/// [`crate::model::normalize_cc_actors`]（issues/141 G10「空不创建行」，spec 06 §2.10），
+/// 与门面手动腿、两仓写侧共用同一条判据。
 fn parse_cc_actors(v: Option<&JsonValue>) -> Vec<String> {
     let Some(v) = v else { return Vec::new(); };
-    let mut out: Vec<String> = match v {
+    let raw: Vec<String> = match v {
         // 数组：逐项取原始标量（对齐 Go fmt.Sprintf("%v", a)，兼容字符串/数字 id）。
         // 注意不能用 JsonValue 的 Display——它走 to_json_string 会给字符串加引号。
         JsonValue::Array(items) => items
@@ -1449,16 +1453,16 @@ fn parse_cc_actors(v: Option<&JsonValue>) -> Vec<String> {
                 _ => None,
             })
             .collect(),
-        // 逗号分隔字符串
-        JsonValue::Str(s) => s
-            .split(',')
-            .map(|x| x.trim().to_string())
-            .filter(|x| !x.is_empty())
-            .collect(),
+        // 逗号分隔字符串：只拆不判，判据与数组腿同一条腿（G10 要求两形同判）
+        JsonValue::Str(s) => s.split(',').map(|x| x.to_string()).collect(),
         _ => Vec::new(),
     };
-    out.retain(|s| !s.is_empty());
-    out
+    // issues/141 G10「空不创建行」（spec 06 §2.10）：逐项 trim、空串/纯空白丢弃、
+    // 同一次调用内重复折叠；丢完为空 ⇒ 两个调用点（发起腿/办理腿的 `if !cc_actors.is_empty()`）
+    // 既不建 cc 行也不 fire 码 4。改前本函数只有 `retain(|s| !s.is_empty())`：
+    // 数组腿的 `"  "`/`"\t"` 原样活着且不 trim ⇒ 真落 `actor_id='  '` 的行并照旧 fire，
+    // 还与 issues/141 G2 写侧判重错开（`" a "` 与 `"a"` 落两行）。写侧另有第二层兜底。
+    crate::model::normalize_cc_actors(&raw)
 }
 
 // ═══════════════════════════════════════════════════════
@@ -3743,6 +3747,182 @@ mod event_leg_tests {
             "不同实例上的同一个人各 fire 一次（判重不得升级成全局）");
         assert_eq!(repo.find_cc_actor_ids(first.instance_id).unwrap(), vec!["u1".to_string()]);
         assert_eq!(repo.find_cc_actor_ids(second.instance_id).unwrap(), vec!["u1".to_string()]);
+    }
+
+    // ─── issues/141 G10 · 空抄送人不建 cc 行（漏斗层：三条入口 + 逗号串/数组两形同判据）───
+
+    /// 一条只有 apply 节点的流，返回 (engine, repo, 事件记录器, define_id)。
+    fn g10_engine(name: &str) -> (JeeflowEngineImpl, Arc<MemoryRepository>, Arc<SeqRecorder>, i64) {
+        let (engine, repo, rec) = ev_engine();
+        let did = ev_define(&repo, name, &ev_flow(name, &[("apply", r#""assignee":"zhangsan""#)]));
+        (engine, repo, rec, did)
+    }
+
+    /// 正向对照（＝java `nonBlankCcActorsStillCreateRowsAndFire`）：非空抄送人照旧逐人建行＋逐人 fire。
+    /// 这一格按设计**改前也不红**，它钉的是"归一不许顺手吃掉正常值"。
+    #[tokio::test]
+    async fn test_i141_g10_non_blank_cc_actors_still_create_rows_and_fire() {
+        let (engine, repo, rec, did) = g10_engine("i141_g10_positive");
+        let mut start = FlowData::new();
+        start.insert("f_ccActors".to_string(),
+            JsonValue::Array(vec![JsonValue::Str("7501".into()), JsonValue::Str("7502".into())]));
+        let inst = engine.start_async(did, "zhangsan", &start).await.unwrap();
+
+        assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(),
+            vec!["7501".to_string(), "7502".to_string()], "正向对照：非空抄送人照旧逐人落行");
+        assert_eq!(cc_fired_actors(&rec), vec!["7501".to_string(), "7502".to_string()],
+            "正向对照：照旧逐人 fire 码 4");
+    }
+
+    /// 逗号串全空白 ⇒ 不建行、不 fire。
+    #[tokio::test]
+    async fn test_i141_g10_start_leg_blank_comma_string_creates_no_row() {
+        for (i, raw) in ["", "   ", "\t", " , , "].into_iter().enumerate() {
+            let (engine, repo, rec, did) = g10_engine(&format!("i141_g10_csv_blank_{i}"));
+            let mut start = FlowData::new();
+            start.insert("f_ccActors".to_string(), JsonValue::Str(raw.to_string()));
+            let inst = engine.start_async(did, "zhangsan", &start).await.unwrap();
+
+            assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(), Vec::<String>::new(),
+                "G10：f_ccActors 全空白（{raw:?}）不得建 cc 行");
+            assert!(cc_fired_actors(&rec).is_empty(),
+                "G10：全空白不得 fire 码 4（{raw:?}）");
+        }
+    }
+
+    /// 数组形态给空串＋纯空白元素 ⇒ 同一判据（rust 的病灶腿：逗号串腿本来就 trim＋丢空，
+    /// **数组腿只 `retain(!is_empty())` ⇒ `"  "` 活着且不 trim**，改前这一格直接红）。
+    #[tokio::test]
+    async fn test_i141_g10_start_leg_array_drops_blank_and_trims() {
+        for (i, (cc, want)) in [
+            (vec!["7801", "", "  "], vec!["7801"]),
+            (vec!["", "  "], Vec::<&str>::new()),
+            (vec![" 8101 "], vec!["8101"]),
+            (vec!["\t"], Vec::<&str>::new()),
+        ].into_iter().enumerate() {
+            let (engine, repo, rec, did) = g10_engine(&format!("i141_g10_arr_{i}"));
+            let mut start = FlowData::new();
+            start.insert("f_ccActors".to_string(),
+                JsonValue::Array(cc.iter().map(|s| JsonValue::Str(s.to_string())).collect()));
+            let inst = engine.start_async(did, "zhangsan", &start).await.unwrap();
+
+            assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(),
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "G10 数组腿第 {i} 档（{cc:?}）：空元素丢弃、值取 trim 后的串");
+            assert_eq!(cc_fired_actors(&rec),
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "G10 数组腿第 {i} 档：fire 的入参只含有效且 trim 后的人");
+        }
+    }
+
+    /// 逗号串里的空元素（`"7701,,7702"`）与尾随逗号（`"8201,"`）丢弃，有效的人照旧。
+    #[tokio::test]
+    async fn test_i141_g10_start_leg_comma_string_drops_empty_elements() {
+        for (i, (cc, want)) in [
+            ("7701,,7702", vec!["7701", "7702"]),
+            ("8201,", vec!["8201"]),
+            (" 8202 , 8203 ", vec!["8202", "8203"]),
+            (",,,", Vec::<&str>::new()),
+        ].into_iter().enumerate() {
+            let (engine, repo, rec, did) = g10_engine(&format!("i141_g10_csv_{i}"));
+            let mut start = FlowData::new();
+            start.insert("f_ccActors".to_string(), JsonValue::Str(cc.to_string()));
+            let inst = engine.start_async(did, "zhangsan", &start).await.unwrap();
+
+            assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(),
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "G10 逗号串第 {i} 档（{cc:?}）：空段丢弃");
+            assert_eq!(cc_fired_actors(&rec),
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "G10 逗号串第 {i} 档：只逐有效人 fire");
+        }
+    }
+
+    /// 办理腿 `tf_ccActors`：纯空白 ⇒ 不建行不 fire；混给空元素 ⇒ 只丢空的。
+    #[tokio::test]
+    async fn test_i141_g10_execute_leg_drops_blank_actors() {
+        for (i, (cc, want)) in [
+            (JsonValue::Str("   ".into()), Vec::<String>::new()),
+            (JsonValue::Array(vec![JsonValue::Str("".into()), JsonValue::Str("  ".into())]),
+                Vec::<String>::new()),
+            (JsonValue::Str("8201,".into()), vec!["8201".to_string()]),
+            (JsonValue::Array(vec![
+                JsonValue::Str("8301".into()), JsonValue::Str("".into()),
+                JsonValue::Str("  ".into()), JsonValue::Str("8302".into())]),
+                vec!["8301".to_string(), "8302".to_string()]),
+        ].into_iter().enumerate() {
+            let (engine, repo, rec, did) = g10_engine(&format!("i141_g10_exec_{i}"));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            rec.events.lock().unwrap().clear();
+            let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+            let mut args = ev_submit(1);
+            args.insert("tf_ccActors".to_string(), cc.clone());
+            engine.execute_task_async(apply.task_id, "zhangsan", &args).await.unwrap();
+
+            assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(), want,
+                "G10 办理腿第 {i} 档（{cc:?}）：空值不建行");
+            assert_eq!(cc_fired_actors(&rec), want,
+                "G10 办理腿第 {i} 档：空值不得拿去 fire 码 4");
+        }
+    }
+
+    /// trim 与 issues/141 G2 写侧判重咬合：先抄 `"8401"`，再抄 `" 8401 "` ⇒ 判为同一个人，
+    /// 不新增第二行、不 fire 码 4（不 trim 的旧形状会在这里落出第二行）。
+    #[tokio::test]
+    async fn test_i141_g10_padded_value_hits_g2_dedup() {
+        let (engine, repo, rec, did) = g10_engine("i141_g10_trim_dedup");
+        let mut start = FlowData::new();
+        start.insert("f_ccActors".to_string(), JsonValue::Str("8401".into()));
+        let inst = engine.start_async(did, "zhangsan", &start).await.unwrap();
+        rec.events.lock().unwrap().clear();
+
+        let apply = ev_doing(&repo, inst.instance_id, "apply", 1)[0].clone();
+        let mut args = ev_submit(1);
+        args.insert("tf_ccActors".to_string(), JsonValue::Array(vec![JsonValue::Str(" 8401 ".into())]));
+        engine.execute_task_async(apply.task_id, "zhangsan", &args).await.unwrap();
+
+        assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(), vec!["8401".to_string()],
+            "G10：带空格的同一人不得再建第二行（trim 后的值才进判重比较）");
+        assert!(cc_fired_actors(&rec).is_empty(), "G10：判重命中 ⇒ 不 fire 码 4");
+    }
+
+    /// 反向哨兵：`"0"` 这类"看起来像空"的正常 id **不得**被归一吃掉（spec §2.10 实现要求④）。
+    #[tokio::test]
+    async fn test_i141_g10_zero_actor_id_is_not_treated_as_blank() {
+        let (engine, repo, rec, did) = g10_engine("i141_g10_sentinel");
+        let mut start = FlowData::new();
+        start.insert("f_ccActors".to_string(),
+            JsonValue::Array(vec![JsonValue::Str("0".into()), JsonValue::Str("user-1".into())]));
+        let inst = engine.start_async(did, "zhangsan", &start).await.unwrap();
+
+        assert_eq!(repo.find_cc_actor_ids(inst.instance_id).unwrap(),
+            vec!["0".to_string(), "user-1".to_string()],
+            "G10 只丢空串/纯空白：'0' 这类正常 id 不得被吃掉");
+        assert_eq!(cc_fired_actors(&rec), vec!["0".to_string(), "user-1".to_string()],
+            "反向哨兵：照旧逐人 fire");
+    }
+
+    /// 漏斗归一本体（c30 `test_parse_cc_actors` 的 G10 补充，不动既有格子）：
+    /// 逗号串与数组**两形同判据**——同一批值两种写法必须得到同一个结果。
+    #[test]
+    fn test_i141_g10_parse_cc_actors_both_forms_same_judgement() {
+        for (raw_csv, arr) in [
+            ("7701,,7702", vec!["7701", "", "7702"]),
+            ("8201,", vec!["8201", ""]),
+            (" 8301 ", vec![" 8301 "]),
+            ("", vec!["", "  ", "\t"]),
+        ] {
+            let from_csv = parse_cc_actors(Some(&JsonValue::Str(raw_csv.to_string())));
+            let from_arr = parse_cc_actors(Some(&JsonValue::Array(
+                arr.iter().map(|s| JsonValue::Str(s.to_string())).collect())));
+            assert_eq!(from_csv, from_arr,
+                "G10：逗号串 {raw_csv:?} 与数组 {arr:?} 必须同判据，实得 {from_csv:?} / {from_arr:?}");
+            assert!(from_csv.iter().all(|s| !s.trim().is_empty() && s == s.trim()),
+                "G10：归一后不得残留空值或未 trim 的值：{from_csv:?}");
+        }
+        // 反向哨兵：'0' 不是空值
+        assert_eq!(parse_cc_actors(Some(&JsonValue::Array(vec![JsonValue::Str("0".into())]))),
+            vec!["0".to_string()], "反向哨兵：'0' 不得被当成空值丢掉");
     }
 
     // ─── 5 / 6 互斥（08 场景 30·31）───

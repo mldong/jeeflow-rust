@@ -39,6 +39,14 @@ pub trait ProcessRepository: Send + Sync {
     fn remove_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()>;
 
     // ═══ CC operations ═══
+    /// 建 cc 行的最底层写入口（`wf_process_cc_instance`）。
+    ///
+    /// issues/141 G10「空不创建行」（spec 06-facade.md §2.10）：入参里的**空串、纯空白一律丢弃**，
+    /// 落库值取 **trim 后的串**（`" 123 "` 与 `"123"` 是同一个人，才与 G2 的写侧判重咬合）。
+    /// 判据必须落在这一层而不只落在引擎漏斗里——绕过 `parse_cc_actors`／门面直连仓储的调用方
+    /// （集成层、第三方仓储消费者）同样不得把空归属值灌进 `actor_id`，那正是 issues/129
+    /// 那族"空 operator 读全库"的病根。归一腿用 [`crate::model::normalize_cc_actors`]，
+    /// 本仓两仓（内存仓 / sqlx 仓）共用它，覆写本方法的第三方仓储**也必须**过这一支。
     fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()>;
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()>;
 
@@ -68,6 +76,10 @@ pub trait ProcessRepository: Send + Sync {
     ///
     /// 未覆写 [`Self::find_cc_actor_ids`] 的第三方仓储走本 default ⇒ 与旧
     /// `create_cc_instance` 逐字一致（全量插入、全量返回），不静默改变既有集成方行为。
+    ///
+    /// issues/141 G10「空不创建行」（spec 06 §2.10）写侧兜底第二层：入参先过
+    /// [`crate::model::normalize_cc_actors`]（空串/纯空白丢弃、值取 trim 后的串）——
+    /// 返回的子集是**拿去 fire `CC_CREATE` 的那一批**，含空值就等于对空抄送人发了码 4。
     fn create_cc_instance_if_absent(
         &self,
         instance_id: i64,
@@ -75,9 +87,11 @@ pub trait ProcessRepository: Send + Sync {
         actor_ids: &[String],
     ) -> JeeflowResult<Vec<String>> {
         // 先取快照再写：不在持锁期间做插入（本仓内存仓有"持锁跨 await 自死锁"的前科）。
+        // G10：归一在取快照之前——空值既进不了子集，也进不了下面的判重比较。
+        let actors = crate::model::normalize_cc_actors(actor_ids);
         let mut existing = self.find_cc_actor_ids(instance_id)?;
         let mut fresh: Vec<String> = Vec::new();
-        for actor_id in actor_ids {
+        for actor_id in &actors {
             if existing.iter().any(|a| a == actor_id) {
                 continue; // 已有 cc 行 ⇒ 幂等空操作
             }

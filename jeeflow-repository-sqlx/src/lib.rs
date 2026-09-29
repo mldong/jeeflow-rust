@@ -822,8 +822,13 @@ impl ProcessRepository for SqlxRepository {
             // ②不重置未读（state 保持原值）、③不更新原行时间（连 UPDATE 都不发，
             // create_time/update_time 逐字不变）。判重放在**写侧**而不是查询侧：
             // 查询保持现状不引入 DISTINCT，历史重复行也不清理（owner 2026-09-29 拍）。
+            // issues/141 G10「空不创建行」（spec 06 §2.10）写侧兜底：与内存仓同一条判据——
+            // 空串/纯空白一律丢弃、落库值取 trim 后的串（`" 123 "` 与 `"123"` 判为同一个人，
+            // 也才与下面的判重咬合）。绕过引擎漏斗与门面直连仓储的调用方同样建不出 actor_id='' 的行
+            // （那正是 issues/129 那族"空 operator 读全库"的病根）。
+            let actors = jeeflow_core::model::normalize_cc_actors(actor_ids);
             let mut existing: Vec<String> = select_cc_actor_ids(&self.pool, instance_id).await?;
-            for actor in actor_ids {
+            for actor in &actors {
                 if existing.iter().any(|a| a == actor) {
                     continue;
                 }
@@ -3609,7 +3614,199 @@ mod tests {
         clean_i141(&pool).await;
     }
 
+    // ═══ issues/141 G10 · 空抄送人不建 cc 行（SQL 真库写侧兜底这一支）═══
+    //   基准＝jeeflow-java `5fbd5ac`（JdbcProcessRepository.createCcInstance ＋
+    //   JdbcCcOwnershipIdempotentTest 的 G10 六格）；判据与内存仓同一条
+    //   （`jeeflow_core::model::normalize_cc_actors`），两仓必须同答案（issues/117 场景 27）。
+
+    /// G10 专用：一条**没有任何 cc 行**的实例（define 9141xx 段，避开 seed_i141 的预置行）。
+    async fn new_cc_instance(pool: &MySqlPool, define_id: i64) -> i64 {
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            let mut define = ProcessDefine {
+                id: define_id, name: format!("rust_141_g10_{define_id}"),
+                display_name: "141 空抄送".into(), define_type: "approval".into(),
+                state: 1, content: b"{}".to_vec(), version: 1,
+                create_time: None, create_user: Some(I141_SENDER.into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define).unwrap();
+            let iid = define_id + 1;
+            let mut inst = ProcessInstance {
+                instance_id: iid, parent_id: None, define_id, state: 10,
+                parent_node_name: None, business_no: Some(format!("biz-{iid}")),
+                operator: "i141_op_a".into(), expire_time: None,
+                variables: jeeflow_core::json::FlowData::new(),
+                tasks: vec![], create_time: None, create_user: Some("i141_op_a".into()),
+                update_time: None, update_user: None, define: None,
+            };
+            repo.save_instance(&mut inst).unwrap();
+            iid
+        }).await
+    }
+
+    /// G10 取证读侧：`find_cc_actor_ids` 是同步 SPI，必须经 `run_sync`（spawn_blocking）调用——
+    /// 直接在 `#[tokio::test]` 的 current-thread 运行时上调会撞 `block_in_place` 断言。
+    async fn cc_actor_ids(pool: &MySqlPool, instance_id: i64) -> Vec<String> {
+        let pool2 = pool.clone();
+        run_sync(move || SqlxRepository::new(pool2).find_cc_actor_ids(instance_id).unwrap()).await
+    }
+
+    /// 写侧兜底（SQL 仓这一层）：空串／纯空白直连仓储也建不出行——
+    /// 改前实测 `actor_id=''` 真落库一行（issues/129 那族"空归属值"的病根）。
+    #[tokio::test]
+    async fn test_mysql_i141_g10_blank_actors_create_no_rows() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i141(&pool).await;
+        let iid = new_cc_instance(&pool, 914120).await;
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.create_cc_instance(iid, I141_SENDER,
+                &["".into(), "   ".into(), "\t".into()]).unwrap();
+            let fresh = repo.create_cc_instance_if_absent(iid, I141_SENDER,
+                &["".into(), "  ".into()]).unwrap();
+            assert!(fresh.is_empty(), "G10：全空值批次的 if_absent 子集必须为空，实得 {fresh:?}");
+        }).await;
+
+        assert!(cc_raw_rows(&pool, iid).await.is_empty(),
+            "G10：wf_process_cc_instance 必须零行，实得 {:?}", cc_raw_rows(&pool, iid).await);
+        assert_eq!(cc_actor_ids(&pool, iid).await, Vec::<String>::new(),
+            "G10：读侧人员集合必须为空");
+        clean_i141(&pool).await;
+    }
+
+    /// 混给一批：只丢空元素，有效的人照旧落行（顺序随入参）。
+    #[tokio::test]
+    async fn test_mysql_i141_g10_mixed_batch_keeps_only_valid_actors() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i141(&pool).await;
+        let iid = new_cc_instance(&pool, 914130).await;
+
+        let pool2 = pool.clone();
+        let created = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.create_cc_instance_if_absent(iid, I141_SENDER,
+                &["".into(), I141_ACTOR_A.into(), "  ".into(), I141_ACTOR_B.into()]).unwrap()
+        }).await;
+
+        assert_eq!(created, vec![I141_ACTOR_A.to_string(), I141_ACTOR_B.to_string()],
+            "G10：if_absent 的子集（＝拿去 fire 码 4 的那一批）只含有效的人");
+        let rows = cc_raw_rows(&pool, iid).await;
+        assert_eq!(rows.len(), 2, "G10：库里只有两行，不得有 actor_id='' 的那一行");
+        assert_eq!(rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+            vec![I141_ACTOR_A.to_string(), I141_ACTOR_B.to_string()]);
+        clean_i141(&pool).await;
+    }
+
+    /// 落库值取 trim 后的串，且与 G2 判重咬合：`" u141a "` 与 `"u141a"` 判为同一个人 ⇒ 仍一行。
+    #[tokio::test]
+    async fn test_mysql_i141_g10_values_trimmed_and_hit_g2_dedup() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i141(&pool).await;
+        let iid = new_cc_instance(&pool, 914140).await;
+
+        let pool2 = pool.clone();
+        let padded = format!("  {I141_ACTOR_A}  ");
+        run_sync(move || {
+            SqlxRepository::new(pool2).create_cc_instance(iid, I141_SENDER, &[padded]).unwrap();
+        }).await;
+        assert_eq!(cc_actor_ids(&pool, iid).await, vec![I141_ACTOR_A.to_string()],
+            "G10：入库值必须是 trim 后的串");
+
+        let pool3 = pool.clone();
+        let fresh = run_sync(move || {
+            SqlxRepository::new(pool3)
+                .create_cc_instance_if_absent(iid, I141_SENDER, &[I141_ACTOR_A.into()]).unwrap()
+        }).await;
+        assert!(fresh.is_empty(), "G10＋G2：带空格与不带空格判为同一人 ⇒ 子集为空、不 fire");
+        assert_eq!(cc_raw_rows(&pool, iid).await.len(), 1, "G10＋G2：同一人不得落出第二行");
+        clean_i141(&pool).await;
+    }
+
+    /// 反向哨兵：`"0"` 是正常用户 id，SQL 仓写侧不得把它当成空值丢掉。
+    #[tokio::test]
+    async fn test_mysql_i141_g10_zero_actor_id_is_not_eaten() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i141(&pool).await;
+        let iid = new_cc_instance(&pool, 914150).await;
+
+        let pool2 = pool.clone();
+        let fresh = run_sync(move || {
+            SqlxRepository::new(pool2).create_cc_instance_if_absent(iid, I141_SENDER,
+                &["0".into(), "".into(), I141_ACTOR_C.into()]).unwrap()
+        }).await;
+
+        assert_eq!(fresh, vec!["0".to_string(), I141_ACTOR_C.to_string()],
+            "G10 只丢空串/纯空白：'0' 照旧建行照旧进子集");
+        assert_eq!(cc_actor_ids(&pool, iid).await,
+            vec!["0".to_string(), I141_ACTOR_C.to_string()]);
+        clean_i141(&pool).await;
+    }
+
+    /// 两仓同答案（issues/117 场景 27 那把尺子）：同一批含空值的入参，内存仓与 SQL 仓
+    /// 落库的人员集合必须逐字一致——只修一层就会出现"一个仓建行、一个仓不建"的分叉。
+    #[tokio::test]
+    async fn test_mysql_i141_g10_two_repos_same_answer_on_blank_actors() {
+        let _serial = i141_serial().await;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i141(&pool).await;
+        let iid = new_cc_instance(&pool, 914160).await;
+
+        let pool2 = pool.clone();
+        let batch = vec!["".to_string(), format!("  {I141_ACTOR_A}  "),
+                         I141_ACTOR_B.to_string(), "  ".to_string(), "0".to_string()];
+        let sqlx_batch = batch.clone();
+        let sqlx_actors = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.create_cc_instance_if_absent(iid, I141_SENDER, &sqlx_batch).unwrap();
+            repo.find_cc_actor_ids(iid).unwrap()
+        }).await;
+
+        let mem = jeeflow_core::MemoryRepository::new();
+        let mut define = ProcessDefine {
+            id: 0, name: "mem_141_g10".into(), display_name: "141".into(),
+            define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+            version: 1, create_time: None, create_user: None, update_time: None, update_user: None,
+        };
+        mem.save_define(&mut define).unwrap();
+        let mut inst = ProcessInstance {
+            instance_id: 0, parent_id: None, define_id: define.id, state: 10,
+            parent_node_name: None, business_no: Some("biz-mem-141-g10".into()),
+            operator: "i141_op_a".into(), expire_time: None,
+            variables: jeeflow_core::json::FlowData::new(),
+            tasks: vec![], create_time: None, create_user: None,
+            update_time: None, update_user: None, define: None,
+        };
+        mem.save_instance(&mut inst).unwrap();
+        mem.create_cc_instance_if_absent(inst.instance_id, I141_SENDER, &batch).unwrap();
+        let mem_actors = mem.find_cc_actor_ids(inst.instance_id).unwrap();
+
+        assert_eq!(sqlx_actors, mem_actors,
+            "141 G10 两仓写侧必须同答案（sqlx={sqlx_actors:?} memory={mem_actors:?}）");
+        assert_eq!(sqlx_actors, vec![I141_ACTOR_A.to_string(), I141_ACTOR_B.to_string(), "0".to_string()],
+            "G10：两仓都只落有效且 trim 后的人（'0' 是有效 id，保留）");
+        clean_i141(&pool).await;
+    }
+
     // ─── 141 用例的 PageQuery 夹具（两仓共用同一支构造，判据才可比）───
+
 
     fn ids_of(page: &PageResult<InstanceRow>) -> Vec<i64> {
         page.rows.iter().map(|r| r.id).collect()
