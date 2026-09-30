@@ -249,22 +249,14 @@ impl JeeflowEngineImpl {
         // 前端「指定下一节点处理人」UserSelect 是 multiple，提交值是**数组**；也可能有
         // 字符串逗号分隔的旧形态——两种都收，否则数组形态 get_str 取不到 → 落到 assignee
         // 字面量，指定下一节点处理人不生效（e2e S15 红：指定刘洋后 gm_approve 仍是 chenhong）。
-        if let Some(v) = exec.args.get("tf_nextNodeOperator") {
-            let list: Vec<String> = match v {
-                JsonValue::Array(items) => items
-                    .iter()
-                    .filter_map(|it| it.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
-                _ => v
-                    .as_str()
-                    .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
-                    .unwrap_or_default(),
-            };
-            if !list.is_empty() {
-                return list;
-            }
+        //
+        // issues/142 B 批 · spec 06 §2.11「两形同判据」：拆形＋判据整体复用 [`parse_actor_ids`]
+        // （与抄送三条入口同一支单点，不抄第二份）。改前的消费腿是数组臂只收 `it.as_str()`
+        // ⇒ **数字元素被静默丢弃**（别栈收成字符串），指定纯数字用户 id 时整档落回 assignee；
+        // 而且数组臂不折叠、串臂 trim＋丢空——两形两个答案。归一后 `"0"` 照旧是有效 id（哨兵）。
+        let next_operators = parse_actor_ids(exec.args.get("tf_nextNodeOperator"));
+        if !next_operators.is_empty() {
+            return next_operators;
         }
 
         // Priority 2: assignee literal
@@ -1580,13 +1572,15 @@ fn custom_unregistered_clazz_warning(node_id: &str, clazz: &str) -> String {
 }
 
 /// 取本次刚建出的那条任务（聚合根里 push 的是克隆，两份都要写才算落库）。
-/// 解析发起时抄送人（对齐 Go facade.go:203 issues/56 E28）：
-/// 支持 JSON 数组（vben 多选 ApiSelect 提交）与逗号分隔字符串两种形态。
+/// 解析**参与者集合**（逗号串／JSON 数组两形）⇒ 原始拆形后统一交给
+/// [`crate::model::normalize_actors`]（spec 06-facade.md §2.10「空不创建行」＋ §2.11
+/// 「两形同判据」），与门面腿、两仓写侧共用同一枚判据。
 ///
-/// 形状判定（trim／丢空／折叠）不在本函数里自造——拆成原始串集合后统一交给
-/// [`crate::model::normalize_cc_actors`]（issues/141 G10「空不创建行」，spec 06 §2.10），
-/// 与门面手动腿、两仓写侧共用同一条判据。
-fn parse_cc_actors(v: Option<&JsonValue>) -> Vec<String> {
+/// issues/142 B 批把它从"抄送专用"升格为通用单点：抄送三条入口与消费腿
+/// `f_nextNodeOperator`／`tf_nextNodeOperator` **共用这一支**，不再各写一份拆形判据。
+/// 数组元素一律收成字符串（`null` 丢弃），**不得静默丢弃数字元素**（旧形状只收 `as_str()`
+/// ⇒ 指定纯数字用户 id 时整档落回 assignee 字面量），也不得串化成类型名。
+fn parse_actor_ids(v: Option<&JsonValue>) -> Vec<String> {
     let Some(v) = v else { return Vec::new(); };
     let raw: Vec<String> = match v {
         // 数组：逐项取原始标量（对齐 Go fmt.Sprintf("%v", a)，兼容字符串/数字 id）。
@@ -1601,16 +1595,23 @@ fn parse_cc_actors(v: Option<&JsonValue>) -> Vec<String> {
                 _ => None,
             })
             .collect(),
-        // 逗号分隔字符串：只拆不判，判据与数组腿同一条腿（G10 要求两形同判）
+        // 标量数字/布尔（`tf_nextNodeOperator: 1001` 这类单值形态）同样收进来，不吃掉
+        JsonValue::Number(n) => vec![format!("{}", *n as i64)],
+        JsonValue::Bool(b) => vec![b.to_string()],
+        // 逗号分隔字符串：只拆不判，判据与数组腿同一条腿（§2.11 要求两形同判）
         JsonValue::Str(s) => s.split(',').map(|x| x.to_string()).collect(),
         _ => Vec::new(),
     };
-    // issues/141 G10「空不创建行」（spec 06 §2.10）：逐项 trim、空串/纯空白丢弃、
-    // 同一次调用内重复折叠；丢完为空 ⇒ 两个调用点（发起腿/办理腿的 `if !cc_actors.is_empty()`）
-    // 既不建 cc 行也不 fire 码 4。改前本函数只有 `retain(|s| !s.is_empty())`：
-    // 数组腿的 `"  "`/`"\t"` 原样活着且不 trim ⇒ 真落 `actor_id='  '` 的行并照旧 fire，
-    // 还与 issues/141 G2 写侧判重错开（`" a "` 与 `"a"` 落两行）。写侧另有第二层兜底。
-    crate::model::normalize_cc_actors(&raw)
+    // §2.10/§2.11：逐项 trim、空串/纯空白丢弃、同一次调用内重复折叠；
+    // 丢完为空 ⇒ 抄送调用点既不建 cc 行也不 fire 码 4，参与者调用点则落回下一档判据。
+    // 反向哨兵：`"0"` 是正常 id，不得被当成空值丢掉。
+    crate::model::normalize_actors(&raw)
+}
+
+/// 抄送三条入口的旧名转发（issues/141 G10 落地的调用点都叫这个名）。
+/// 判据本体已上移为 [`parse_actor_ids`]——**同一枚尺子，不抄第二份**（spec 06 §2.11 尾注）。
+fn parse_cc_actors(v: Option<&JsonValue>) -> Vec<String> {
+    parse_actor_ids(v)
 }
 
 // ═══════════════════════════════════════════════════════
@@ -4859,5 +4860,135 @@ mod custom_node_tests {
         assert_eq!(repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state,
             InstanceState::Doing.code(), "实例停在未知节点处（照 java 跳过节点＝令牌不前进）");
         assert_eq!(csm_seq(&rec), vec!["PROCESS_INSTANCE_START"], "未知档不产生任何任务事件");
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// issues/142 B 批 · 消费腿 `tf_nextNodeOperator` 两形同判据（spec 06-facade.md §2.11 表第三行）
+//   普查实读的 rust 形状：消费腿数组臂只收 `it.as_str()` ⇒ **数字元素被静默丢弃**
+//   （别栈把数字收成字符串），指定纯数字用户 id 时整档落回 assignee 字面量；
+//   而且串臂 trim＋丢空、数组臂不折叠＝两形两个答案。
+//   判据本体＝`crate::model::normalize_actors`，拆形单点＝本文件的 `parse_actor_ids`
+//   （抄送三条入口的 `parse_cc_actors` 已改成它的别名转发，两枝共用一枚尺子）。
+// ═══════════════════════════════════════════════════════
+#[cfg(test)]
+mod actor_i142_tests {
+    use super::*;
+    use crate::id_gen::AtomicIdGenerator;
+    use crate::memory::MemoryRepository;
+
+    /// 一条只有 approve 任务节点的流（`assignee` 字面量 zhangsan），返回 (engine, repo, define_id)。
+    fn i142_engine(name: &str) -> (JeeflowEngineImpl, Arc<MemoryRepository>, i64) {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let content = format!(
+            r#"{{"name":"{name}","displayName":"142 B","type":"approval",
+               "nodes":[
+                 {{"id":"start","type":"snaker:start","properties":{{}},"text":{{"value":"开始"}}}},
+                 {{"id":"approve","type":"snaker:task","properties":{{"assignee":"zhangsan"}},"text":{{"value":"审批"}}}},
+                 {{"id":"end","type":"snaker:end","properties":{{}},"text":{{"value":"结束"}}}}
+               ],
+               "edges":[
+                 {{"id":"e1","sourceNodeId":"start","targetNodeId":"approve","properties":{{}}}},
+                 {{"id":"e2","sourceNodeId":"approve","targetNodeId":"end","properties":{{}}}}
+               ]}}"#);
+        let mut define = ProcessDefine {
+            id: 0, name: name.into(), display_name: name.into(),
+            define_type: "approval".into(), state: 1, content: content.as_bytes().to_vec(),
+            version: 1, create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        repo.save_define(&mut define).unwrap();
+        (JeeflowEngineImpl::new(ctx), repo, define.id)
+    }
+
+    /// 以 `tf_nextNodeOperator` 给定形态发起，取 approve 行的参与者台账（写侧落库值）。
+    async fn actors_by_next_operator(name: &str, value: JsonValue) -> Vec<String> {
+        let (engine, repo, did) = i142_engine(name);
+        let mut args = FlowData::new();
+        args.insert("tf_nextNodeOperator".to_string(), value);
+        let inst = engine.start_async(did, "zhangsan", &args).await.unwrap();
+        let doing = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
+        assert_eq!(doing.len(), 1, "夹具前提：只有一条 approve 待办");
+        repo.find_task_actors(doing[0].task_id).unwrap()
+    }
+
+    /// 消费腿数组形态：**数字元素收成字符串**、空白丢弃、值取 trim 后的串、`"0"` 照旧有效。
+    /// 改前实测（数组臂只 `it.as_str()`，还原跑一次的红格读数）：台账是 `["1002","0"]`，
+    /// 期望 `["1001","1002","0"]` —— 数字 id `1001` 被静默丢弃（别栈收成字符串）。
+    #[tokio::test]
+    async fn test_i142_b_next_node_operator_array_keeps_numeric_elements() {
+        let actors = actors_by_next_operator("i142_b_num_arr", JsonValue::Array(vec![
+            JsonValue::Number(1001.0),
+            JsonValue::Str(" 1002 ".into()),
+            JsonValue::Str("".into()),
+            JsonValue::Str("   ".into()),
+            JsonValue::Null,
+            JsonValue::Str("0".into()),
+        ])).await;
+        assert_eq!(actors, vec!["1001".to_string(), "1002".to_string(), "0".to_string()],
+            "§2.11：数组元素不得静默丢弃／串化成类型名，null 丢弃，'0' 是正常 id（哨兵）");
+    }
+
+    /// 消费腿**两形同判据**：同一批人换两种写法 ⇒ 参与者台账逐字相同（§2.11 反面即 java 现状
+    /// "串腿 trim＋丢空、数组腿照落"，rust 同一族病灶的表现是数组臂丢数字元素＝同组第一格）。
+    /// 如实记一笔：本组三档在**改前也不红**——旧数组臂对纯字符串元素恰好也 trim＋丢空，
+    /// 与串腿撞出同一个答案；它钉的是新形状下"折叠＋空白档"两形恒等，防的是日后只改一条腿。
+    #[tokio::test]
+    async fn test_i142_b_next_node_operator_both_forms_same_judgement() {
+        for (i, (csv, arr, want)) in [
+            ("1001, 1002 ,,0", vec!["1001", " 1002 ", "", "0"],
+             vec!["1001", "1002", "0"]),
+            (" i142x ,i142x,  ", vec![" i142x ", "i142x", "  "], vec!["i142x"]),
+            ("0,, ", vec!["0", "", " "], vec!["0"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let from_csv = actors_by_next_operator(
+                &format!("i142_b_csv_{i}"), JsonValue::Str(csv.to_string())).await;
+            let from_arr = actors_by_next_operator(
+                &format!("i142_b_arr_{i}"),
+                JsonValue::Array(arr.iter().map(|s| JsonValue::Str(s.to_string())).collect())).await;
+            let want_v: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            assert_eq!(from_csv, from_arr,
+                "§2.11 两形同判据第 {i} 档：逗号串 {csv:?} 与数组 {arr:?} 必须同答案，\
+                 实得 {from_csv:?} / {from_arr:?}");
+            assert_eq!(from_csv, want_v, "第 {i} 档：落库值＝trim 后且折叠的人");
+        }
+    }
+
+    /// 拆形单点的判据本体：两形同判 ＋ 数字/布尔收成字符串 ＋ 旧名转发同答案。
+    /// （`parse_cc_actors` 改名为通用 `parse_actor_ids` 后旧名只转发 ⇒ 这一格钉"一枚判据
+    /// 两个名字"，防的是日后有人往任何一枝里另抄一份尺子。）
+    #[test]
+    fn test_i142_b_parse_actor_ids_is_the_single_judge() {
+        for (raw_csv, arr) in [
+            ("7701,,7702", vec!["7701", "", "7702"]),
+            (" i142y ,i142y,", vec![" i142y ", "i142y", ""]),
+            ("", vec!["", "  ", "\t"]),
+        ] {
+            let csv = JsonValue::Str(raw_csv.to_string());
+            let array = JsonValue::Array(arr.iter().map(|s| JsonValue::Str(s.to_string())).collect());
+            let from_csv = parse_actor_ids(Some(&csv));
+            let from_arr = parse_actor_ids(Some(&array));
+            assert_eq!(from_csv, from_arr, "两形同判据：{raw_csv:?} vs {arr:?}");
+            assert!(from_csv.iter().all(|s| !s.trim().is_empty() && s == s.trim()),
+                "归一后不得残留空值或未 trim 的值：{from_csv:?}");
+            assert_eq!(parse_cc_actors(Some(&csv)), from_csv,
+                "旧名必须转发到同一枚判据（抄送腿与任务腿一把尺子）");
+            assert_eq!(parse_cc_actors(Some(&array)), from_arr, "旧名数组腿同判");
+        }
+        // 数字/布尔元素收成字符串（别栈在这里串化成 "null"/"<nil>"，rust 的旧形状是直接丢掉）
+        assert_eq!(parse_actor_ids(Some(&JsonValue::Array(vec![
+            JsonValue::Number(1001.0), JsonValue::Bool(true), JsonValue::Null,
+            JsonValue::Str(" u ".into())]))),
+            vec!["1001".to_string(), "true".to_string(), "u".to_string()],
+            "标量元素收进来，null 丢弃，值再 trim");
+        // 反向哨兵
+        assert_eq!(parse_actor_ids(Some(&JsonValue::Array(vec![JsonValue::Str("0".into())]))),
+            vec!["0".to_string()], "哨兵：'0' 不得被当成空值丢掉");
     }
 }

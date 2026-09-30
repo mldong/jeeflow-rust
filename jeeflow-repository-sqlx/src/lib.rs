@@ -424,6 +424,20 @@ async fn select_cc_actor_ids(pool: &MySqlPool, instance_id: i64) -> JeeflowResul
     Ok(rows.iter().map(|r| r.get::<String, _>("actor_id")).collect())
 }
 
+/// 任务参与者台账的读侧单点（`wf_process_task_actor.actor_id`）。
+/// issues/142 B 批：`find_task_actors` 与 `add_task_actor` 的写侧判重共用这一支，
+/// 不另抄第二份 SELECT——判重与读回必须看到同一批行。逐行返回，**不加 DISTINCT**
+/// （与 [`select_cc_actor_ids`] 同口径：判重只看"这个人在这个任务上有没有行"，
+/// 存量脏行原样留着，issues/141 G2 owner 拍板）。
+async fn select_task_actor_ids(pool: &MySqlPool, task_id: i64) -> JeeflowResult<Vec<String>> {
+    let rows = sqlx::query("SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ?")
+        .bind(task_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+    Ok(rows.iter().map(|r| r.get::<String, _>("actor_id")).collect())
+}
+
 impl ProcessRepository for SqlxRepository {
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>> {
         self.block_on(async {
@@ -782,19 +796,28 @@ impl ProcessRepository for SqlxRepository {
     }
 
     fn find_task_actors(&self, task_id: i64) -> JeeflowResult<Vec<String>> {
-        self.block_on(async {
-            let rows = sqlx::query("SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ?")
-                .bind(task_id)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
-            Ok(rows.into_iter().map(|r| r.get::<String, _>("actor_id")).collect())
-        })
+        self.block_on(async { select_task_actor_ids(&self.pool, task_id).await })
     }
 
     fn add_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()> {
         self.block_on(async {
-            for actor in actors {
+            // issues/142 B 批 · spec 06-facade.md §2.11 的**写侧兜底层**，与内存仓
+            // `MemoryRepository::add_task_actor` 同一条判据（判据本体＝
+            // `jeeflow_core::model::normalize_actors`，与抄送侧 §2.10 同一枚单点）：
+            // 逐元素 trim ⇒ 空串/纯空白丢弃 ⇒ 同一次调用内折叠，落库与比较一律取 trim 后的串。
+            // 改前本仓是**盲插**（无判空、无 trim、无判重），而同栈内存仓判重 ⇒ 同一串入参
+            // 两仓两个答案（issues/117 场景 27 那把尺子点名的形状），绕过门面直连仓储的调用方
+            // 能在真库里灌空值/灌重复——空归属值正是 issues/129 那族"空 operator 读全库"的进水口。
+            // 反向哨兵（§2.11 硬要求④）：`"0"`／`"00"` 是正常 id，不得被当成空值丢掉。
+            let normalized = jeeflow_core::model::normalize_actors(actors);
+            // 判重的读侧放在写侧这一层（与 create_cc_instance 同姿势）：先取快照再插，
+            // 已有同一人的行 ⇒ 幂等空操作；同一次调用内重复也给同一个人也只落一行。
+            let mut existing = select_task_actor_ids(&self.pool, task_id).await?;
+            for actor in &normalized {
+                if existing.iter().any(|a| a == actor) {
+                    continue;
+                }
+                existing.push(actor.clone());
                 // 规范表 wf_process_task_actor.id NOT NULL 无默认值：由应用层雪花生成
                 // （对齐 Java insertTaskActors 的 nextId()；漏 id 会 1364，startAndExecute 全挂）。
                 let actor_row_id = self.next_id();
@@ -812,8 +835,13 @@ impl ProcessRepository for SqlxRepository {
     }
 
     fn remove_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()> {
+        // issues/142 §9.2 第二批（spec 06 §2.11 删除位与写侧同一条尺子）：删除列表先过
+        // `model::normalize_actors`（与内存仓同一枚）——「 8601 」删得掉库里的 8601；
+        // 归一后为空 ⇒ 一条 DELETE 都不发（空串入参批量误删历史 actor_id='' 脏行）。
+        let remove = jeeflow_core::model::normalize_actors(actors);
+        if remove.is_empty() { return Ok(()); }
         self.block_on(async {
-            for actor in actors {
+            for actor in &remove {
                 sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id = ?")
                     .bind(task_id)
                     .bind(actor)
@@ -3947,5 +3975,190 @@ mod tests {
 
             clean_by_define(&pool, define_id).await;
         });
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/142 B 批 · 任务参与者写侧归属值归一（sqlx 真库这一支 · spec 06 §2.11）
+    //   普查实读的 rust 形状：**两仓分叉**——本仓 `add_task_actor` 是盲插（无判空、无 trim、
+    //   **连判重都没有**），而同栈内存仓判重 ⇒ 同一串入参两仓两个答案，正是 issues/117
+    //   场景 27 那把尺子点名的形状；绕过门面直连仓储的调用方能在真库里灌空值/灌重复，
+    //   空归属值又是 issues/129 那族"空 operator 读全库"的上游进水口。
+    //   判据本体＝`jeeflow_core::model::normalize_actors`（与抄送侧 §2.10 同一枚单点，不抄第二份）。
+    //   ID 段：9142xx（本组独占，避开 900xxx／9141xx 既有用例段）；`wf_process_task_actor`
+    //   无外键约束（C10 用例同姿势），参与者台账可独立于任务行读写。
+    // ═══════════════════════════════════════════════════════
+
+    const I142_ACTOR_A: &str = "u142a";
+    const I142_ACTOR_B: &str = "u142b";
+
+    async fn clean_i142_task_actor(pool: &MySqlPool, task_id: i64) {
+        sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ?")
+            .bind(task_id).execute(pool).await.unwrap();
+    }
+
+    /// 台账原始行（读的是**库里的列**，按 id 排序＝落库顺序；不走 `find_task_actors` 那条无 ORDER BY 的路径）。
+    async fn task_actor_rows(pool: &MySqlPool, task_id: i64) -> Vec<String> {
+        sqlx::query("SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ? ORDER BY id")
+            .bind(task_id).fetch_all(pool).await.unwrap()
+            .iter().map(|r| r.get::<String, _>("actor_id")).collect()
+    }
+
+    /// 写侧兜底（§2.11 硬要求①）：空串／纯空白即使**绕过门面直连仓储**也进不了归属列。
+    /// 改前实测（真库）：三行原样落进 `wf_process_task_actor`，`actor_id=''`／`'   '`／制表符各一条。
+    #[tokio::test]
+    async fn test_mysql_i142_b_add_task_actor_blank_values_write_nothing() {
+        let task_id: i64 = 914201;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            SqlxRepository::new(pool2)
+                .add_task_actor(task_id, &["".into(), "   ".into(), "\t".into()]).unwrap();
+        }).await;
+
+        assert_eq!(task_actor_rows(&pool, task_id).await, Vec::<String>::new(),
+            "§2.11：全空白批次不得落进 actor_id（真库读回）");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// 落库值取 trim 后的串（§2.11 硬要求②）：`"  u142a  "` 在库里必须是 `"u142a"`。
+    #[tokio::test]
+    async fn test_mysql_i142_b_add_task_actor_values_are_trimmed() {
+        let task_id: i64 = 914202;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        let pool2 = pool.clone();
+        let padded = format!("  {I142_ACTOR_A}  ");
+        run_sync(move || {
+            SqlxRepository::new(pool2).add_task_actor(task_id, &[padded]).unwrap();
+        }).await;
+
+        assert_eq!(task_actor_rows(&pool, task_id).await, vec![I142_ACTOR_A.to_string()],
+            "§2.11：入库值＝trim 后的串");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// 同一次调用内折叠 ＋ 跨调用判重（**本仓改前连判重都没有**，内存仓有 ⇒ 补齐成两仓同形）。
+    #[tokio::test]
+    async fn test_mysql_i142_b_add_task_actor_folds_within_and_across_calls() {
+        let task_id: i64 = 914203;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        let pool2 = pool.clone();
+        let first = vec![format!("  {I142_ACTOR_A}  "), I142_ACTOR_A.to_string(),
+                         "".to_string(), I142_ACTOR_B.to_string()];
+        run_sync(move || {
+            SqlxRepository::new(pool2).add_task_actor(task_id, &first).unwrap();
+        }).await;
+        assert_eq!(task_actor_rows(&pool, task_id).await,
+            vec![I142_ACTOR_A.to_string(), I142_ACTOR_B.to_string()],
+            "§2.11：一次调用里 trim 后同值＝同一个人 ⇒ 只落一行，空值丢弃");
+
+        let pool3 = pool.clone();
+        let again = format!(" {I142_ACTOR_A} ");
+        run_sync(move || {
+            SqlxRepository::new(pool3).add_task_actor(task_id, &[again]).unwrap();
+        }).await;
+        assert_eq!(task_actor_rows(&pool, task_id).await,
+            vec![I142_ACTOR_A.to_string(), I142_ACTOR_B.to_string()],
+            "§2.11 写侧兜底：跨调用重复给同一人（带空格）⇒ 幂等空操作，不得落第二行");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// 反向哨兵（§2.11 硬要求④）：`"0"`、`"00"`、`" "`、`"a"` 是**三个人**。
+    /// 改前实测（真库）：四条全盲插 ⇒ 台账里躺着 `actor_id=' '` 那一行（判空没 trim）。
+    #[tokio::test]
+    async fn test_mysql_i142_b_sentinel_four_are_three_people() {
+        let task_id: i64 = 914204;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            SqlxRepository::new(pool2)
+                .add_task_actor(task_id, &["0".into(), "00".into(), " ".into(), "a".into()]).unwrap();
+        }).await;
+
+        assert_eq!(task_actor_rows(&pool, task_id).await,
+            vec!["0".to_string(), "00".to_string(), "a".to_string()],
+            "哨兵：'0'/'00'/'a' 都是正常 id，只有 ' ' 是空值；'00' 与 '0' 是两个人，不得被松散判重吞掉");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// 两仓同答案（issues/117 场景 27 那把尺子）：同一批含空值/带空格的入参，内存仓与 SQL 仓
+    /// 落库的人员集合必须逐字一致——只修一层就会出现"一个仓收、一个仓不收"的分叉。
+    #[tokio::test]
+    async fn test_mysql_i142_b_two_repos_same_answer_on_task_actors() {
+        let task_id: i64 = 914205;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        let batch = vec!["".to_string(), format!("  {I142_ACTOR_A}  "), I142_ACTOR_B.to_string(),
+                         "  ".to_string(), "0".to_string(), I142_ACTOR_A.to_string()];
+        let want = vec![I142_ACTOR_A.to_string(), I142_ACTOR_B.to_string(), "0".to_string()];
+
+        let pool2 = pool.clone();
+        let sqlx_batch = batch.clone();
+        let sqlx_actors = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.add_task_actor(task_id, &sqlx_batch).unwrap();
+            repo.find_task_actors(task_id).unwrap()
+        }).await;
+        assert_eq!(sqlx_actors, want, "SQL 仓写侧：只落有效且 trim 后的人（'0' 保留）");
+
+        let mem = jeeflow_core::MemoryRepository::new();
+        mem.add_task_actor(task_id, &batch).unwrap();
+        let mem_actors = mem.find_task_actors(task_id).unwrap();
+        assert_eq!(mem_actors, want, "内存仓写侧：同一枚判据");
+
+        assert_eq!(sqlx_actors, mem_actors,
+            "§2.11：两仓 add_task_actor 必须同答案（sqlx={sqlx_actors:?} memory={mem_actors:?}）");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// 删除位（issues/142 §9.2 第二批）真库读数：「 8601 」删得掉库里的 8601；
+    /// 归一后为空 ⇒ 一条 DELETE 都不发——真库插一条 actor_id='' 的历史脏行，
+    /// 空串入参不得批量误删。改前实测（真库）：DELETE 拿未 trim 原值 ⇒ 静默 no-op。
+    #[tokio::test]
+    async fn test_mysql_i142_b_remove_task_actor_trims_and_blank_is_noop() {
+        let task_id: i64 = 914206;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        let pool2 = pool.clone();
+        let padded = format!("  {I142_ACTOR_A}  ");
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.add_task_actor(task_id, &[padded]).unwrap();
+            // 带空格的删除必须打得中 trim 后的行
+            repo.remove_task_actor(task_id, &[format!("  {I142_ACTOR_A}  ")]).unwrap();
+            // 历史脏行（旧版本写进去的 actor_id=''）：空串/全空白入参一条都不许删。
+            // run_sync 的闭包是同步的，INSERT 走仓内同一枚 block_on（与 repo 同步方法同口径）。
+            repo.block_on(async {
+                sqlx::query("INSERT INTO wf_process_task_actor (id, process_task_id, actor_id) VALUES (914206001, ?, '')")
+                    .bind(task_id).execute(repo.pool()).await
+            }).unwrap();
+            repo.remove_task_actor(task_id, &["".to_string(), "   ".to_string()]).unwrap();
+            repo.remove_task_actor(task_id, &[]).unwrap();
+        }).await;
+
+        assert_eq!(task_actor_rows(&pool, task_id).await, vec!["".to_string()],
+            "§9.2 删除位：trim 命中 + 空档零删除，脏行原样保留");
+        clean_i142_task_actor(&pool, task_id).await;
     }
 }

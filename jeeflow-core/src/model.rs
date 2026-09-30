@@ -806,32 +806,39 @@ pub fn has_effective_cc_ownership(query: &PageQuery) -> bool {
     false
 }
 
-/// **抄送人集合归一**的唯一判据出口（issues/141 G10「空不创建行」· spec 06-facade.md §2.10；
-/// 基准＝jeeflow-java `5fbd5ac` 的 `StringUtils.normalizeCcActors`）。
+/// **归属值集合归一**的唯一判据出口（spec 06-facade.md §2.10 ＋ §2.11；
+/// 基准＝jeeflow-java `5fbd5ac` 的 `StringUtils.normalizeCcActors`；issues/142 B 批按 owner
+/// 拍板「八栈一起收：两形同判据＋写侧兜底＋trim＋哨兵」，把同一枚尺子从抄送侧搬到任务侧，
+/// **严禁另抄第二份判据**——两份判据迟早分叉）。
 ///
-/// 逐元素 **trim ⇒ 空串/纯空白丢弃 ⇒ 同一次调用内的重复折叠（顺序保持）**。
-/// 三条入口（发起 `f_ccActors`／办理 `tf_ccActors`／门面手动
-/// `processInstance/createCCInstance`）解析出的**逗号串与数组两种形态**都必须过这一支，
-/// 丢完为空 ⇒ 调用方**不建任何 cc 行、也不 fire `CC_CREATE`(码 4)**。
+/// 判据三件事，顺序固定：**逐元素 trim ⇒ 空串/纯空白丢弃 ⇒ 同一次调用内的重复折叠（顺序保持）**。
+/// 落库与比较一律取 **trim 后的串**（`" 123 "` 与 `"123"` 是同一个人；不 trim 就会与
+/// issues/141 G2 的写侧判重错开，同一人落两行）。
+/// 覆盖的写点（spec §2.11 表，全部走这一支，**逗号串与数组两形同判据**）：
+/// - 抄送三条入口：发起 `f_ccActors`／办理 `tf_ccActors`／门面手动 `createCCInstance`
+///   —— 丢完为空 ⇒ 调用方**不建任何 cc 行、也不 fire `CC_CREATE`(码 4)**；
+/// - 任务侧 `processTask/addCandidate`／`processTask/surrogate` 的 `actorIds`
+///   （门面 `arg_actor_ids` 两条腿）与 `transfer` 的 `fromActor`/`toActor`；
+/// - 消费腿 `f_nextNodeOperator`／`tf_nextNodeOperator`（数组元素**不得**被静默丢弃，
+///   数字元素 `to_string` 之后照样过这一支）；
+/// - 两仓 `add_task_actor`／`create_cc_instance` 的**写侧兜底**（本函数不认主键，
+///   只归一归属值集合）。
 ///
-/// 本仓的两处旧形状正是这一条要堵的洞（普查读数见 `docs`／收口报告）：
-/// - [`crate::engine`] 的 `parse_cc_actors` 与门面 `arg_actor_ids` 的**数组腿**只做
-///   `retain(!is_empty())`——纯空白元素（`"  "`／`"\t"`）原样活着 ⇒ 真落一条
-///   `actor_id='  '` 的 cc 行并照旧 fire；同一支的逗号串腿却 trim＋丢空。
-///   **两条腿两个答案**，正是条文点名的"只修一条腿"。
-/// - 数组元素不 trim ⇒ `" a "` 与 `"a"` 落成两行，把 issues/141 G2 的写侧判重
-///   （本仓 `53c1d28` 的 `find_cc_actor_ids`／`create_cc_instance_if_absent`）直接打穿。
-/// - 空归属值正是 issues/129 那族"空 operator 读全库"的病根，不能从抄送侧继续往里灌。
-///
-/// 判据落在**两层**，缺一层就还能灌进空值（spec §2.10 实现要求①）：
-/// ① 漏斗层＝`parse_cc_actors`（引擎两条腿共用）＋门面手动腿；
-/// ② 写侧层＝两仓 `create_cc_instance`（[`crate::memory::MemoryRepository`] /
+/// 判据落在**两层**，缺一层就还能灌进空值（spec §2.10 实现要求①／§2.11 硬要求①）：
+/// ① 漏斗层＝`parse_cc_actors`（引擎两条腿共用）＋门面腿；
+/// ② 写侧层＝两仓 `add_task_actor`／`create_cc_instance`（[`crate::memory::MemoryRepository`] /
 ///    `SqlxRepository`）与 [`crate::spi::ProcessRepository::create_cc_instance_if_absent`]
-///    default——绕过引擎/门面直连仓储的第三方调用方同样建不出空行。
+///    default——绕过引擎/门面的第三方调用方（集成层）同样灌不进空值。
 ///
-/// 反向哨兵（spec §2.10 实现要求④）：这一支**只吃空值**，`"0"` 这类"看起来像空"的正常 id
-/// 不得被丢掉。
-pub fn normalize_cc_actors(raw: &[String]) -> Vec<String> {
+/// 空入参档不在本函数：本函数只归一；返回空集合后由调用方按**各仓既有的"缺参数"错误信封**
+/// 报错（§2.11 硬要求③，不新造错误码/文案）。主键类参数（`processTaskId`）另判一档、
+/// 不参与归属值归一——归属值可有可无，主键没给就是调用方写错了。
+///
+/// 反向哨兵（spec §2.10 实现要求④／§2.11 硬要求④）：这一支**只吃空值**，
+/// `"0"`／`"00"`／`" "`／`"a"` 是四个人，`"0"` 这类"看起来像空"的正常 id **不得**被丢掉；
+/// 判空一律 `trim().is_empty()`，严禁不 trim 就 `is_empty()`（旧形状：数组腿只
+/// `filter(!s.is_empty())` ⇒ `"  "` 存活并真落进 `actor_id`，而串腿才 trim＝两条腿两个答案）。
+pub fn normalize_actors(raw: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
     for actor in raw {
         let trimmed = actor.trim();
@@ -844,6 +851,16 @@ pub fn normalize_cc_actors(raw: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// 抄送侧的旧名转发（issues/141 G10 当年落地的就是这一枚单点；spec 06 §2.11 尾注
+/// 「各栈的归一判据请复用 §2.10 已落地的那一枚单点……必要时改名成通用的 `normalizeActors`」）。
+///
+/// 判据本体已上移为 [`normalize_actors`]；**保留本公开名是为了不破坏已发布 crate 的 API 面**——
+/// 两仓 `create_cc_instance`、引擎 `parse_cc_actors`、门面手动腿的调用点逐字不变。
+/// ⚠️ 任务侧新写点一律用 [`normalize_actors`]，不要再在这里长出抄送专属的第二条腿。
+pub fn normalize_cc_actors(raw: &[String]) -> Vec<String> {
+    normalize_actors(raw)
 }
 
 #[derive(Debug, Clone)]
@@ -1501,6 +1518,52 @@ mod tests {
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ─────────── issues/142 B 批 · 归属值写侧归一（§2.11 把 §2.10 的尺子搬到任务侧）───────────
+
+    /// 判据本体（任务侧与抄送侧共用同一枚 `normalize_actors`）：trim ⇒ 丢空 ⇒ 折叠，顺序保持。
+    #[test]
+    fn test_i142_b_normalize_actors_trims_drops_and_folds() {
+        assert_eq!(normalize_actors(&v(&["7501", "7502"])), v(&["7501", "7502"]),
+            "正向对照：正常值一个不吃、顺序不动");
+        assert_eq!(normalize_actors(&v(&[" 8301 ", "\tu9\n", "8302"])), v(&["8301", "u9", "8302"]),
+            "§2.11 要求②：落库与比较一律取 trim 后的值");
+        assert_eq!(normalize_actors(&v(&["8401", " 8401 ", "8401"])), v(&["8401"]),
+            "§2.11 要求②：trim 后同值＝同一个人 ⇒ 同一次调用内折叠（不 trim 就与写侧判重错开落两行）");
+        for blank in ["", " ", "   ", "\t", "\n", "\r\n", " \t\n "] {
+            assert!(normalize_actors(&v(&[blank])).is_empty(),
+                "§2.11：纯空白 {blank:?} 必须丢完 ⇒ 空集合，实得 {:?}", normalize_actors(&v(&[blank])));
+        }
+        assert_eq!(normalize_actors(&v(&["7601", "", "  ", "7602"])), v(&["7601", "7602"]),
+            "混给只丢空的");
+    }
+
+    /// 反向哨兵原文四档：`"0"`、`"00"`、`" "`、`"a"` 是**三个人**（`" "` 才是空值）。
+    /// 判空一律 `trim().is_empty()`，严禁拿"看起来像空/像假值"的判据吃正常 id。
+    #[test]
+    fn test_i142_b_normalize_actors_sentinel_four_are_three_people() {
+        assert_eq!(normalize_actors(&v(&["0", "00", " ", "a"])), v(&["0", "00", "a"]),
+            "§2.11 硬要求④：'0'/'00'/'a' 都是正常 id，只有纯空白 ' ' 是空值");
+        assert_eq!(normalize_actors(&v(&["0", "0"])), v(&["0"]), "同值折叠，但 '0' 本身不许被丢");
+        assert_eq!(normalize_actors(&v(&["00", "0"])), v(&["00", "0"]),
+            "'00' 与 '0' 是两个人（严禁松散比较把第二个人静默吞掉——php 本轮实测到的两把尺子）");
+    }
+
+    /// 一枚判据两个名字：`normalize_cc_actors`（§2.10 旧公开名）必须转发到 `normalize_actors`，
+    /// 两支对同一批入参**逐字同答案**——分叉的起点就是"抄第二份"。
+    #[test]
+    fn test_i142_b_cc_alias_forwards_to_the_single_judge() {
+        for batch in [
+            v(&["7501", " 7501 ", "", "  ", "0"]),
+            v(&["", "   ", "\t"]),
+            v(&["0", "00", " ", "a"]),
+            v(&[]),
+            v(&["x", "y", "x", " y "]),
+        ] {
+            assert_eq!(normalize_cc_actors(&batch), normalize_actors(&batch),
+                "§2.11 尾注：旧名只是转发，两枚名字必须同一判据（入参 {batch:?}）");
+        }
     }
 
     /// 正向对照：非空抄送人原样保留、顺序不动（判据不吃正常值）。

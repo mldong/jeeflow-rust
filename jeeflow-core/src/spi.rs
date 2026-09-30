@@ -35,7 +35,30 @@ pub trait ProcessRepository: Send + Sync {
 
     // ═══ Task actor operations ═══
     fn find_task_actors(&self, task_id: i64) -> JeeflowResult<Vec<String>>;
+    /// 任务参与者写入口（`wf_process_task_actor.actor_id`，**归属列**）。
+    ///
+    /// issues/142 B 批 · spec 06-facade.md §2.11「归属值写侧归一」的**写侧兜底层**义务
+    /// （与 [`Self::create_cc_instance`] 同一条尺子，只是换到任务侧）：入参集合必须自己再过一遍
+    /// [`crate::model::normalize_actors`]——**逐元素 trim、空串/纯空白丢弃、同一次调用内折叠**，
+    /// 落库值取 trim 后的串。判据必须落在这一层而不只落在门面/引擎漏斗里：绕过它们直连仓储的
+    /// 调用方（集成层、第三方仓储消费者）同样不得把空归属值灌进 `actor_id`——那正是 issues/129
+    /// 那族"空 operator 读全库"的上游进水口。
+    ///
+    /// ⚠️ 本仓两仓（内存仓 / sqlx 仓）**必须同答案**（issues/117 场景 27 那把尺子）：只有一仓
+    /// 挡空值＝"绕过门面"的调用方在真库里灌空值/灌重复。
+    ///
+    /// 反向哨兵（§2.11 硬要求④）：`"0"` 这类"看起来像空"的正常 id **不得**被当成空值丢掉。
+    ///
+    /// 主键另判一档：`task_id` 不是归属值，**不**参与归一——它是调用方给错了（缺失/空/0），
+    /// 由参数解析层响亮报错，不得拿 `0` 当 id 落库（§2.11 末段）。
     fn add_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()>;
+    /// 任务参与者删除（issues/142 §9.2 第二批 · §2.11 删除位与写侧同一条尺子）。
+    ///
+    /// 实现方必须：① 删除列表先过 [`crate::model::normalize_actors`]（与 [`Self::add_task_actor`]
+    /// 同一枚，不另立尺子）——存量行存的是 trim 后的串，入参带空格时按原样比会**静默不中**
+    /// （转办"摘原人"那一腿就落在这种"报成功却没删"上）；② **归一后为空 ⇒ 一条都不删**（早退）——
+    /// 空串入参在历史 `actor_id=''` 的脏行上会批量误删（issues/129 的删除位对偶）。
+    /// 本仓两仓（内存 / sqlx）都按这一条实现，同一条判据给同一个答案（issues/117 场景 27）。
     fn remove_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()>;
 
     // ═══ CC operations ═══
@@ -48,6 +71,13 @@ pub trait ProcessRepository: Send + Sync {
     /// 那族"空 operator 读全库"的病根。归一腿用 [`crate::model::normalize_cc_actors`]，
     /// 本仓两仓（内存仓 / sqlx 仓）共用它，覆写本方法的第三方仓储**也必须**过这一支。
     fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()>;
+    /// 抄送已读回写（`wf_process_cc_instance.state` → 1）。
+    ///
+    /// issues/142 B 批 · spec 06-facade.md §2.11 表第四行：入参 `actor_id`（门面的 `operator`）
+    /// **必须先归一再比**——取 trim 后的值，trim 后为空则按各仓既有的"缺参数/默认操作人"档处理。
+    /// 不归一就直接比，空 operator 会把 `state=1` 打到历史 `actor_id=''` 的脏行上（越权改别人的
+    /// 已读位），带空格的同一人又永远命不中。判据本体＝[`crate::model::normalize_actors`]
+    /// （单值档取归一后的那一个元素），**不要另抄一份 `trim()` 判据**。
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()>;
 
     /// issues/141 G2 写侧判重的**读侧**（spec 06 §4「抄送写侧判重＝幂等空操作」）：

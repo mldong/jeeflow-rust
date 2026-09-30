@@ -503,8 +503,18 @@ fn arg_id(args: &HashMap<String, Json>, keys: &[&str]) -> JeeflowResult<Option<i
 }
 
 /// Accept JSON array or comma-separated string → Vec<String>.
+///
+/// issues/142 B 批 · spec 06-facade.md §2.11「两形同判据」：两条腿只负责**拆形**，
+/// 拆完的原始串集合统一交给 [`normalize_actors`]（与抄送侧 §2.10、引擎消费腿
+/// `parse_actor_ids`、两仓 `add_task_actor` 写侧同一枚判据，**严禁第二份**）。
+///
+/// 改前形状（普查实读）：数组腿只做 `filter(|s| !s.is_empty())` ⇒ **不 trim**，
+/// `"  "`／`"\t"` 这类纯空白元素存活并真落进 `wf_process_task_actor.actor_id`，
+/// 同一次调用里的重复也不折叠；只有逗号串腿才 trim＋丢空——两形两个答案。
+/// 现在：逐元素 trim、空串/纯空白丢弃、同次调用折叠、数字元素收成字符串后**照样 trim**；
+/// `null` 元素丢弃（不串化成 `"null"`）；反向哨兵——`"0"` 是正常 id，不得被当成空值丢掉。
 fn arg_actor_ids(args: &HashMap<String, Json>) -> Vec<String> {
-    match args.get("actorIds") {
+    let raw: Vec<String> = match args.get("actorIds") {
         Some(Json::Array(arr)) => arr
             .iter()
             .filter_map(|v| {
@@ -518,15 +528,41 @@ fn arg_actor_ids(args: &HashMap<String, Json>) -> Vec<String> {
                     None
                 }
             })
-            .filter(|s| !s.is_empty())
             .collect(),
-        Some(Json::String(s)) => s
-            .split(',')
-            .map(|x| x.trim().to_string())
-            .filter(|x| !x.is_empty())
-            .collect(),
+        Some(Json::String(s)) => s.split(',').map(|x| x.to_string()).collect(),
         _ => Vec::new(),
+    };
+    normalize_actors(&raw)
+}
+
+/// 主键类参数**另判一档**（spec 06 §2.11 末段）：`processTaskId` 没给／给了 `0` 或负数
+/// ⇒ 响亮报错，不得拿 `''`/`0` 当 id 往下落库（归属值可有可无，主键没给就是调用方写错了）。
+/// 错误信封沿用本仓既有的"缺参数"文案（§2.11 硬要求③：不新造错误码/文案）；
+/// 空串形态在 [`arg_i64`] 里已经报「非法id: 」，这一支管"整条没给"和"给了 0/负数"两档。
+fn require_task_id(args: &HashMap<String, Json>, missing_msg: &str) -> JeeflowResult<i64> {
+    let task_id = arg_id(args, &["processTaskId", "id"])?
+        .ok_or_else(|| JeeflowError::Business(missing_msg.to_string()))?;
+    if task_id <= 0 {
+        return Err(JeeflowError::Business(missing_msg.to_string()));
     }
+    Ok(task_id)
+}
+
+/// 单值归属参数归一后再用（spec 06 §2.11 表第二行：`transfer` 的 `fromActor`/`toActor`
+/// 现在各栈只判必填、存的是未 trim 的原值）。必填校验仍走 [`require_non_empty`]
+/// （既有"缺参数"信封逐字不动），随后把值交给 §2.10/§2.11 那一枚单点取 trim 后的串 ⇒
+/// 落库与归属比较（`operator != from_actor`、`find_task_actors` 命中判定）用的是同一个尺度。
+/// 判空一律 `trim().is_empty()`：`"0"` 是正常 id，不得被当成空值丢掉。
+fn require_normalized_actor(
+    args: &HashMap<String, Json>,
+    key: &str,
+    msg: &str,
+) -> JeeflowResult<String> {
+    let raw = require_non_empty(args, key, msg)?;
+    normalize_actors(&[raw])
+        .into_iter()
+        .next()
+        .ok_or_else(|| JeeflowError::Business(msg.to_string()))
 }
 
 fn arg_ids(args: &HashMap<String, Json>) -> JeeflowResult<Vec<i64>> {
@@ -960,10 +996,13 @@ impl JeeflowFacade {
         for task in &tasks {
             let _ = self.repo.add_task_actor(task.task_id, &[operator.clone()]);
             flow_data.insert_i64("submitType", 0); // Apply
-            // f_nextNodeOperator → tf_nextNodeOperator（若有）
-            if let Some(next_op) = flow_data.get_str("f_nextNodeOperator") {
-                let v = next_op.to_string();
-                flow_data.insert_str("tf_nextNodeOperator", v);
+            // f_nextNodeOperator → tf_nextNodeOperator（若有）。
+            // issues/142 B 批 · spec 06 §2.11 表第三行：这一支**原样透传值**（数组形态也要转出去），
+            // 拆形与判据收在引擎消费腿 `parse_actor_ids` 那一枚单点里。旧写法 `get_str` 只认字符串
+            // ⇒ 前端 UserSelect(multiple) 提交的数组在这里整条被静默丢弃（与普查点名的
+            // "消费腿用 get_str＝数组形态整条失效"同一形状，只是长在发起腿上）。
+            if let Some(next_op) = flow_data.get("f_nextNodeOperator").cloned() {
+                flow_data.insert("tf_nextNodeOperator".to_string(), next_op);
             }
             let _ = self
                 .engine
@@ -1692,8 +1731,9 @@ impl JeeflowFacade {
 
     fn process_task_surrogate(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         // Java: surrogate = addTaskActor(processTaskId, actorIds) — NOT lookup surrogate table
-        let task_id = arg_id(args, &["processTaskId", "id"])?
-            .ok_or(JeeflowError::Business("processTaskId/actorIds 缺失".into()))?;
+        // 主键另判一档（§2.11 末段）＋ actorIds 两形同判据（§2.11 表第一行，判据＝arg_actor_ids
+        // 里的 normalize_actors）；丢完为空与本仓既有的"缺参数"档逐字同判（硬要求③）。
+        let task_id = require_task_id(args, "processTaskId/actorIds 缺失")?;
         let actors = arg_actor_ids(args);
         if actors.is_empty() {
             return Err(JeeflowError::Business("processTaskId/actorIds 缺失".into()));
@@ -1709,12 +1749,15 @@ impl JeeflowFacade {
     /// 转办（issues/115/116）：摘原参与人 + 换新人，沿用同一 taskId，三件留痕。
     /// 与 surrogate（加签=只追加）语义相反——本 action 会摘走 fromActor 那一行。
     fn process_task_transfer(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        let task_id = arg_id(args, &["processTaskId", "id"])?
-            .ok_or(JeeflowError::Business("缺少processTaskId参数".into()))?;
+        let task_id = require_task_id(args, "缺少processTaskId参数")?;
         // operator 硬必填（缺失/空串统一 msg），fromActor/toActor 同口径。
-        let operator = require_non_empty(args, "operator", "operator 必填")?;
-        let from_actor = require_non_empty(args, "fromActor", "fromActor 必填")?;
-        let to_actor = require_non_empty(args, "toActor", "toActor 必填")?;
+        // issues/142 B 批 · spec 06 §2.11 表第二行：三个归属值**归一后再用**——必填档的既有
+        // "缺参数"信封逐字不动，值取 trim 后的串，于是下面的权限判定（operator==fromActor）、
+        // 参与者命中判定（find_task_actors）与 tf_transferHistory 留痕用的是同一个尺度；
+        // 落库侧再由两仓 `add_task_actor` 兜第二层（§2.11 硬要求①「两层都挡」）。
+        let operator = require_normalized_actor(args, "operator", "operator 必填")?;
+        let from_actor = require_normalized_actor(args, "fromActor", "fromActor 必填")?;
+        let to_actor = require_normalized_actor(args, "toActor", "toActor 必填")?;
         let reason = arg_str(args, "reason").unwrap_or_default();
 
         let mut task = self
@@ -6512,5 +6555,303 @@ mod tests {
         let seen = seen_names(&probe.seen.lock().unwrap().clone());
         assert!(seen.is_empty(),
             "已读回写与只读 action 一律不 fire（§11.4 不发清单），实得 {:?}", seen);
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/142 B 批 · 任务参与者写侧归属值归一（spec 06-facade.md §2.11）
+    //   普查实读的 rust 形状（本组用例逐条对着钉）：
+    //   · 门面 `arg_actor_ids` 数组腿只 `filter(!s.is_empty())` ⇒ **不 trim**（`"  "` 存活并
+    //     真落进 `wf_process_task_actor.actor_id`）、同次调用不折叠，而逗号串腿才 trim
+    //     ＝**两形两个答案**；
+    //   · `transfer` 的 fromActor/toActor 只判必填、存的是**未 trim 的原值**；
+    //   · `processTaskId` 给 `0` 不拦（§2.11 末段：主键另判一档）。
+    //   判据本体＝`jeeflow_core::model::normalize_actors`（与抄送侧 §2.10 同一枚单点）。
+    //   两仓写侧兜底另有格：内存仓见 `memory.rs::actor_i142_tests`，真库见 repository-sqlx。
+    // ═══════════════════════════════════════════════════════
+
+    const I142_TASK: i64 = 914201;
+
+    fn surrogate_args(task_id: i64, actors: Json) -> HashMap<String, Json> {
+        let mut m = HashMap::new();
+        m.insert("processTaskId".to_string(), json!(task_id));
+        m.insert("actorIds".to_string(), actors);
+        m
+    }
+
+    fn actors_of(facade: &JeeflowFacade, task_id: i64) -> Vec<String> {
+        facade.repo().find_task_actors(task_id).unwrap()
+    }
+
+    /// 拆形单点本体（**直接打 `arg_actor_ids`**，不等仓储写侧兜底）：两形同判据＋trim＋丢空＋折叠。
+    /// 与下面几条端到端格分工不同：端到端格在"两层都挡"（§2.11 硬要求①）之下会被写侧兜住
+    /// ——还原门面腿单独跑一次，端到端只有"全空白 ⇒ 信封"那格红（`{"code":0,"msg":"成功"}`），
+    /// 门面腿自身的红只有打这一支才照得出来。
+    /// 改前实测（还原跑一次的红格读数）：数组腿 `[" i142a ", "", "  ", "i142a", "i142b"]` 返回
+    /// `[" i142a ", "  ", "i142a", "i142b"]`——不 trim、不折叠、纯空白活着；逗号串腿才 trim＋丢空
+    /// ⇒ 同一批人两形两个答案（`["i142x","i142y"]` vs `[" i142x ","i142y "]`）。
+    #[test]
+    fn test_i142_b_arg_actor_ids_both_forms_single_judge() {
+        for (arr, want) in [
+            (vec![" i142a ", "", "  ", "i142a", "i142b"], vec!["i142a", "i142b"]),
+            (vec!["0", "00", " ", "a"], vec!["0", "00", "a"]),
+            (vec!["i142e", "i142e"], vec!["i142e"]),
+        ] {
+            let w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            assert_eq!(arg_actor_ids(&surrogate_args(I142_TASK, json!(arr))), w,
+                "§2.11：数组腿（{arr:?}）必须 trim＋丢空＋折叠");
+            // 同一批人换逗号串写法 ⇒ 逐字同答案（两形同判据）
+            let csv = format!("{} ", want.join(","));
+            assert_eq!(arg_actor_ids(&surrogate_args(I142_TASK, json!(csv))), w,
+                "§2.11：逗号串腿（{csv:?}）与数组腿同判据");
+        }
+        // 全空白批次丢完为空（调用方据此走既有"缺参数"档）
+        assert!(arg_actor_ids(&surrogate_args(I142_TASK, json!(["", "  ", "\t"]))).is_empty(),
+            "§2.11：全空白 ⇒ 空集合");
+        assert!(arg_actor_ids(&surrogate_args(I142_TASK, json!(" , , "))).is_empty(),
+            "§2.11：逗号串全空白 ⇒ 同一个空集合");
+        // 数字元素收成字符串后照样过判据
+        assert_eq!(arg_actor_ids(&surrogate_args(I142_TASK, json!([1001, " 1002 ", 1001]))),
+            vec!["1001".to_string(), "1002".to_string()], "数字元素 to_string 后仍 trim＋折叠");
+        // null 元素丢弃（别栈在这里串化成 "null"/"<nil>"/"None"）
+        assert_eq!(arg_actor_ids(&surrogate_args(I142_TASK, json!(["i142f", null, "i142f"]))),
+            vec!["i142f".to_string()], "null 元素丢弃且不串化");
+        assert!(arg_actor_ids(&HashMap::new()).is_empty(), "整条没给 ⇒ 空集合");
+    }
+
+    /// 发起腿 `f_nextNodeOperator` 的**数组形态也要转出去**（§2.11 表第三行的另一半：值还没到
+    /// 消费腿就被丢了）。旧写法 `flow_data.get_str("f_nextNodeOperator")` 只认字符串 ⇒
+    /// 前端「指定下一节点处理人」UserSelect(multiple) 提交的数组在这一道整条静默丢弃
+    /// （与普查点名 moon 消费腿 `get_str` 同一形状），指定根本不进引擎。
+    /// 改前实测：approve 的参与者仍是定义里的 `user2`（指定 `user3` 不生效）。
+    #[tokio::test]
+    async fn test_i142_b_start_leg_forwards_array_next_node_operator() {
+        let facade = make_facade();
+        let mut a1 = HashMap::new();
+        a1.insert("name".to_string(), json!("i142-b-f-next"));
+        a1.insert("displayName".to_string(), json!("i142-b-f-next"));
+        let r1 = facade.flow("processDesign/save", &a1).await;
+        assert_eq!(r1["code"], 0, "{r1}");
+        let design_id = r1["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(design_id));
+        a2.insert("content".to_string(), json!(r#"{
+            "name":"i142-b-f-next","displayName":"i142-b-f-next","type":"approval",
+            "nodes":[
+                {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                {"id":"apply","type":"snaker:task","text":{"value":"Apply"},
+                 "properties":{"assignee":"applicant"}},
+                {"id":"approve","type":"snaker:task","text":{"value":"Approve"},
+                 "properties":{"assignee":"user2"}},
+                {"id":"end","type":"snaker:end","text":{"value":"End"}}
+            ],
+            "edges":[
+                {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+            ]
+        }"#));
+        assert_eq!(facade.flow("processDesign/updateDefine", &a2).await["code"], 0);
+        let mut a3 = HashMap::new();
+        a3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &a3).await["code"], 0);
+
+        let mut a4 = HashMap::new();
+        a4.insert("name".to_string(), json!("i142-b-f-next"));
+        a4.insert("operator".to_string(), json!("applicant"));
+        // 数组形态 ＋ 带空格与空元素：两形同判据 ⇒ 落库值是 trim 后的串
+        a4.insert("f_nextNodeOperator".to_string(), json!([" user3 ", "", "  "]));
+        let r4 = facade.flow("processDefine/startAndExecute", &a4).await;
+        assert_eq!(r4["code"], 0, "{r4}");
+        let iid: i64 = r4["data"]["processInstanceId"].as_str().unwrap().parse().unwrap();
+
+        let doing = facade.repo().find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(doing.len(), 1, "夹具前提：停在 approve 一条待办");
+        assert_eq!(facade.repo().find_task_actors(doing[0].task_id).unwrap(),
+            vec!["user3".to_string()],
+            "§2.11：发起腿数组形态要转出到引擎，空元素丢弃、值取 trim 后的串");
+    }
+
+    /// 正向对照：正常参与者照旧逐个落台账（钉"归一不许顺手吃掉正常值"，这一格改前也不红）。
+    #[tokio::test]
+    async fn test_i142_b_surrogate_positive_control_keeps_valid_actors() {
+        let facade = make_facade();
+        let r = facade.flow("processTask/surrogate", &surrogate_args(I142_TASK, json!(["7501", "7502"]))).await;
+        assert_eq!(r["code"], 0, "{r}");
+        assert_eq!(actors_of(&facade, I142_TASK), vec!["7501".to_string(), "7502".to_string()],
+            "正向对照：非空参与者逐个落库、顺序随入参");
+    }
+
+    /// 数组腿：逐元素 trim ⇒ 空串/纯空白丢弃 ⇒ 同一次调用内折叠（§2.11 表第一行＋硬要求②）。
+    /// 改前实测：台账里是 `[" i142a ", "", "  ", "i142a", "i142b"]`——空白值活着、同一人两行。
+    #[tokio::test]
+    async fn test_i142_b_surrogate_array_arm_trims_drops_and_folds() {
+        let facade = make_facade();
+        let r = facade.flow("processTask/surrogate",
+            &surrogate_args(I142_TASK, json!([" i142a ", "", "  ", "i142a", "i142b"]))).await;
+        assert_eq!(r["code"], 0, "{r}");
+        assert_eq!(actors_of(&facade, I142_TASK), vec!["i142a".to_string(), "i142b".to_string()],
+            "§2.11：数组腿必须 trim＋丢空＋折叠，落库值取 trim 后的串");
+    }
+
+    /// 两形同判据：同一批人换两种写法 ⇒ 台账集合**逐字相同**（普查点名的"只修一条腿"）。
+    /// 改前实测：串腿给 `["i142x","i142y"]`、数组腿给 `[" i142x "," i142y ",""]`，两个答案。
+    #[tokio::test]
+    async fn test_i142_b_surrogate_csv_and_array_same_judgement() {
+        for (i, (csv, arr, want)) in [
+            ("i142x, i142y", vec![" i142x ", "i142y "], vec!["i142x", "i142y"]),
+            (" i142m ,,i142n,", vec![" i142m ", "", "i142n"], vec!["i142m", "i142n"]),
+            ("", Vec::<&str>::new(), Vec::<&str>::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let csv_task = I142_TASK + i as i64 * 10;
+            let arr_task = csv_task + 1;
+            let facade = make_facade();
+            let rc = facade.flow("processTask/surrogate", &surrogate_args(csv_task, json!(csv))).await;
+            let ra = facade.flow("processTask/surrogate", &surrogate_args(arr_task, json!(arr))).await;
+            if want.is_empty() {
+                // 丢完为空 ⇒ 与既有"缺参数"档同判（硬要求③），不是"成功但什么都没写"
+                assert_eq!(rc["msg"], "processTaskId/actorIds 缺失", "第 {i} 档逗号串：空集合信封 {rc}");
+                assert_eq!(ra["msg"], "processTaskId/actorIds 缺失", "第 {i} 档数组：空集合信封 {ra}");
+            } else {
+                assert_eq!(rc["code"], 0, "第 {i} 档逗号串应成功：{rc}");
+                assert_eq!(ra["code"], 0, "第 {i} 档数组应成功：{ra}");
+            }
+            assert_eq!(actors_of(&facade, csv_task), actors_of(&facade, arr_task),
+                "§2.11 两形同判据第 {i} 档：逗号串 {csv:?} 与数组 {arr:?} 必须同答案");
+            assert_eq!(actors_of(&facade, csv_task),
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "第 {i} 档落库值＝trim 后的人");
+        }
+    }
+
+    /// 全空白批次 ⇒ 台账零行，并且与"空集合"返回**逐字同档**（§2.11 硬要求③不新造信封）。
+    /// 改前实测：`["   "]`／制表符一支返回 code=0 并真落一条 `actor_id='   '` 的行。
+    #[tokio::test]
+    async fn test_i142_b_surrogate_all_blank_batch_same_bucket_as_missing() {
+        for actors in [json!([""]), json!(["   "]), json!(["\t"]), json!(["", "  ", "\t"]),
+                       json!("  "), json!(" , , ")] {
+            let facade = make_facade();
+            let r = facade.flow("processTask/surrogate", &surrogate_args(I142_TASK, actors.clone())).await;
+            assert_eq!(r["msg"], "processTaskId/actorIds 缺失",
+                "§2.11：全空白（{actors}）必须与既有\"缺参数\"档同判，实得 {r}");
+            assert_eq!(r["code"], 99999999, "同档＝同一个码，不新造错误语义：{r}");
+            assert!(actors_of(&facade, I142_TASK).is_empty(),
+                "§2.11：全空白不得落进 actor_id（{actors}）");
+
+            let empty = facade.flow("processTask/surrogate", &surrogate_args(I142_TASK + 1, json!([]))).await;
+            assert_eq!(r, empty, "§2.11：全空白与空集合必须返回逐字一致");
+        }
+    }
+
+    /// 数组里的数字元素收成字符串后照样过判据（§2.11：不得静默丢弃、不得串化成类型名）。
+    #[tokio::test]
+    async fn test_i142_b_surrogate_numeric_elements_not_dropped() {
+        let facade = make_facade();
+        let r = facade.flow("processTask/surrogate",
+            &surrogate_args(I142_TASK, json!([1001, "1002", 1003]))).await;
+        assert_eq!(r["code"], 0, "{r}");
+        assert_eq!(actors_of(&facade, I142_TASK),
+            vec!["1001".to_string(), "1002".to_string(), "1003".to_string()],
+            "数字 id 收成字符串，与字符串写法同判据");
+    }
+
+    /// 反向哨兵（§2.11 硬要求④）：`"0"`、`"00"`、`" "`、`"a"` 是**三个人**。
+    /// 改前实测：台账落成 `["0","00"," ","a"]` 四行——纯空白被当成"人"，正是判空没 trim。
+    #[tokio::test]
+    async fn test_i142_b_surrogate_sentinel_four_are_three_people() {
+        let facade = make_facade();
+        let r = facade.flow("processTask/surrogate",
+            &surrogate_args(I142_TASK, json!(["0", "00", " ", "a"]))).await;
+        assert_eq!(r["code"], 0, "{r}");
+        assert_eq!(actors_of(&facade, I142_TASK),
+            vec!["0".to_string(), "00".to_string(), "a".to_string()],
+            "哨兵：'0'/'00'/'a' 都是正常 id，只有 ' ' 是空值");
+    }
+
+    /// 主键另判一档（§2.11 末段）：`processTaskId` 给 `0` ⇒ 响亮报错，不得拿 `0` 当 id 落库。
+    /// 改前实测：code=0 并往 `process_task_id=0` 挂了两行（php 同款病灶：门面不校验 taskId）。
+    #[tokio::test]
+    async fn test_i142_b_surrogate_task_id_zero_is_loud_error() {
+        let facade = make_facade();
+        for bad in [json!(0), json!(-1)] {
+            let mut a = surrogate_args(I142_TASK, json!(["i142pk", " i142pk "]));
+            a.insert("processTaskId".to_string(), bad.clone());
+            let r = facade.flow("processTask/surrogate", &a).await;
+            assert_eq!(r["code"], 99999999, "主键 {bad} 必须响亮报错，实得 {r}");
+            assert_eq!(r["msg"], "processTaskId/actorIds 缺失",
+                "主键档沿用既有\"缺参数\"信封（硬要求③：不新造文案）");
+            assert!(actors_of(&facade, 0).is_empty(), "不得拿 0 当 id 落库");
+        }
+        // 整条没给同档
+        let mut none = HashMap::new();
+        none.insert("actorIds".to_string(), json!(["i142pk"]));
+        assert_eq!(facade.flow("processTask/surrogate", &none).await["msg"],
+            "processTaskId/actorIds 缺失");
+    }
+
+    /// `addCandidate` 与 `surrogate` 同体（Java 语义：两者都是 addTaskActor）⇒ 同一判据同一信封。
+    #[tokio::test]
+    async fn test_i142_b_add_candidate_shares_the_same_judge() {
+        let facade = make_facade();
+        let batch = json!([" i142c ", "", "  ", "i142c", "i142d", "0"]);
+        let sur = facade.flow("processTask/surrogate", &surrogate_args(I142_TASK, batch.clone())).await;
+        let cand = facade.flow("processTask/addCandidate", &surrogate_args(I142_TASK + 1, batch)).await;
+        assert_eq!(sur["code"], 0, "{sur}");
+        assert_eq!(cand["code"], 0, "{cand}");
+        assert_eq!(actors_of(&facade, I142_TASK), actors_of(&facade, I142_TASK + 1),
+            "§2.11：addCandidate 与 surrogate 是同一条腿，两形同判据不许一腿一答案");
+        assert_eq!(actors_of(&facade, I142_TASK + 1),
+            vec!["i142c".to_string(), "i142d".to_string(), "0".to_string()]);
+    }
+
+    /// `transfer` 的 fromActor/toActor **归一后再用**（§2.11 表第二行）：带空格的同一人必须
+    /// 命中原参与者行，且落库/留痕取 trim 后的值。
+    /// 改前实测：fromActor 存原值 `" user2 "` ⇒ 归属命中判定失败，报「原办理人不是该任务参与人」。
+    #[tokio::test]
+    async fn test_i142_b_transfer_normalizes_from_and_to_actor() {
+        let facade = make_facade();
+        let (_iid, task_id) = start_two_step_flow(&facade, "i142_b_transfer").await;
+
+        let r = facade.flow("processTask/transfer",
+            &transfer_args(task_id, " user2 ", " lisi ", " user2 ")).await;
+        assert_eq!(r["code"], 0, "带空格的同一人应命中：{r}");
+
+        let actors = actors_of(&facade, task_id);
+        assert_eq!(actors, vec!["lisi".to_string()],
+            "转办后台账＝trim 后的新人，原人不留未 trim 的残行");
+
+        // 留痕同样取归一后的值（六键 tf_transferHistory 的 fromActor/toActor 不得带空格）
+        let task = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        let JsonValue::Array(hops) = task.variables.get("tf_transferHistory").unwrap() else {
+            panic!("转办留痕 tf_transferHistory 缺失");
+        };
+        assert_eq!(hops[0].get_str("fromActor"), Some("user2"), "留痕 fromActor 取归一后的值");
+        assert_eq!(hops[0].get_str("toActor"), Some("lisi"), "留痕 toActor 取归一后的值");
+        assert_eq!(hops[0].get_str("operator"), Some("user2"), "留痕 operator 与归属判定同一尺度");
+    }
+
+    /// `transfer` 的主键档：缺失／`0` 都响亮报错（既有「缺少processTaskId参数」信封不动），
+    /// 必填三档的文案逐字不变（硬要求③）。
+    #[tokio::test]
+    async fn test_i142_b_transfer_missing_or_zero_task_id_is_loud_error() {
+        let facade = make_facade();
+        let (_iid, task_id) = start_two_step_flow(&facade, "i142_b_transfer_pk").await;
+
+        let mut zero = transfer_args(task_id, "user2", "lisi", "user2");
+        zero.insert("processTaskId".to_string(), json!(0));
+        let r = facade.flow("processTask/transfer", &zero).await;
+        assert_eq!(r["msg"], "缺少processTaskId参数", "主键 0 ⇒ 沿用既有缺参数信封：{r}");
+        assert_eq!(actors_of(&facade, 0), Vec::<String>::new(), "不得拿 0 当 id 落库");
+
+        // 必填档逐字不动（归一只改值，不改信封）
+        assert_eq!(facade.flow("processTask/transfer",
+            &transfer_args(task_id, "user2", "lisi", "   ")).await["msg"], "operator 必填");
+        assert_eq!(facade.flow("processTask/transfer",
+            &transfer_args(task_id, "  ", "lisi", "user2")).await["msg"], "fromActor 必填");
+        assert_eq!(facade.flow("processTask/transfer",
+            &transfer_args(task_id, "user2", "\t", "user2")).await["msg"], "toActor 必填");
     }
 }

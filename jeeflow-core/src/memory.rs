@@ -293,18 +293,33 @@ impl ProcessRepository for MemoryRepository {
     }
 
     fn add_task_actor(&self, task_id: i64, new_actors: &[String]) -> JeeflowResult<()> {
-        let mut actors = self.task_actors.lock().unwrap();
-        let entry = actors.entry(task_id).or_insert_with(Vec::new);
-        for a in new_actors {
+        // issues/142 B 批 · spec 06-facade.md §2.11 的**写侧兜底层**（判据＝`model::normalize_actors`，
+        // 与抄送侧 §2.10 同一枚单点，不抄第二份）：逐元素 trim ⇒ 空串/纯空白丢弃 ⇒ 同一次调用内折叠，
+        // 落库与比较一律取 trim 后的串。归一排在取锁之前（本函数不 await，锁只在函数体内取放一次）。
+        // 只修门面腿的话，绕过门面直连仓储的调用方照样能把空归属值灌进 `actor_id`——那正是
+        // issues/129 那族"空 operator 读全库"的上游进水口。
+        // ⚠️ 与 sqlx 仓那条必须**同答案**（issues/117 场景 27）：旧形状是本仓判重、sqlx 仓盲插
+        //    （无判重、无判空、无 trim），同一串入参两仓两个结果。
+        // 反向哨兵（§2.11 硬要求④）：`"0"`／`"00"` 是正常 id，不得被当成空值丢掉。
+        let actors = crate::model::normalize_actors(new_actors);
+        let mut actors_map = self.task_actors.lock().unwrap();
+        let entry = actors_map.entry(task_id).or_insert_with(Vec::new);
+        for a in &actors {
             if !entry.contains(a) { entry.push(a.clone()); }
         }
         Ok(())
     }
 
     fn remove_task_actor(&self, task_id: i64, remove_actors: &[String]) -> JeeflowResult<()> {
+        // issues/142 §9.2 第二批（spec 06 §2.11 同一把尺子搬到删除位）：删除列表先过
+        // `model::normalize_actors`——不 trim 则「 8601 」删不掉库里 trim 后的 8601（静默
+        // no-op 报成功）；归一后为空 ⇒ 什么都不删（早退），空串入参在历史 actor_id='' 脏行上
+        // 会批量误删（issues/129 的删除位对偶）。与 sqlx 仓同一条判据、同一个答案。
+        let remove = crate::model::normalize_actors(remove_actors);
+        if remove.is_empty() { return Ok(()); }
         let mut actors = self.task_actors.lock().unwrap();
         if let Some(entry) = actors.get_mut(&task_id) {
-            entry.retain(|a| !remove_actors.contains(a));
+            entry.retain(|a| !remove.contains(a));
         }
         Ok(())
     }
@@ -1713,5 +1728,98 @@ mod cc_i141_tests {
         repo.create_cc_instance(iid, SENDER, &["0".into()]).unwrap();
         assert_eq!(repo.find_cc_actor_ids(iid).unwrap(), vec!["0".to_string()],
             "G10 只丢空串/纯空白：'0' 不得被当成空值丢掉");
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// issues/142 B 批 · 任务参与者写侧归属值归一（内存仓这一支）
+//   立法＝spec 06-facade.md §2.11（把 §2.10 的四点实现要求逐字搬到任务侧）；
+//   owner 拍「八栈一起收：两形同判据＋写侧兜底＋trim＋哨兵」。
+//   判据本体＝`crate::model::normalize_actors`，与抄送侧 §2.10 同一枚单点（不抄第二份）；
+//   真库那一支的对拍在 `jeeflow-repository-sqlx` 的 `test_mysql_i142_b_*`——
+//   改前本仓判重、sqlx 仓盲插（无判空、无 trim、无判重）＝同一串入参两仓两个答案，
+//   正是 issues/117 场景 27 立过法的那一类形状。
+// ═══════════════════════════════════════════════════════
+#[cfg(test)]
+mod actor_i142_tests {
+    use super::*;
+
+    const TASK: i64 = 914201;
+
+    /// 正向对照：正常参与者一个不吃、顺序不动（钉"归一不许顺手吃掉正常值"，改前也绿）。
+    #[test]
+    fn test_i142_b_positive_control_keeps_valid_actors_in_order() {
+        let repo = MemoryRepository::new();
+        repo.add_task_actor(TASK, &["7501".into(), "7502".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(),
+            vec!["7501".to_string(), "7502".to_string()], "正向对照：顺序随入参，一个不吃");
+    }
+
+    /// 写侧兜底（§2.11 硬要求①）：空串／纯空白即使**绕过门面直连仓储**也进不了归属列。
+    /// 改前实测（内存仓）：判重有、判空无 ⇒ `["", "   ", "\t"]` 三行原样进台账。
+    #[test]
+    fn test_i142_b_add_task_actor_drops_blank_values() {
+        let repo = MemoryRepository::new();
+        repo.add_task_actor(TASK, &["".into(), "   ".into(), "\t".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(), Vec::<String>::new(),
+            "§2.11：全空白批次不得落进 wf_process_task_actor.actor_id");
+    }
+
+    /// 落库与比较一律取 trim 后的值，同一次调用内的重复折叠（§2.11 硬要求②）。
+    #[test]
+    fn test_i142_b_add_task_actor_trims_and_folds() {
+        let repo = MemoryRepository::new();
+        repo.add_task_actor(TASK,
+            &[" i142a ".into(), "".into(), "i142a".into(), "i142b".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(),
+            vec!["i142a".to_string(), "i142b".to_string()],
+            "§2.11：trim 后同值＝同一个人，落库值是 trim 后的串");
+    }
+
+    /// 跨调用判重与 trim 咬合：先写 `"i142c"` 再写 `" i142c "` ⇒ 仍一行。
+    /// 改前实测（内存仓，还原跑一次的红格读数）：判重**看着有、其实被未 trim 的值打穿** ⇒
+    /// 台账落 `["i142c"," i142c "]` 两行，正是 §2.11 硬要求②点名的"不 trim 就会与写侧判重错开"。
+    #[test]
+    fn test_i142_b_padded_value_hits_dedup() {
+        let repo = MemoryRepository::new();
+        repo.add_task_actor(TASK, &["i142c".into()]).unwrap();
+        repo.add_task_actor(TASK, &[" i142c ".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(), vec!["i142c".to_string()],
+            "§2.11 硬要求②：不 trim 就会与写侧判重错开，同一人落两行");
+    }
+
+    /// 反向哨兵（§2.11 硬要求④）：`"0"`、`"00"`、`" "`、`"a"` 是**三个人**。
+    /// 判空一律 `trim().is_empty()`——旧形状不 trim 时纯空白 `' '` 被当成第四个人收进台账。
+    #[test]
+    fn test_i142_b_sentinel_four_are_three_people() {
+        let repo = MemoryRepository::new();
+        repo.add_task_actor(TASK, &["0".into(), "00".into(), " ".into(), "a".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(),
+            vec!["0".to_string(), "00".to_string(), "a".to_string()],
+            "哨兵：'0'/'00'/'a' 都是正常 id，只有 ' ' 是空值");
+        assert_eq!(repo.find_task_actors(TASK).unwrap().len(), 3,
+            "'00' 与 '0' 是两个人（严禁松散比较静默吞掉第二个人）");
+    }
+
+    /// 删除位（issues/142 §9.2 第二批）：「 8601 」删得掉 trim 后的 8601；归一后为空 ⇒
+    /// 什么都不删——历史 actor_id='' 脏行不得被空串入参批量误删。
+    #[test]
+    fn test_i142_b_remove_task_actor_trims_and_blank_is_noop() {
+        let repo = MemoryRepository::new();
+        repo.add_task_actor(TASK, &["  i142d  ".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(), vec!["i142d".to_string()],
+            "前置：写侧落库存 trim 值");
+
+        repo.remove_task_actor(TASK, &["  i142d  ".into()]).unwrap();
+        assert!(repo.find_task_actors(TASK).unwrap().is_empty(),
+            "删除位必须按归一后的值比较（【 i142d 】删得掉 i142d）");
+
+        // 历史脏行：库里有 actor_id=空串 的行。空串入参绝不能把它当"要删的人"。
+        repo.task_actors.lock().unwrap().insert(TASK, vec!["i142e".to_string(), "".to_string()]);
+        repo.remove_task_actor(TASK, &["".to_string(), "   ".to_string()]).unwrap();
+        repo.remove_task_actor(TASK, &[]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(),
+            vec!["i142e".to_string(), "".to_string()],
+            "归一后为空 ⇒ 一行都不删（issues/129 删除位对偶）");
     }
 }
