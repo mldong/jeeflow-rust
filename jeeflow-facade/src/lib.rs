@@ -4822,9 +4822,12 @@ mod tests {
     }
 
     // ─── Action count test ───
+    // issues/115 §3-8：门面第 47 个 action `processTask/removeTaskActor` 入账，条数与名单一起前进
+    // （owner 2026-10-01 拍 A：条数断言随代次前进）。这格是 manifest↔分派表的一致性门禁：
+    // 名单漏记 ⇒ 该 action 不在覆盖内；分派表漏记 ⇒ 落 unknown 分支当场红。
 
     #[tokio::test]
-    async fn test_all_46_actions_dispatchable() {
+    async fn test_all_47_actions_dispatchable() {
         let facade = make_facade();
         let actions = vec![
             "processDefine/page", "processDefine/detail", "processDefine/startAndExecute",
@@ -4841,6 +4844,7 @@ mod tests {
             "processTask/detail", "processTask/jumpAbleTaskNameList",
             "processTask/candidatePage", "processTask/surrogate",
             "processTask/addCandidate", "processTask/transfer", "processTask/latest",
+            "processTask/removeTaskActor",
             "processDesign/page", "processDesign/detail",
             "processDesign/save", "processDesign/update",
             "processDesign/updateDefine", "processDesign/remove",
@@ -4850,12 +4854,18 @@ mod tests {
             "processSurrogate/update", "processSurrogate/detail",
             "processSurrogate/remove",
         ];
-        assert_eq!(actions.len(), 46, "Should have exactly 46 actions");
+        assert_eq!(actions.len(), 47,
+            "Should have exactly 47 actions (issues/115 §3-8 added processTask/removeTaskActor)");
         // All actions should return a response (not panic)
         for action in &actions {
             let resp = facade.flow(action, &HashMap::new()).await;
             // Should have code field (either success or error)
             assert!(resp.get("code").is_some(), "Action {} should return a response with code", action);
+            // ⚠️ 只有上一条判据＝"恒真"：unknown action 也返回 code=99999999 的信封 ⇒ 名单里写了但
+            // 分派表漏记的话，前一判照样绿。补这一判才让本格真成"名单 ↔ 分派表"门禁
+            // （与 c# FacadeTests.AllActionsInManifest_Dispatch_NoUnknown 同判据）。
+            let msg = resp.get("msg").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(!msg.contains("未知 action"), "Action {} 落到 unknown 分支：分派表漏记该 action", action);
         }
     }
 
