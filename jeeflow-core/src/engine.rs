@@ -3482,6 +3482,38 @@ mod tests {
         assert_eq!(revived.expire_time.as_deref(), Some("2028-02-02 02:02:02"),
             "回退新建必须读随行那份（2028）；实得 {:?}＝读成实例变量或压根没算", revived.expire_time);
     }
+
+    /// issues/137 D（owner 2026-10-01 拍"判非负"）写点腿，逐格对齐 java 参考实现
+    /// `ExpireTimeOnCreateTest.negativeRelativeExpressionStaysNull`：节点把到期表达式配成
+    /// **负数相对档**（`-5h` / `-5d`）⇒ 该列必须是 NULL。
+    ///
+    /// 为什么建单这一层也要钉一格：求值器返回 `None` 与写点把 `None` 落库是两回事——放行 `-5h` 时
+    /// 库里躺着一个**过去**的时刻，新建行当场即逾期，比"没配到期时间"更难发现（issues/126 病灶同族）。
+    /// `d` 档单独一格：它在求值器里走日历加天那一支（负数＝历日倒退），与共用的前缀解析同判但代码路不同。
+    /// 正向对照 `+2h` 必须仍算得出 ≈7200s：只裁负、**不裁加号**（各栈整数解析都收 '+'），
+    /// 也保证上面两判不是把整档恒真化。
+    #[tokio::test]
+    async fn test_i137_negative_relative_expression_stays_null() {
+        for (i, expr) in ["-5h", "-5d"].iter().enumerate() {
+            let (engine, repo) = make_surrogate_engine();
+            let name = format!("i137_neg{i}");
+            let did = save_define(&repo, &name, &exp_flow(&name, &[(
+                "approve", &format!(r#""assignee":"zhangsan","expireTime":"{expr}""#),
+            )]));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            exp_expire_null(&exp_doing(&repo, inst.instance_id, "approve", 1)[0],
+                &format!("节点配负数相对档 {expr}（应落穿 ⇒ NULL，不得写成一个过去的时刻）"));
+        }
+
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i137_plus";
+        let did = save_define(&repo, name, &exp_flow(name, &[(
+            "approve", r#""assignee":"zhangsan","expireTime":"+2h""#,
+        )]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        exp_expire_about(&exp_doing(&repo, inst.instance_id, "approve", 1)[0],
+            7200, "加号档 +2h（正向对照：只裁负不裁加号）");
+    }
 }
 
 // ═══════════════════════════════════════════════════════

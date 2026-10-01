@@ -75,7 +75,8 @@ pub fn apply_expire_time(task: &mut ProcessTask, expr: Option<&str>, args: &Flow
 /// ① `args` 里存在**键名等于表达式原串**的项 ⇒ 取该项的值：
 ///    墙钟串 → 该串（解析失败即**终局** `None`，不落穿）；整值数值 → 毫秒时间戳；
 ///    类型不认识（bool / null / 数组 / 对象 / 非整值数值）→ **落穿**到后面两档（易错点①）。
-/// ② 以 `s|m|h|d` 结尾且前缀是整数 ⇒ 基准 + N 秒/分/时/天（`d` 走**日历加天**）。
+/// ② 以 `s|m|h|d` 结尾且前缀是**非负**整数 ⇒ 基准 + N 秒/分/时/天（`d` 走**日历加天**；
+///    负数前缀按 issues/137 D 算"解析不出来"，落穿到第 ③ 档，加号档仍合法）。
 /// ③ 否则把表达式本身按 `yyyy-MM-dd HH:mm:ss` 严格解析；失败 → `None`。
 ///
 /// 变量档**优先于**相对档（易错点②：`args` 里真有个键叫 `"2h"` 时取的是变量值）。
@@ -125,11 +126,14 @@ pub fn process_time_in(expr: Option<&str>, args: &FlowData, base: &str, utc_base
     to_epoch_secs(raw).map(from_epoch_secs)
 }
 
-/// 相对档 `Ns`/`Nm`/`Nh`/`Nd`；后缀不识别或前缀非整数 ⇒ `None`（交回调用方走绝对档）。
+/// 相对档 `Ns`/`Nm`/`Nh`/`Nd`；后缀不识别、前缀非整数**或前缀是负数** ⇒ `None`（交回调用方走绝对档）。
 ///
 /// §1.9-3 口径：前缀不是整数（节点误配成 `xh`）时 Java 会 `Integer.parseInt` **抛异常打断建单**，
 /// 本栈与 C# 同走"**落穿** → 绝对档 → 最终 NULL"（配置写错不该让流程卡死）。
 /// **与 Java 的差异是故意的**，要改成"跟 Java 一样抛"必须八栈同批改、另立案。
+///
+/// issues/137 D（owner 2026-10-01 拍"判非负"，spec/04 §任务行 expire_time）：**负数前缀同样算
+/// "解析不出来"**，与上面误配档同一落穿路径 ⇒ 绝对档 ⇒ 仍解析不出就 NULL。
 fn relative_secs(expr: &str, base: i64) -> Option<i64> {
     let bytes = expr.as_bytes();
     if bytes.len() < 2 {
@@ -142,6 +146,16 @@ fn relative_secs(expr: &str, base: i64) -> Option<i64> {
     }
     let prefix = expr[..expr.len() - 1].trim();
     let n: i64 = prefix.parse().ok()?;
+    // issues/137 D 判非负：负数偏移不是合法到期档——放行 `-5h` 会算出一个**过去**的时刻 ⇒
+    // 新建的行当场就是逾期，比"没配到期时间"更难发现，也正是上面"任何一档都不许退化成取当前时间"
+    // （issues/126 病灶）的同向延伸。归 `None` 走既有的 `?` 落穿分支，不新造返回路径。
+    // 四档共用**这一枚**前缀解析 ⇒ 一处即全覆盖：`d` 档走 `add_calendar_days` 也只是把同一个 `n`
+    // 交给历日加天（负数＝历日倒退），没有第二条前缀解析的旁路。
+    // 只裁负、**不裁加号**：各栈整数解析（python `[+-]?`、node `[-+]?\d+`、php `[+-]?\d{1,18}`、
+    // 本栈 `i64::from_str`）都收 `+`，裁掉加号等于新造一处跨栈分叉。
+    if n < 0 {
+        return None;
+    }
     match unit {
         b's' => Some(base + n),
         b'm' => Some(base + n.checked_mul(60)?),
@@ -264,7 +278,14 @@ mod tests {
         assert_eq!(ev("45m", &[]).as_deref(), Some("2026-09-28 12:45:00"));
         assert_eq!(ev("2h", &[]).as_deref(), Some("2026-09-28 14:00:00"));
         assert_eq!(ev("3d", &[]).as_deref(), Some("2026-10-01 12:00:00"));
-        assert_eq!(ev("-1h", &[]).as_deref(), Some("2026-09-28 11:00:00"));
+        // 本格原为 `assert_eq!(ev("-1h", &[]).as_deref(), Some("2026-09-28 11:00:00"));`
+        // ——issues/137 D owner 2026-10-01 拍"判非负"：原断负偏移生效＝放行负数、新建行当场逾期，
+        // 本格按裁定**翻面**（负数相对档一律算不出，见 negative_relative_expression_stays_null）。
+        // 原本靠 `-1h` 覆盖的"时档做加减算术 + 跨日界"覆盖面用**正数**补回，不缩水：
+        // `+1h` 同时钉住"加号合法"（只裁负不裁加号），`31d` 钉跨月正向历日推进。
+        assert_eq!(ev("-1h", &[]), None, "负数时档按 issues/137 D 算解析不出");
+        assert_eq!(ev("+1h", &[]).as_deref(), Some("2026-09-28 13:00:00"));
+        assert_eq!(ev("31d", &[]).as_deref(), Some("2026-10-29 12:00:00"), "跨月正向");
         assert_eq!(
             ev("2027-03-04 05:06:07", &[]).as_deref(),
             Some("2027-03-04 05:06:07"),
@@ -351,6 +372,65 @@ mod tests {
                 Some(BASE),
                 "任何一档都不许兜底成基准时刻（那等于建单即逾期）"
             );
+        }
+    }
+
+    /// 负向（issues/137 D · owner 2026-10-01 拍"判非负"，对齐 java 基准
+    /// `ExpireTimeOnCreateTest.negativeRelativeExpressionStaysNull`）：**负数相对档不是合法偏移**。
+    ///
+    /// 放行 `-5h` 会算出一个**过去**的时刻 ⇒ 新建的行当场就是逾期，比"没配到期时间"更难发现，
+    /// 与上面 `test_unparsable_stays_null_never_base_time` 的"不许退化成取当前时间"（issues/126 病灶）同向。
+    /// 判据形状是 `None`（落穿绝对档后仍解析不出）——**不是 panic、不是基准时刻、不是回拨后的时刻**。
+    /// 四档 `s/m/h/d` 共用 [`relative_secs`] 里同一枚前缀解析，故四档各自钉一格；`d` 档那一格
+    /// 尤其要紧：它走 `add_calendar_days`，负数是**历日倒退**，不是乘 86400 秒。
+    #[test]
+    fn test_negative_relative_expression_stays_null() {
+        // ① 四档负数前缀全部算不出，三个侧面一起钉：不是回拨后的时刻（那样的话 `实得 {got:?}`
+        // 直接把那个过去的时刻打在失败信息里）、不是基准时刻、求值不得 panic
+        for expr in ["-30s", "-5m", "-5h", "-5d"] {
+            let got = ev(expr, &[]);
+            assert_eq!(got, None, "负数相对档 {expr:?} 该算不出（落穿 ⇒ 空），实得 {got:?}");
+            assert_ne!(
+                got.as_deref(),
+                Some(BASE),
+                "负数档也不许兜底成基准时刻"
+            );
+        }
+
+        // ② 正向对照：**只裁负、不裁加号**——`+2h` 必须仍算得出 now+7200s，`2h`/`2d` 一字不变。
+        // 这一格保证上面两判不是"把整档裁成恒真"：往 prefix 上动刀禁掉 '+'、或把整枚相对档
+        // 直接改成 return None，都会红在这里（摘掉 `< 0` 那一判则红在 ①）
+        let plus = ev("+2h", &[]).expect("加号档必须仍合法：各栈整数解析都收 '+'，裁加号＝新造跨栈分叉");
+        assert_eq!(plus.as_str(), "2026-09-28 14:00:00");
+        assert_eq!(
+            to_epoch_secs(&plus).unwrap() - to_epoch_secs(BASE).unwrap(),
+            7200,
+            "+2h 必须以基准为起点加满 7200s"
+        );
+        assert_eq!(ev("2h", &[]).as_deref(), Some("2026-09-28 14:00:00"), "无符号时档不变");
+        assert_eq!(ev("2d", &[]).as_deref(), Some("2026-09-30 12:00:00"), "无符号天档不变");
+        assert_eq!(ev("+3d", &[]).as_deref(), Some("2026-10-01 12:00:00"), "加号天档同样合法");
+
+        // ③ 变量档与绝对档不受本次裁定影响（变量档**先于**相对档，键名恰好带负号也照取）
+        assert_eq!(
+            ev("dueAt", &[("dueAt", JsonValue::string("2026-12-31 10:00:00"))]).as_deref(),
+            Some("2026-12-31 10:00:00"),
+            "变量档照旧取变量值"
+        );
+        assert_eq!(
+            ev("-5h", &[("-5h", JsonValue::string("2026-12-31 10:00:00"))]).as_deref(),
+            Some("2026-12-31 10:00:00"),
+            "键名叫 \"-5h\" 的变量仍走变量档（判非负只作用于相对档，不得漏进变量档）"
+        );
+        assert_eq!(
+            ev("2026-12-31 10:00:00", &[]).as_deref(),
+            Some("2026-12-31 10:00:00"),
+            "绝对档照旧成功"
+        );
+
+        // ④ 坏前缀行为不变（本来就落穿）：非整数 / 小数 / 后缀不认识三档
+        for expr in ["xh", "2.5h", "3hh", "-2.5h"] {
+            assert_eq!(ev(expr, &[]), None, "误配档 {expr:?} 行为不变：落穿 ⇒ 空");
         }
     }
 
