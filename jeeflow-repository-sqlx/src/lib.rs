@@ -3983,7 +3983,7 @@ mod tests {
     //
     // 为什么这一族必须有一条真库格：`wf_process_instance.expire_time` 是 `DATETIME(3)` 列，
     // 而改前搬进这一列的是**定义级表达式的原串**（`"2h"`）。内存仓把它当 String 存 ⇒ 全绿；
-    // 真库在 `STRICT_TRANS_TABLES`（160 那台 MySQL 8.0.46 实测 sql_mode 含之）下**硬拒**——
+    // 真库在 `STRICT_TRANS_TABLES`（160 那台 MySQL **5.7.31**，本轮直连 `SELECT VERSION()` 实测）下**硬拒**——
     // 实测 errno 1292(22007) `Incorrect datetime value: '2h' for column 'expire_time'`
     // （工单案文写的 1366 是字符列那一族的返回码，DATETIME 列这台给的是 1292），
     // 非严格模式则静默存成 `0000-00-00`。"内存绿 ≠ 落库绿"这一族按红线做**两步变异对照**：

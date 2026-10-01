@@ -955,7 +955,7 @@ impl JeeflowEngineImpl {
         //        同形状 boot2 内置版 `ProcessInstanceServiceImpl.java:157-160`；
         //      · 改前本栈是 `instance.expire_time = Some(et.clone())`——**原串搬运**。表达式原串
         //        （如 `"2h"`）进 `wf_process_instance.expire_time` 那枚 `DATETIME(3)` 列，在
-        //        `STRICT_TRANS_TABLES`（160 那台 MySQL 8.0.46 实测 sql_mode 含之）下被**硬拒**——
+        //        `STRICT_TRANS_TABLES`（160 那台 MySQL **5.7.31**，本轮直连 `SELECT VERSION()` 实测）下被**硬拒**——
         //        实测 errno 1292(22007) `Incorrect datetime value: '2h' for column 'expire_time'`
         //        （工单案文写的 1366 是字符列那一族的码，DATETIME 列这台给的是 1292，见本轮收口报告），
         //        非严格模式下静默存 `0000-00-00`——两种都是"内存绿、真库红"的病灶形状，不是这一列该有的语义；
