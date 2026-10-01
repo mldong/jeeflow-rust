@@ -282,7 +282,9 @@ async fn wf_action(req: &mut Request, res: &mut Response) {
     let body: Json = match req.parse_json().await {
         Ok(v) => v,
         Err(e) => {
-            let msg = format!("非法请求body: {}", e);
+            // issues/137 §3-1（spec/06 §2.12）：JSON 解析器写的原文属内部实现细节，
+            // 不得拼进对外 msg——原文只进下面这条日志，对外只给固定文案。
+            let msg = "非法请求body";
             eprintln!("[wf_action] body parse error: {}", e);
             res.render(salvo::prelude::Json(json!({
                 "code": 99999999,

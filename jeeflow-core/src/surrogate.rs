@@ -230,11 +230,13 @@ pub fn expand_actors(
         let hit = match ext.get_surrogate(&actor, process_name, time) {
             Ok(h) => h,
             Err(e) => {
+                // 日志腿取全文（issues/137 §3-1：`message()` 已收敛成对外固定文案，
+                // Internal 档的原文只在 `detail()` 里，别在这儿把排障信息弄丢）。
                 eprintln!(
                     "[jeeflow] 委托查询失败 actor={} process={} err={}（跳过该参与者，不中断建单）",
                     actor,
                     process_name,
-                    e.message()
+                    e.detail()
                 );
                 continue;
             }

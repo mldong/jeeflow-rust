@@ -887,7 +887,21 @@ impl JeeflowFacade {
 
         match result {
             Ok(data) => success_response(transform_output(data)),
-            Err(e) => error_response(&e.message()),
+            Err(e) => {
+                // issues/137 §3-1（spec/06 §2.12）：判别式 `is_foreign_detail`（error.rs 纯函数）
+                // 判定 Internal 档＝内部实现细节（驱动／运行时／集成方 provider 原文）⇒ 原文只进
+                // 日志（下面这一支），出口 msg 由 `message()` 收敛为固定文案「流程处理失败」；
+                // 引擎自己写的契约文案不记内部异常日志、照旧逐字透出（对齐 java 顶层 catch：
+                // isForeignDetail ⇒ log SEVERE + INTERNAL_FAILURE_MSG，否则 e.getMessage()）。
+                if jeeflow_core::error::is_foreign_detail(&e) {
+                    eprintln!(
+                        "[jeeflow] action 执行失败: action={} detail={}",
+                        action,
+                        e.detail()
+                    );
+                }
+                error_response(&e.message())
+            }
         }
     }
 
