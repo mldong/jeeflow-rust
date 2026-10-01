@@ -850,7 +850,7 @@ impl JeeflowFacade {
             "processInstance/stats/trend" => self.stats_trend(args),
             "processInstance/stats/group" => self.stats_group(args),
 
-            // ═══ processTask (9) ═══
+            // ═══ processTask (10) ═══
             "processTask/todoList" => self.process_task_todo_list(args),
             "processTask/doneList" => self.process_task_done_list(args),
             "processTask/execute" => self.process_task_execute(args).await,
@@ -860,6 +860,7 @@ impl JeeflowFacade {
             "processTask/surrogate" => self.process_task_surrogate(args),
             "processTask/addCandidate" => self.process_task_add_candidate(args),
             "processTask/transfer" => self.process_task_transfer(args),
+            "processTask/removeTaskActor" => self.process_task_remove_actor(args),
             "processTask/latest" => self.process_task_latest(args),
 
             // ═══ processDesign (9) ═══
@@ -1827,6 +1828,108 @@ impl JeeflowFacade {
         // instanceId / taskId / fromActor / toActor / operator。
         self.engine.notify_task_transfer(
             task.process_instance_id, task_id, &from_actor, &to_actor, &operator);
+        Ok(Json::Null)
+    }
+
+    /// 摘除参与人（issues/115 残留 · 门面第 **47** 个 action，spec 06-facade.md
+    /// §processTask/removeTaskActor）。SPI 侧 [`ProcessRepository::remove_task_actor`] 从第一天起
+    /// 就是必选方法、两仓都实现，只是没上门面——本 action 补的就是这一段（摘人过去只能靠
+    /// `transfer`，而它是"摘 A **并**加 B"）。
+    ///
+    /// 三个兄弟 action 的分工（写清楚，免得后来人把三条混用）：
+    /// - `processTask/surrogate`／`addCandidate` ＝ **只加**（原人保留可办）；
+    /// - `processTask/transfer` ＝ **换人**（摘 A 加 B，submitType=7 ＋ tf_transferHistory 三件留痕
+    ///   ＋ fire 码 7）；
+    /// - 本 action ＝ **只摘不加、零留痕、不 fire 事件**：删掉 `actorIds` 在本任务的参与者行，
+    ///   不新建任务、不写任何任务变量、不覆写任务 `actor_id`/`operator` 列。
+    ///   「不发事件」是定稿判据（issues/132 §11.3 事件集里**没有**"摘除参与人"这一码，
+    ///   码 7 `TASK_TRANSFER` 的语义是"参与者被**替换**"，只摘不加套它就是凭空造出一条
+    ///   根本没发生的转办事实；要立法先开 issue）。
+    ///
+    /// 守卫次序（逐栈一致，spec 同节钉死，门禁按 msg 断言，不接受本栈自行排序）：
+    /// `operator 必填` → `processTaskId/actorIds 缺失` → `任务不存在` → `无权限摘除该任务参与人`
+    /// → `任务非进行中，不可摘除参与人` → `至少需保留一名参与人` → 落库。
+    fn process_task_remove_actor(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        // ① operator **硬必填且先判**（issues/114/115 同 transfer 口径，严禁缺省回落 user1）：
+        //    参数全缺时若先报主键缺失，会把鉴权缺口藏进"缺参数"报错里。归一（trim）在入口就做，
+        //    于是下面的归属比较与被摘集合是同一个尺度（§2.11，本栈单点 require_normalized_actor）。
+        let operator = require_normalized_actor(args, "operator", "operator 必填")?;
+        // ② 主键档与归属值档分得很清楚（§2.11「主键类参数另判一档」）：`require_task_id` ＋
+        //    `arg_actor_ids` 都是 surrogate/addCandidate 已在用的那两枚腿，"缺参数"文案与它们
+        //    逐字同一条（同族同文案，不另造）。两条都不落库，空串元素也绝不会被喂进 DELETE
+        //    （归一单点丢空 ⇒ 历史 actor_id='' 脏行因此安全）。
+        // 主键**空串/纯空白/JSON null** 归「缺参数」档（spec 语义 8：缺键/空串/纯空白/0/负数
+        // 同一句逐字文案；java `toLong("")` 得 null、go 的 taskIDArg、php 的 normalizeActor 本来
+        // 都落这一档）。本栈 `arg_i64` 的既有形状是把空串一并折进「非法id: 」（兄弟 action 同款），
+        // 故在调用 `require_task_id` **之前**先把空值档截出来判。
+        // ⚠️ 只截空值：给了但不是数字（"abc"）仍走本栈既有「非法id」——spec 明文不作跨栈统一
+        // 那一档，伪装成"参数没传"会让调用方看不出自己传错了类型。
+        let pk_blank = match args.get("processTaskId") {
+            Some(Json::String(s)) => s.trim().is_empty(),
+            Some(Json::Null) => true,
+            _ => false,
+        };
+        if pk_blank {
+            return Err(JeeflowError::Business("processTaskId/actorIds 缺失".into()));
+        }
+        let task_id = require_task_id(args, "processTaskId/actorIds 缺失")?;
+        let actors = arg_actor_ids(args);
+        if actors.is_empty() {
+            return Err(JeeflowError::Business("processTaskId/actorIds 缺失".into()));
+        }
+        let task = self
+            .repo
+            .find_task_by_id(task_id)?
+            .ok_or(JeeflowError::Business("任务不存在".into()))?;
+        // ③ 归属判据同 transfer：被摘集合必须含操作人本人（**按归一值比**），flow.auto|flow.admin
+        //    例外。transfer 能"摘 A 加 B"是因为 A 就是操作人本人，本 action 同理不得成为
+        //    借道摘他人的口子。哨兵生效边界同 transfer 那条注（真实超管不命中，超管可操作性
+        //    归集成层权限码）。
+        if !is_privileged_operator(&operator) && !actors.iter().any(|a| a == &operator) {
+            return Err(JeeflowError::Business("无权限摘除该任务参与人".into()));
+        }
+        // ④ 前置态：仅进行中（DOING=10）任务可摘。已办结/撤回/废弃任务的历史参与人行是
+        //    approvalRecord 的取证依据（它读全状态任务行），摘它等于改写审批历史。
+        if task.task_state != TaskState::Doing.code() {
+            return Err(JeeflowError::Business("任务非进行中，不可摘除参与人".into()));
+        }
+        // 以参与者表为判据（聚合副本 `task.actor_ids` 可能滞后于加签/转办的增量写入，与 transfer 同源）。
+        let current = self.repo.find_task_actors(task_id)?;
+        // 语义 6「匹配取归一值、DELETE 取行上的原值」（§2.11 硬要求②的**删除腿**）：
+        // 库里的行可能是修复前落下的未 trim 原值 `" leader "`，入参 `leader` 必须**判成同一个人
+        // 并真删掉它**——所以命中用归一形、`to_delete` 收的是**那一行的原值**。反面形状＝拿归一值
+        // 去 DELETE：判成同一人却一条没删，门面报成功而被摘的人待办还在（**假成功**，go 栈实测到）。
+        // 语义 5「不得摘空」的下限按**能办单的人数**算：`remaining` 只数"归一后非空"的行——
+        // 历史 `actor_id=''`/纯空白脏行谁也办不了，拿它撑起下限等于让"摘空"伪装成成功，
+        // 而摘空会造出**无人可办又无法撤回重派的死单**，比"配错表达式落 NULL"更难恢复。
+        let mut to_delete: Vec<String> = Vec::new();
+        let mut remaining: usize = 0;
+        for row in &current {
+            // 归一仍复用本栈那一枚单点（§2.11「严禁第二份」）：空串/纯空白 ⇒ 归一后无元素，
+            // 既不匹配也不计人（脏行不算一个人）。
+            let normalized = normalize_actors(std::slice::from_ref(row));
+            let Some(name) = normalized.first() else {
+                continue;
+            };
+            if actors.contains(name) {
+                to_delete.push(row.clone());
+            } else {
+                remaining += 1;
+            }
+        }
+        // 判据是**集合差**（当前参与者 − 归一后的 actorIds），不是"入参条数"——
+        // actorIds 里混进非参与者 id 也绕不过这一条（spec 语义 5 第二句）。
+        if !to_delete.is_empty() && remaining == 0 {
+            return Err(JeeflowError::Business("至少需保留一名参与人".into()));
+        }
+        // 语义 7「幂等」：非参与者静默忽略；一个都没命中 ⇒ 空操作、照样成功信封（前端双点、
+        // 集成层重放第二次不再报错）。要"人不在任务里就报错"请用 transfer。
+        if !to_delete.is_empty() {
+            self.repo.remove_task_actor(task_id, &to_delete)?;
+        }
+        // 语义 2：不置 submitType、不写 tf_* 变量、不覆写 actor_id/operator 列、不 fire 事件
+        // ——本函数从头到尾没有 `update_task`／`notify_*` 这两条腿，"零留痕零事件"由构造成立。
+        // data → null（spec 同节：前端消费面 surrogate/addCandidate 的调用点也不读 data）。
         Ok(Json::Null)
     }
 
@@ -6853,5 +6956,710 @@ mod tests {
             &transfer_args(task_id, "  ", "lisi", "user2")).await["msg"], "fromActor 必填");
         assert_eq!(facade.flow("processTask/transfer",
             &transfer_args(task_id, "user2", "\t", "user2")).await["msg"], "toActor 必填");
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/115 残留 · 门面第 47 个 action processTask/removeTaskActor
+    // （spec 06-facade.md §processTask/removeTaskActor · Rust 腿。17 格判据逐条对齐 java 基准腿
+    //   jeeflow-core/src/test/java/com/mldong/jeeflow/test/RemoveTaskActorActionTest.java）
+    //
+    // 判据主线是三个兄弟 action 的分工：surrogate/addCandidate 只加、transfer 换人＋留痕＋fire
+    // 码 7、本 action 只摘不加零留痕零事件。每条负向都**同时**断言"参与者一动不动"——摘人是删除
+    // 操作，报错却删了一半比不报错更糟。
+    // ═══════════════════════════════════════════════════════
+
+    /// **test-only 包装仓储**（java 基准腿 `RemoveTaskActorActionTest.DirtyRowSpyRepo` 同款）：
+    /// 语义 5/6 那三格要求"库里真存着修复前落下的历史脏行"（`actor_id=''`／纯空白／`' 9101 '`），
+    /// 而内存仓写侧 [`MemoryRepository`] 的 `add_task_actor` 会归一 ⇒ 正常路径**根本建不出**这些行，
+    /// 脏行只能从外部塞。这里复刻 JDBC 的形状：
+    /// - 读侧：真人＋脏行并起来返回（一条裸 `SELECT` 本来就会把脏行读出来，所以"脏行算不算一个人"
+    ///   "脏行会不会被误删"都是门面这一层必须面对的真实判据）；
+    /// - 删侧：按 `DELETE ... AND actor_id IN (?)` **逐字语义**处理脏行（字面命中才删，不 trim
+    ///   不丢空），并**记录每一次喂进 DELETE 的实参**——语义 6「DELETE 取行上的原值」的判据
+    ///   只有落在实参上才咬得住（拿归一值去删＝判成同一人却一条没删的"假成功"）。
+    /// 其余方法逐条转调内层内存仓，保证"除了上面两处，本 spy 的行为＝内存仓"。
+    #[derive(Clone)]
+    struct DirtyRowSpyRepo {
+        inner: Arc<MemoryRepository>,
+        dirty: Arc<std::sync::Mutex<HashMap<i64, Vec<String>>>>,
+        remove_calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl DirtyRowSpyRepo {
+        fn new(inner: Arc<MemoryRepository>) -> Self {
+            DirtyRowSpyRepo {
+                inner,
+                dirty: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                remove_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        /// 塞一条历史脏行（**故意不归一**——要造的就是"修复前落库"的原值行）。
+        fn seed_dirty_row(&self, task_id: i64, actor_id: &str) {
+            self.dirty
+                .lock()
+                .unwrap()
+                .entry(task_id)
+                .or_insert_with(Vec::new)
+                .push(actor_id.to_string());
+        }
+
+        /// 脏行还剩几条（DELETE 按字面命中的判据）。
+        fn dirty_remaining(&self, task_id: i64) -> Vec<String> {
+            self.dirty
+                .lock()
+                .unwrap()
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// 只取"真人"那一半（脏行并进 `find_task_actors` 会干扰别的判据，故取证分离）。
+        fn find_real_actors(&self, task_id: i64) -> Vec<String> {
+            self.inner.find_task_actors(task_id).unwrap()
+        }
+
+        /// 每次 DELETE 的实参（顺序＝调用顺序）。
+        fn remove_calls(&self) -> Vec<Vec<String>> {
+            self.remove_calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ProcessRepository for DirtyRowSpyRepo {
+        fn find_task_actors(&self, task_id: i64) -> JeeflowResult<Vec<String>> {
+            let mut out = self.inner.find_task_actors(task_id)?;
+            let rows: Vec<String> = {
+                let guard = self.dirty.lock().unwrap();
+                guard.get(&task_id).cloned().unwrap_or_default()
+            };
+            out.extend(rows);
+            Ok(out)
+        }
+
+        fn remove_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()> {
+            self.remove_calls.lock().unwrap().push(actors.to_vec());
+            // `DELETE ... actor_id IN (?)` 的逐字语义：字面命中才删（空串实参会真删掉空串行，
+            // 这正是"归一单点丢空 ⇒ 脏行安全"那一格要照出来的地方）。
+            if let Some(rows) = self.dirty.lock().unwrap().get_mut(&task_id) {
+                rows.retain(|row| !actors.iter().any(|a| a == row));
+            }
+            self.inner.remove_task_actor(task_id, actors)
+        }
+
+        // ── 以下逐条转调内存仓（本 spy 只在上面两处偏离）──
+        fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>> {
+            self.inner.find_define_by_id(define_id)
+        }
+        fn save_define(&self, define: &mut ProcessDefine) -> JeeflowResult<()> {
+            self.inner.save_define(define)
+        }
+        fn update_define(&self, define: &ProcessDefine) -> JeeflowResult<()> {
+            self.inner.update_define(define)
+        }
+        fn update_define_state(&self, define_id: i64, state: i32) -> JeeflowResult<()> {
+            self.inner.update_define_state(define_id, state)
+        }
+        fn remove_define(&self, define_id: i64) -> JeeflowResult<()> {
+            self.inner.remove_define(define_id)
+        }
+        fn find_instance_by_id(&self, instance_id: i64) -> JeeflowResult<Option<ProcessInstance>> {
+            self.inner.find_instance_by_id(instance_id)
+        }
+        fn save_instance(&self, instance: &mut ProcessInstance) -> JeeflowResult<()> {
+            self.inner.save_instance(instance)
+        }
+        fn update_instance(&self, instance: &ProcessInstance) -> JeeflowResult<()> {
+            self.inner.update_instance(instance)
+        }
+        fn find_task_by_id(&self, task_id: i64) -> JeeflowResult<Option<ProcessTask>> {
+            self.inner.find_task_by_id(task_id)
+        }
+        fn save_task(&self, task: &mut ProcessTask) -> JeeflowResult<()> {
+            self.inner.save_task(task)
+        }
+        fn update_task(&self, task: &ProcessTask) -> JeeflowResult<()> {
+            self.inner.update_task(task)
+        }
+        fn find_doing_tasks(&self, instance_id: i64, task_names: &[String]) -> JeeflowResult<Vec<ProcessTask>> {
+            self.inner.find_doing_tasks(instance_id, task_names)
+        }
+        fn find_done_tasks(&self, instance_id: i64, task_names: &[String]) -> JeeflowResult<Vec<ProcessTask>> {
+            self.inner.find_done_tasks(instance_id, task_names)
+        }
+        fn find_history_tasks(&self, instance_id: i64) -> JeeflowResult<Vec<ProcessTask>> {
+            self.inner.find_history_tasks(instance_id)
+        }
+        fn add_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()> {
+            self.inner.add_task_actor(task_id, actors)
+        }
+        fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()> {
+            self.inner.create_cc_instance(instance_id, creator, actor_ids)
+        }
+        fn find_cc_actor_ids(&self, instance_id: i64) -> JeeflowResult<Vec<String>> {
+            self.inner.find_cc_actor_ids(instance_id)
+        }
+        fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()> {
+            self.inner.update_cc_status(instance_id, actor_id)
+        }
+        fn page_todo_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
+            self.inner.page_todo_tasks(query)
+        }
+        fn page_done_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
+            self.inner.page_done_tasks(query)
+        }
+        fn page_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
+            self.inner.page_instances(query)
+        }
+        fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
+            self.inner.page_cc_instances(query)
+        }
+        fn page_defines(&self, query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>> {
+            self.inner.page_defines(query)
+        }
+        fn count_todo_tasks(&self, user_id: &str) -> JeeflowResult<i64> {
+            self.inner.count_todo_tasks(user_id)
+        }
+        fn get_all_instances(&self) -> JeeflowResult<Vec<ProcessInstance>> {
+            self.inner.get_all_instances()
+        }
+        fn get_all_tasks(&self) -> JeeflowResult<Vec<ProcessTask>> {
+            self.inner.get_all_tasks()
+        }
+    }
+
+    /// 事件录制器：语义 2「不 fire 事件」的取证腿——本栈一切 fire 都走
+    /// `ServiceContext::event_listeners`（`JeeflowEngineImpl::fire_event` → `ProcessPublisher::notify`），
+    /// 挂上它就能断言"这次调用一条都没发"。探针**有牙**由 `leaves_no_trace` 那一格末段反证
+    /// （同一装配下 transfer 必须录得到 TASK_TRANSFER），否则"零事件"可能只是监听器没挂上的空转。
+    struct SpyEventListener(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl ProcessEventListener for SpyEventListener {
+        fn on_event(&self, event: &ProcessEvent) {
+            self.0.lock().unwrap().push(event.spec_label());
+        }
+    }
+
+    /// `(门面, spy 仓储, 事件录制)` 三件套：门面与引擎都走 spy 仓储；扩展仓储仍指内存仓本体
+    /// （processDesign/* 不经过被覆写的那两处）。
+    fn make_remove_actor_fixture() -> (
+        JeeflowFacade,
+        Arc<DirtyRowSpyRepo>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let inner = Arc::new(MemoryRepository::new());
+        let repo = Arc::new(DirtyRowSpyRepo::new(inner.clone()));
+        let events: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(inner as Arc<dyn ProcessExtRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        ctx.register_event_listener(Arc::new(SpyEventListener(events.clone())));
+        (JeeflowFacade::new(ctx), repo, events)
+    }
+
+    /// `removeTaskActor` 入参：`operator` 给 `None` ＝**整条不传**（必填档的"缺省"形状，
+    /// 比传空串更能证明门面没有偷偷回落固定账号）。
+    fn remove_actor_args(task_id: Json, actor_ids: Json, operator: Option<&str>) -> HashMap<String, Json> {
+        let mut m = HashMap::new();
+        m.insert("processTaskId".to_string(), task_id);
+        m.insert("actorIds".to_string(), actor_ids);
+        if let Some(op) = operator {
+            m.insert("operator".to_string(), json!(op));
+        }
+        m
+    }
+
+    async fn call_remove(
+        facade: &JeeflowFacade,
+        task_id: Json,
+        actor_ids: Json,
+        operator: Option<&str>,
+    ) -> Json {
+        facade
+            .flow("processTask/removeTaskActor", &remove_actor_args(task_id, actor_ids, operator))
+            .await
+    }
+
+    /// 造多参与人现场：用兄弟 action（`addCandidate` 追加），不直接塞仓储。
+    async fn seed_participants(facade: &JeeflowFacade, task_id: i64, ids: &[&str]) {
+        let r = facade
+            .flow("processTask/addCandidate", &surrogate_args(task_id, json!(ids)))
+            .await;
+        assert_eq!(r["code"], 0, "夹具加签失败: {r}");
+    }
+
+    fn recorded_events(events: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
+        events.lock().unwrap().clone()
+    }
+
+    fn drain_events(events: &Arc<std::sync::Mutex<Vec<String>>>) {
+        events.lock().unwrap().clear();
+    }
+
+    // ─── 语义 1「只摘不加」＋ 正向核心 ───
+
+    /// ① 只摘点名的人，其余参与人**按顺序原样保留**；成功信封 code=0／msg=成功／data=null。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_removes_only_the_named_actor() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_only").await;
+        seed_participants(&facade, task_id, &["9001", "9002"]).await;
+        assert_eq!(actors_of(&facade, task_id), vec!["user2", "9001", "9002"], "夹具前提");
+
+        let r = call_remove(&facade, json!(task_id), json!(["9001"]), Some("flow.admin")).await;
+
+        assert_eq!(r["code"], 0, "只摘点名的人应成功: {r}");
+        assert_eq!(r["msg"], "成功");
+        assert!(r["data"].is_null(), "data 出 null（spec 同节：前端消费面不读 data）: {r}");
+        assert_eq!(
+            actors_of(&facade, task_id),
+            vec!["user2", "9002"],
+            "只删点名的 9001，其余参与人原样保留（含顺序）"
+        );
+        assert_eq!(repo.find_real_actors(task_id), vec!["user2", "9002"]);
+        assert_eq!(repo.remove_calls(), vec![vec!["9001".to_string()]], "一次调用一条 DELETE");
+    }
+
+    /// ② 一次摘多人（集合语义，不是"一次只能摘一个人"）。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_removes_several_in_one_call() {
+        let (facade, _repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_multi").await;
+        seed_participants(&facade, task_id, &["9001", "9002", "9003"]).await;
+
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!(["9001", "9002"]), Some("flow.admin")).await["code"],
+            0
+        );
+
+        assert_eq!(actors_of(&facade, task_id), vec!["user2", "9003"]);
+    }
+
+    /// ③ 逗号串腿与数组腿同判据（§2.11「两形一把尺子」，摘人腿不得另抄一份）：
+    /// `"9001, 9002 "` 带空格也照删，且喂进 DELETE 的是归一后（＝行上原值）的那两个人。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_comma_string_form_same_judge() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_comma").await;
+        seed_participants(&facade, task_id, &["9001", "9002"]).await;
+
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!("9001, 9002 "), Some("flow.admin")).await["code"],
+            0
+        );
+
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"], "逗号串带空格照样命中");
+        assert_eq!(repo.remove_calls(), vec![vec!["9001".to_string(), "9002".to_string()]]);
+    }
+
+    // ─── 语义 3「归属判据同 transfer」：只能摘自己那一票，auto/admin 例外 ───
+
+    /// ④ 本人摘自己那一票不需要特权；`operator` 带空格的同一人也放行（比较**按归一值**做）。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_self_removal_needs_no_privilege() {
+        let (facade, _repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_self").await;
+        seed_participants(&facade, task_id, &["9001", "9002"]).await;
+
+        assert_eq!(call_remove(&facade, json!(task_id), json!(["9001"]), Some("9001")).await["code"], 0);
+        assert_eq!(actors_of(&facade, task_id), vec!["user2", "9002"]);
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!(["9002"]), Some(" 9002 ")).await["code"],
+            0,
+            "operator 带空格的同一人必须判成同一人（§2.11 归一后再比）"
+        );
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"]);
+    }
+
+    /// ⑤ 借道摘他人必须拦下（transfer 能"摘 A 加 B"是因为 A＝操作人本人，本 action 同理不得
+    /// 成为借道摘他人的口子），而且报错后**一条都不许删**。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_cannot_remove_someone_else() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_piggyback").await;
+        seed_participants(&facade, task_id, &["9001"]).await;
+
+        let r = call_remove(&facade, json!(task_id), json!(["9001"]), Some("user2")).await;
+
+        assert_eq!(r["msg"], "无权限摘除该任务参与人", "{r}");
+        assert_eq!(r["code"], 99999999);
+        assert_eq!(actors_of(&facade, task_id), vec!["user2", "9001"], "报错后一条都不许删");
+        assert!(repo.remove_calls().is_empty(), "鉴权不过时不得喂 DELETE");
+    }
+
+    /// ⑥ `flow.auto` 与 `flow.admin` 同档放行（大小写不敏感沿用本栈既有
+    /// `is_privileged_operator`，不另立判据）。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_privileged_operators() {
+        let (facade, _repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_privileged").await;
+        seed_participants(&facade, task_id, &["9001", "9002", "9003"]).await;
+
+        for (who, victim) in [("flow.auto", "9001"), ("FLOW.ADMIN", "9002"), ("flow.Admin", "9003")] {
+            assert_eq!(
+                call_remove(&facade, json!(task_id), json!([victim]), Some(who)).await["code"],
+                0,
+                "{who} 摘 {victim} 应放行"
+            );
+        }
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"]);
+    }
+
+    // ─── 语义 5「不得摘空」：判据是集合差，不是入参条数 ───
+
+    /// ⑦ 摘空报错——少了这一条，一次误操作就会留下**永远无人可办、也无法撤回重派**的死任务。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_never_empties_the_task() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_empty").await;
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"], "夹具前提：唯一参与人");
+
+        let r = call_remove(&facade, json!(task_id), json!(["user2"]), Some("user2")).await;
+
+        assert_eq!(r["msg"], "至少需保留一名参与人", "{r}");
+        assert_eq!(r["code"], 99999999);
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"], "人还在");
+        assert!(repo.remove_calls().is_empty(), "下限不过 ⇒ 一条都不喂 DELETE");
+    }
+
+    /// ⑧ 绕过档：`actorIds` 里混进非参与者 id，"入参条数 < 参与人数"那种判据会放过去，
+    /// 集合差判据必须照样拦下（spec 语义 5 第二句）。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_mixed_ghost_cannot_bypass_floor() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_ghost_floor").await;
+        seed_participants(&facade, task_id, &["9001"]).await;
+
+        let r = call_remove(&facade, json!(task_id), json!(["user2", "9001", "ghost"]), Some("user2")).await;
+
+        assert_eq!(r["msg"], "至少需保留一名参与人", "集合差为空 ⇒ 混入 ghost 也绕不过下限: {r}");
+        assert_eq!(actors_of(&facade, task_id), vec!["user2", "9001"]);
+        assert!(repo.remove_calls().is_empty());
+    }
+
+    // ─── 语义 4「只作用于进行中任务」 ───
+
+    /// ⑨ 非 DOING 一律拦下，且**历史参与人行不动**（它是 approvalRecord 的取证依据，
+    /// 摘它等于改写审批历史）。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_finished_task_is_protected() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_finished").await;
+        assert_eq!(exec_task(&facade, task_id, "user2", vec![]).await["code"], 0, "夹具办结失败");
+        let finished = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        assert_ne!(finished.task_state, TaskState::Doing.code(), "夹具前提：任务已离开 DOING");
+
+        let r = call_remove(&facade, json!(task_id), json!(["user2"]), Some("flow.admin")).await;
+
+        assert_eq!(r["msg"], "任务非进行中，不可摘除参与人", "{r}");
+        assert_eq!(r["code"], 99999999);
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"], "历史参与人行不得被改写");
+        assert!(repo.remove_calls().is_empty());
+    }
+
+    // ─── 语义 2「不留痕且不 fire 事件」 ───
+
+    /// ⑩ 零留痕＋零事件：不置 submitType、不写 tf_transferHistory/tf_transferTo/tf_transferReason/
+    /// tf_approvalComment、不覆写任务行 actor_id/update_user/update_time（**取改前快照再比**，
+    /// 建单路径本来就会写这两列，不能假定它是 null）；一条事件都不发。
+    /// 末段反证事件探针有牙：同一装配下 transfer 确实 fire 码 7。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_leaves_no_trace_and_fires_no_event() {
+        let (facade, _repo, events) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_trace").await;
+        seed_participants(&facade, task_id, &["9001"]).await;
+        drain_events(&events); // 夹具（发起/起单）发的码不算在本次账上
+        let before = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!(["9001"]), Some("flow.admin")).await["code"],
+            0
+        );
+
+        assert!(
+            recorded_events(&events).is_empty(),
+            "摘人不在 issues/132 定稿事件集里，一律不 fire（码 7 的语义是「参与者被替换」）: {:?}",
+            recorded_events(&events)
+        );
+        let after = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        assert_eq!(after.variables, before.variables, "不写任何任务变量（整张变量表逐键不变）");
+        for key in [
+            "submitType",
+            "tf_transferHistory",
+            "tf_transferTo",
+            "tf_transferReason",
+            "tf_approvalComment",
+        ] {
+            assert!(!after.variables.contains_key(key), "不留痕：任务变量里不得出现 {key}");
+        }
+        assert_eq!(
+            after.update_user, before.update_user,
+            "不覆写 update_user（判据是「摘人这一步没动它」，不是「它本来是 null」）"
+        );
+        assert_eq!(after.update_time, before.update_time, "不覆写 update_time");
+        assert_eq!(after.actor_id, before.actor_id, "不覆写 actor_id 列");
+        assert_eq!(after.task_state, before.task_state, "不改任务状态");
+
+        // 探针有牙的反证：同一次装配里转办必须录得到 TASK_TRANSFER（否则上面的"零事件"不作数）
+        assert_eq!(
+            facade
+                .flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "user2"))
+                .await["code"],
+            0
+        );
+        assert!(
+            recorded_events(&events)
+                .iter()
+                .any(|e| e.starts_with("TASK_TRANSFER/")),
+            "事件探针空转（连转办都没录到），那上面的「零事件」断言就不作数: {:?}",
+            recorded_events(&events)
+        );
+    }
+
+    // ─── 语义 7「幂等」 ───
+
+    /// ⑪ 非参与者静默忽略（不报错）、一个都没命中 ⇒ 空操作仍返回成功信封、重放第二次成功。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_is_idempotent() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_idempotent").await;
+        seed_participants(&facade, task_id, &["9001"]).await;
+
+        assert_eq!(call_remove(&facade, json!(task_id), json!(["9001"]), Some("flow.admin")).await["code"], 0);
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"]);
+
+        let replay = call_remove(&facade, json!(task_id), json!(["9001"]), Some("flow.admin")).await;
+        assert_eq!(replay["code"], 0, "同一次摘人重放第二次应得成功信封（前端双点/集成层重放）: {replay}");
+        assert_eq!(replay["msg"], "成功");
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"]);
+
+        let ghost = call_remove(&facade, json!(task_id), json!(["ghost"]), Some("flow.admin")).await;
+        assert_eq!(ghost["code"], 0, "非参与者静默忽略、不报错: {ghost}");
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"]);
+        assert_eq!(repo.remove_calls().len(), 1, "重放与 ghost 都不该再喂 DELETE");
+    }
+
+    // ─── 必填档逐字文案 ＋ 守卫次序（spec 同节钉死，八栈不接受自行排序）───
+
+    /// ⑫ 五个报错档的逐字文案：`operator 必填`（缺省／纯空白两支，严禁回落 user1）／
+    /// `processTaskId/actorIds 缺失`（与 surrogate 同族同文案）／`任务不存在`；
+    /// 并且五档**一条都不许删**。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_missing_arms_reuse_existing_envelope() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_arms").await;
+        seed_participants(&facade, task_id, &["9001"]).await;
+        let before = actors_of(&facade, task_id);
+
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!(["9001"]), None).await["msg"],
+            "operator 必填",
+            "缺省 operator ⇒ 必填档（严禁缺省回落 user1）"
+        );
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!(["9001"]), Some("   ")).await["msg"],
+            "operator 必填",
+            "纯空白 operator 也不给过"
+        );
+
+        // 主键整条没给 ⇒ 与 surrogate/addCandidate 同一逐字文案（同族同文案，不另造）
+        let mut no_pk = HashMap::new();
+        no_pk.insert("actorIds".to_string(), json!(["9001"]));
+        no_pk.insert("operator".to_string(), json!("flow.admin"));
+        assert_eq!(
+            facade.flow("processTask/removeTaskActor", &no_pk).await["msg"],
+            "processTaskId/actorIds 缺失"
+        );
+        // actorIds 归一后为空 ⇒ 同一档（空串元素也绝不能被喂进 DELETE）
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!(["", "  ", null]), Some("flow.admin")).await["msg"],
+            "processTaskId/actorIds 缺失"
+        );
+        // 主键空串/纯空白 ⇒ 缺参数档（spec 语义 8：与缺键、0/负数同判，java `toLong("")` 同档）
+        assert_eq!(
+            call_remove(&facade, json!(""), json!(["9001"]), Some("flow.admin")).await["msg"],
+            "processTaskId/actorIds 缺失",
+            "空串主键必须落缺参数档，不得折进本栈「非法id」——八栈这一档逐字同答案"
+        );
+        assert_eq!(
+            call_remove(&facade, json!("   "), json!(["9001"]), Some("flow.admin")).await["msg"],
+            "processTaskId/actorIds 缺失",
+            "纯空白与空串同档"
+        );
+        // 主键"给了但不是数字" ⇒ 仍走本栈既有「非法id」信封（spec 明文**不**统一这一档，
+        //   兄弟 action 同款形状，本轮不回改它们）
+        let bad_rm = call_remove(&facade, json!("abc"), json!(["9001"]), Some("flow.admin")).await;
+        assert!(
+            bad_rm["msg"].as_str().unwrap_or("").contains("非法id"),
+            "非数字主键应沿用本栈既有「非法id」档，实得 {bad_rm}"
+        );
+        // 任务不存在（本 action 的逐字判据，八栈一致）
+        assert_eq!(
+            call_remove(&facade, json!(424242), json!(["9001"]), Some("flow.admin")).await["msg"],
+            "任务不存在"
+        );
+
+        assert_eq!(actors_of(&facade, task_id), before, "以上报错档一条都不许删（写死条数每次加档都要漂，故不写数）");
+        assert!(repo.remove_calls().is_empty(), "报错档不得喂 DELETE");
+    }
+
+    /// ⑬ 守卫次序两支：`operator 必填` 排在缺参数之前（否则鉴权缺口会被参数报错藏起来）；
+    /// 权限档排在非进行中之前（否则外人可以靠"任务已完成"探到别人的任务状态）。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_guard_order_is_fixed_across_stacks() {
+        let (facade, _repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_order").await;
+
+        let mut nothing = HashMap::new();
+        nothing.insert("operator".to_string(), json!("   "));
+        assert_eq!(
+            facade.flow("processTask/removeTaskActor", &nothing).await["msg"],
+            "operator 必填",
+            "参数全缺时 operator 必填先判：主键缺失不得抢在它前面"
+        );
+
+        assert_eq!(exec_task(&facade, task_id, "user2", vec![]).await["code"], 0);
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!(["user2"]), Some("outsider")).await["msg"],
+            "无权限摘除该任务参与人",
+            "权限档先于非进行中档"
+        );
+    }
+
+    // ─── 语义 5＋6 的脏行腿（test-only spy 仓储）───
+
+    /// ⑭ 带空格入参删得掉真人 ∧ 空值不误删 `actor_id=''` 脏行 ∧ 喂进仓储删除的实参不含空值。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_whitespace_padded_and_dirty_rows_survive() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_whitespace").await;
+        seed_participants(&facade, task_id, &["9001", "9002"]).await;
+        repo.seed_dirty_row(task_id, ""); // 历史脏行：内存仓写侧归一，正常路径建不出来
+        repo.seed_dirty_row(task_id, "   ");
+
+        assert_eq!(
+            call_remove(
+                &facade,
+                json!(task_id),
+                json!([" 9001 ", "", null, "   ", "9002"]),
+                Some("flow.admin")
+            )
+            .await["code"],
+            0
+        );
+
+        assert_eq!(
+            repo.find_real_actors(task_id),
+            vec!["user2"],
+            "带空格的入参删得掉真人，其余参与人不动"
+        );
+        assert_eq!(
+            repo.dirty_remaining(task_id),
+            vec!["", "   "],
+            "空串/纯空白绝不能喂进 DELETE ⇒ 历史脏行必须原样还在"
+        );
+        for call in repo.remove_calls() {
+            for actor in &call {
+                assert!(!actor.trim().is_empty(), "喂给 DELETE 的实参不得含空串/纯空白: {:?}", call);
+            }
+        }
+    }
+
+    /// ⑮ 语义 6 的正体：库里的行是修复前落下的未 trim 原值 `" 9101 "`，入参给 `"9101"` ⇒
+    /// **判成同一个人并真删掉**，且喂进 DELETE 的实参是**那一行的原值**。
+    /// 反面形状＝拿归一值去删：判成同一人却一条没删，门面报成功而被摘的人待办还在（假成功）。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_untrimmed_row_matched_and_deleted_by_row_value() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_untrimmed").await;
+        repo.seed_dirty_row(task_id, " 9101 ");
+
+        assert_eq!(
+            call_remove(&facade, json!(task_id), json!(["9101"]), Some("flow.admin")).await["code"],
+            0
+        );
+
+        assert_eq!(repo.find_real_actors(task_id), vec!["user2"], "其余参与人不动");
+        assert_eq!(
+            repo.dirty_remaining(task_id),
+            Vec::<String>::new(),
+            "未 trim 的历史行被归一匹配命中并真删掉了"
+        );
+        let calls = repo.remove_calls();
+        assert_eq!(calls.len(), 1, "{:?}", calls);
+        assert_eq!(
+            calls[0],
+            vec![" 9101 ".to_string()],
+            "DELETE 的实参是行上的原值，不是归一后的值（否则一条没删＝假成功）"
+        );
+    }
+
+    /// ⑯ 「至少剩一名参与人」的下限按**能办单的人数**算：库里只剩 `actor_id=''`/纯空白脏行时，
+    /// 摘走最后一个真人仍须报错——脏行谁也办不了，拿它撑住下限等于让"摘空"伪装成成功。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_dirty_rows_do_not_prop_up_the_keep_one_floor() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_dirty_floor").await;
+        repo.seed_dirty_row(task_id, "");
+        repo.seed_dirty_row(task_id, "   ");
+
+        let r = call_remove(&facade, json!(task_id), json!(["user2"]), Some("flow.admin")).await;
+
+        assert_eq!(r["msg"], "至少需保留一名参与人", "脏行不算一个人: {r}");
+        assert_eq!(repo.find_real_actors(task_id), vec!["user2"], "报错后真人那行还在");
+        assert_eq!(repo.dirty_remaining(task_id), vec!["", "   "], "报错后脏行也不动");
+        assert!(repo.remove_calls().is_empty(), "下限不过 ⇒ 一条都不喂 DELETE");
+    }
+
+    // ─── 兄弟 action 回归（三条混用是本组判据最怕的分叉）───
+
+    /// ⑰ `surrogate` 仍旧只加不摘、`transfer` 仍旧换人＋写 submitType=7＋fire 码 7，
+    /// 本 action 夹在中间"只摘不加零留痕"——三条各自的形状都不许被这次改动带偏。
+    #[tokio::test]
+    async fn test_i115_remove_task_actor_siblings_keep_their_own_semantics() {
+        let (facade, _repo, events) = make_remove_actor_fixture();
+        let (_iid, task_id) = start_two_step_flow(&facade, "ra115_siblings").await;
+
+        assert_eq!(
+            facade.flow("processTask/surrogate", &surrogate_args(task_id, json!(["9101"]))).await["code"],
+            0
+        );
+        assert_eq!(actors_of(&facade, task_id), vec!["user2", "9101"], "surrogate 仍旧只加不摘");
+
+        assert_eq!(call_remove(&facade, json!(task_id), json!(["9101"]), Some("flow.admin")).await["code"], 0);
+        assert_eq!(actors_of(&facade, task_id), vec!["user2"], "摘人不带加人");
+        assert!(
+            !facade
+                .repo()
+                .find_task_by_id(task_id)
+                .unwrap()
+                .unwrap()
+                .variables
+                .contains_key("submitType"),
+            "摘人不置 submitType（那是 transfer 的留痕）"
+        );
+
+        drain_events(&events);
+        assert_eq!(
+            facade
+                .flow("processTask/transfer", &transfer_args(task_id, "user2", "lisi", "user2"))
+                .await["code"],
+            0
+        );
+        assert_eq!(actors_of(&facade, task_id), vec!["lisi"], "transfer 换人语义不变");
+        let task = facade.repo().find_task_by_id(task_id).unwrap().unwrap();
+        let submit_type = match task.variables.get("submitType") {
+            Some(JsonValue::Number(n)) => *n as i64,
+            Some(JsonValue::Str(s)) => s.parse::<i64>().unwrap_or(-1),
+            _ => -1,
+        };
+        assert_eq!(submit_type, 7, "transfer 仍写 submitType=7 留痕");
+        assert!(
+            recorded_events(&events)
+                .iter()
+                .any(|e| e.starts_with("TASK_TRANSFER/")),
+            "transfer 仍 fire 码 7: {:?}",
+            recorded_events(&events)
+        );
     }
 }
