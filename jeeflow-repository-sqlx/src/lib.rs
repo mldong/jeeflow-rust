@@ -835,13 +835,20 @@ impl ProcessRepository for SqlxRepository {
     }
 
     fn remove_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()> {
-        // issues/142 §9.2 第二批（spec 06 §2.11 删除位与写侧同一条尺子）：删除列表先过
-        // `model::normalize_actors`（与内存仓同一枚）——「 8601 」删得掉库里的 8601；
-        // 归一后为空 ⇒ 一条 DELETE 都不发（空串入参批量误删历史 actor_id='' 脏行）。
-        let remove = jeeflow_core::model::normalize_actors(actors);
-        if remove.is_empty() { return Ok(()); }
+        // issues/137 §3-6（spec 06 §processTask/removeTaskActor 语义 6，owner 2026-10-02 拍
+        // 「两形并集」，与内存仓同一枚判据＝`jeeflow_core::model::actor_delete_forms`，
+        // issues/117 场景 27 同答案）：空值一律丢弃；非空值以「原值 ∪ trim 值」两形逐个绑
+        // DELETE。为什么不能只取原值：「 8601 」删不掉写侧归一后落库的规范行 8601
+        // （issues/142 §9.2，静默 no-op 报成功）；为什么也不能只取 trim 形（1.8.36 之前
+        // 本仓正是这个形状）：门面按语义 6 交出的是**行上的原值**，修复前落下的未 trim
+        // 历史脏行「 9101 」被削成 9101，真库 NO PAD 排序规则下那一行删不掉而门面报成功
+        // ——被摘的人待办还在。并集为空 ⇒ 早退，一条 DELETE 都不发（空串入参会批量误删
+        // 历史 actor_id='' 脏行，issues/129 的删除位对偶）。
+        // 展开在 `block_on` 之前完成（同步 SPI，不引入持锁跨 await），库内逐元素绑定删除。
+        let forms = jeeflow_core::model::actor_delete_forms(actors);
+        if forms.is_empty() { return Ok(()); }
         self.block_on(async {
-            for actor in &remove {
+            for actor in &forms {
                 sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id = ?")
                     .bind(task_id)
                     .bind(actor)
@@ -4316,6 +4323,163 @@ mod tests {
 
         assert_eq!(task_actor_rows(&pool, task_id).await, vec!["".to_string()],
             "§9.2 删除位：trim 命中 + 空档零删除，脏行原样保留");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/137 §3-6 · 参与者删除腿「原值 ∪ trim 值」两形并集（sqlx 真库这一支 · spec 06 语义 6）
+    //   判据本体＝`jeeflow_core::model::actor_delete_forms`（与内存仓 `actor_delete_forms_tests`
+    //   同一枚，issues/117 场景 27 同答案）。改前本仓删除位过 `normalize_actors`＝只取 trim 形，
+    //   真库（NO PAD 排序规则）下面目按语义 6 交出的行原值「 9101 」被削成 9101，脏行删不掉而
+    //   门面报成功——本组第一格 N 档在改前正是红的。
+    //   种脏行必须**绕开写侧归一**（`add_task_actor` 会 trim＋丢空，正常路径建不出脏行）：直接
+    //   INSERT 到 `wf_process_task_actor`（该表无外键，参与者台账可独立于任务行读写）。断言打在
+    //   **库里真实存着的列值**上（`task_actor_rows` 读 actor_id 列，不走 find_task_actors）。
+    //   ID 段：9137xx（本组独占，避开 900xxx／9141xx／9142xx 既有用例段）。
+    // ═══════════════════════════════════════════════════════
+
+    /// 直插参与者行（绕开 add_task_actor 的写侧归一，用来种未 trim 脏行 / 空值脏行）。
+    /// 行 id 按 `task_id*100 + idx` **确定性**派生（对齐既有 i142 用例硬编码 914206001 的姿势）：
+    /// 每个用例开头 `clean_i142_task_actor` 按 process_task_id 清场，正好覆盖本用例独占的 id 段，
+    /// 跨进程重跑（含前一轮断言失败未走到尾部清场的残留）也不会撞主键。
+    async fn seed_i137_task_actor(pool: &MySqlPool, task_id: i64, idx: i64, actor_id: &str) {
+        let row_id = task_id * 100 + idx;
+        sqlx::query("INSERT INTO wf_process_task_actor (id, process_task_id, actor_id, create_time) VALUES (?, ?, ?, ?)")
+            .bind(row_id).bind(task_id).bind(actor_id).bind(current_time_str())
+            .execute(pool).await.unwrap();
+    }
+
+    /// N 档（假成功修复，改前必红）：库里躺着修复前落下的未 trim 历史脏行「 9101 」＋规范行，
+    /// 门面按语义 6 交出**行上的原值**去删 ⇒ 脏行必须真消失（真库 NO PAD 下原值形才命中）。
+    /// 只取 trim 形的实现（改前 rust）把「 9101 」削成 9101，脏行留在库里、门面报成功。
+    #[tokio::test]
+    async fn test_mysql_i137_remove_task_actor_deletes_untrimmed_legacy_row_by_raw_form() {
+        let task_id: i64 = 913701;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        seed_i137_task_actor(&pool, task_id, 0, " 9101 ").await; // 未 trim 历史脏行（原值形）
+        seed_i137_task_actor(&pool, task_id, 1, "leader").await; // 无关参与人，一行不许动
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            SqlxRepository::new(pool2).remove_task_actor(task_id, &[" 9101 ".into()]).unwrap();
+        }).await;
+
+        assert_eq!(task_actor_rows(&pool, task_id).await, vec!["leader".to_string()],
+            "语义 6：未 trim 历史脏行「 9101 」必须被原值形真删掉（真库读回；否则是假成功）");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// N 档（142 §9.2 那一路不破）：写侧归一后的规范行 8601，第三方绕过门面直连仓储传「 8601 」
+    /// ⇒ 靠 trim 形也必须删得掉。改前改后都要绿。
+    #[tokio::test]
+    async fn test_mysql_i137_remove_task_actor_still_deletes_normalized_row_by_trimmed_form() {
+        let task_id: i64 = 913702;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            // add_task_actor 写侧归一 ⇒ 落库是 trim 后的规范行 8601
+            SqlxRepository::new(pool2).add_task_actor(task_id, &["  8601  ".into(), "leader".into()]).unwrap();
+        }).await;
+        assert_eq!(task_actor_rows(&pool, task_id).await, vec!["8601".to_string(), "leader".to_string()],
+            "前置：写侧落库是规范行 8601");
+
+        let pool3 = pool.clone();
+        run_sync(move || {
+            SqlxRepository::new(pool3).remove_task_actor(task_id, &[" 8601 ".into()]).unwrap();
+        }).await;
+
+        assert_eq!(task_actor_rows(&pool, task_id).await, vec!["leader".to_string()],
+            "规范行由 trim 形命中（issues/142 §9.2 既有判据不破）");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// 脏行与规范行并存 ⇒ 同一个人（§2.11 归一口径）名下两行都摘掉，其余参与人一行不动。
+    #[tokio::test]
+    async fn test_mysql_i137_remove_task_actor_removes_both_forms_together() {
+        let task_id: i64 = 913703;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        seed_i137_task_actor(&pool, task_id, 0, " 9101 ").await; // 脏行（原值形）
+        seed_i137_task_actor(&pool, task_id, 1, "9101").await;   // 规范行（trim 形）
+        seed_i137_task_actor(&pool, task_id, 2, "leader").await;
+        seed_i137_task_actor(&pool, task_id, 3, "boss").await;
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            SqlxRepository::new(pool2).remove_task_actor(task_id, &[" 9101 ".into()]).unwrap();
+        }).await;
+
+        let mut left = task_actor_rows(&pool, task_id).await;
+        left.sort();
+        assert_eq!(left, vec!["boss".to_string(), "leader".to_string()],
+            "归一后同一个人 ⇒ 脏行与规范行两行都摘，其余参与人原样保留（语义 1）");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// P 档（脏行保护）：空值入参不得删掉 actor_id='' 脏行；全空入参（[""]／[]）⇒ 零删除，
+    /// 不得清空全部参与者（语义 6 义务③：并集为空则早退，一条 DELETE 都不发）。
+    #[tokio::test]
+    async fn test_mysql_i137_blank_input_never_deletes_dirty_row_nor_clears_all() {
+        let task_id: i64 = 913704;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        seed_i137_task_actor(&pool, task_id, 0, "").await;     // 历史 actor_id='' 脏行
+        seed_i137_task_actor(&pool, task_id, 1, "zhangsan").await;
+        seed_i137_task_actor(&pool, task_id, 2, "leader").await;
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.remove_task_actor(task_id, &["".to_string(), "   ".to_string(), "\t".to_string()]).unwrap();
+            repo.remove_task_actor(task_id, &[]).unwrap();
+        }).await;
+
+        let rows = task_actor_rows(&pool, task_id).await;
+        assert_eq!(rows.len(), 3, "空值/空列表入参 ⇒ 零删除，三行（含 actor_id='' 脏行）原样保留");
+        assert!(rows.iter().any(|a| a == ""), "历史 actor_id='' 脏行不得被空串入参批量误删");
+        assert!(rows.contains(&"zhangsan".to_string()) && rows.contains(&"leader".to_string()),
+            "不得退化成清空全部参与者");
+        clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// 非参与者静默忽略（语义 7 幂等）＋任务不存在 ⇒ 零操作不 panic（真库这一支）。
+    #[tokio::test]
+    async fn test_mysql_i137_unknown_actor_ignored_and_unknown_task_noop() {
+        let task_id: i64 = 913705;
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        clean_i142_task_actor(&pool, task_id).await;
+
+        seed_i137_task_actor(&pool, task_id, 0, "zhangsan").await;
+        seed_i137_task_actor(&pool, task_id, 1, "leader").await;
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            repo.remove_task_actor(task_id, &["stranger".into(), " 9999 ".into()]).unwrap();
+            // 任务不存在（无任何参与者行）⇒ 零操作、不 panic
+            repo.remove_task_actor(404404, &[" 9101 ".into()]).unwrap();
+        }).await;
+
+        assert_eq!(task_actor_rows(&pool, task_id).await,
+            vec!["zhangsan".to_string(), "leader".to_string()],
+            "非参与者静默忽略，既有参与者一行不动");
+        assert!(task_actor_rows(&pool, 404404).await.is_empty(), "不存在任务的参与者台账仍为空");
         clean_i142_task_actor(&pool, task_id).await;
     }
 }

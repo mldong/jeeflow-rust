@@ -311,15 +311,21 @@ impl ProcessRepository for MemoryRepository {
     }
 
     fn remove_task_actor(&self, task_id: i64, remove_actors: &[String]) -> JeeflowResult<()> {
-        // issues/142 §9.2 第二批（spec 06 §2.11 同一把尺子搬到删除位）：删除列表先过
-        // `model::normalize_actors`——不 trim 则「 8601 」删不掉库里 trim 后的 8601（静默
-        // no-op 报成功）；归一后为空 ⇒ 什么都不删（早退），空串入参在历史 actor_id='' 脏行上
-        // 会批量误删（issues/129 的删除位对偶）。与 sqlx 仓同一条判据、同一个答案。
-        let remove = crate::model::normalize_actors(remove_actors);
-        if remove.is_empty() { return Ok(()); }
+        // issues/137 §3-6（spec 06 §processTask/removeTaskActor 语义 6，owner 2026-10-02 拍
+        // 「两形并集」）：删除列表过 `model::actor_delete_forms`——空值一律丢弃，非空值展开成
+        // 「原值 ∪ trim 值」两形并集。为什么不能只取原值：第三方绕过门面直连仓储传「 8601 」时，
+        // 删不掉写侧归一后落库的规范行 8601（issues/142 §9.2，静默 no-op 报成功）；为什么也
+        // 不能只取 trim 形（1.8.36 之前本仓正是这个形状）：门面按语义 6 交出的是**行上的原值**，
+        // 修复前落下的未 trim 历史脏行「 9101 」被削成 9101，真库 NO PAD 排序规则下那一行
+        // 删不掉而门面报成功——被摘的人待办还在。两形并集同时满足两侧。
+        // 并集为空 ⇒ 早退，一条删除都不发（空串入参在历史 actor_id='' 脏行上会批量误删，
+        // issues/129 的删除位对偶）。与 sqlx 仓同一条判据、同一个答案（issues/117 场景 27）。
+        // 展开排在取锁之前（本函数不 await，锁只在函数体内取放一次）。
+        let forms = crate::model::actor_delete_forms(remove_actors);
+        if forms.is_empty() { return Ok(()); }
         let mut actors = self.task_actors.lock().unwrap();
         if let Some(entry) = actors.get_mut(&task_id) {
-            entry.retain(|a| !remove.contains(a));
+            entry.retain(|a| !forms.contains(a));
         }
         Ok(())
     }
@@ -1821,5 +1827,103 @@ mod actor_i142_tests {
         assert_eq!(repo.find_task_actors(TASK).unwrap(),
             vec!["i142e".to_string(), "".to_string()],
             "归一后为空 ⇒ 一行都不删（issues/129 删除位对偶）");
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// issues/137 §3-6 · 参与者删除腿「原值 ∪ trim 值」两形并集（内存仓这一支）
+//   立法＝spec 06-facade.md §processTask/removeTaskActor 语义 6 ＋ §2.11 写点表删除腿行
+//   （owner 2026-10-02 拍「两形并集」）。判据本体只有一枚＝`crate::model::actor_delete_forms`；
+//   真库那一支的对拍在 `jeeflow-repository-sqlx` 的 `test_mysql_i137_*`，
+//   两仓必须同一条判据、同一个答案（issues/117 场景 27）。
+//   改前 rust 是"只取 trim 形"那一派（删除位过 `normalize_actors`）：门面按语义 6 交出的
+//   行上原值「 9101 」被削成 9101，未 trim 历史脏行删不掉而门面报成功——本组第一格 N 档
+//   在改前正是红的（rust 的假成功实证）。
+//   种脏行必须**绕开写侧归一**（`add_task_actor` 会 trim＋丢空，正常路径建不出脏行）：
+//   直接插 `task_actors` 台账；断言打在仓储里真实存着的值上（`find_task_actors` 读回）。
+// ═══════════════════════════════════════════════════════
+#[cfg(test)]
+mod actor_delete_forms_tests {
+    use super::*;
+
+    const TASK: i64 = 913701;
+
+    /// 直插台账种行（含未 trim 脏行/空值脏行——写侧归一挡得住的那些形状）。
+    fn seed(repo: &MemoryRepository, actors: &[&str]) {
+        repo.task_actors.lock().unwrap()
+            .insert(TASK, actors.iter().map(|s| s.to_string()).collect());
+    }
+
+    /// N 档（假成功修复，改前必红）：库里躺着修复前落下的未 trim 历史脏行「 9101 」，
+    /// 门面按语义 6 交出**行上的原值**去删 ⇒ 脏行必须真消失。只取 trim 形的实现
+    /// （改前 rust）在这一格把「 9101 」削成 9101，脏行留在库里、门面报成功——被摘的人待办还在。
+    #[test]
+    fn test_i137_remove_task_actor_deletes_untrimmed_legacy_row_by_raw_form() {
+        let repo = MemoryRepository::new();
+        seed(&repo, &[" 9101 ", "leader"]);
+        repo.remove_task_actor(TASK, &[" 9101 ".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(), vec!["leader".to_string()],
+            "语义 6：未 trim 的历史脏行必须被原值形删掉（否则是门面报成功的假成功）");
+    }
+
+    /// N 档（142 §9.2 那一路不破）：写侧归一后的规范行 8601，第三方绕过门面直连仓储
+    /// 传「 8601 」⇒ 靠 trim 形也必须删得掉。
+    #[test]
+    fn test_i137_remove_task_actor_still_deletes_normalized_row_by_trimmed_form() {
+        let repo = MemoryRepository::new();
+        seed(&repo, &["8601", "leader"]);
+        repo.remove_task_actor(TASK, &[" 8601 ".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(), vec!["leader".to_string()],
+            "规范行由 trim 形命中（issues/142 §9.2 的既有判据不破）");
+    }
+
+    /// 脏行与规范行并存 ⇒ 同一个人（§2.11 归一口径）名下两行都摘掉，
+    /// 其余参与人一行不动（语义 1「只摘不加」）。
+    #[test]
+    fn test_i137_remove_task_actor_removes_both_forms_together() {
+        let repo = MemoryRepository::new();
+        seed(&repo, &[" 9101 ", "9101", "leader", "boss"]);
+        repo.remove_task_actor(TASK, &[" 9101 ".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(),
+            vec!["leader".to_string(), "boss".to_string()],
+            "归一后是同一个人 ⇒ 两行都摘，其余参与人原样保留");
+    }
+
+    /// P 档（脏行保护）：空值入参一律不参与匹配——历史 actor_id=''/纯空白脏行
+    /// 是待另案清洗的取证痕迹，不得被一次空值入参批量做掉。
+    #[test]
+    fn test_i137_blank_input_never_deletes_empty_actor_id_dirty_row() {
+        let repo = MemoryRepository::new();
+        seed(&repo, &["", "   ", "leader"]);
+        repo.remove_task_actor(TASK, &["".to_string(), "   ".to_string(), "\t".to_string()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(),
+            vec!["".to_string(), "   ".to_string(), "leader".to_string()],
+            "空值入参一行都不许删（含历史 actor_id=''/纯空白脏行）");
+    }
+
+    /// P 档（不得退化成清空）：并集为空 ⇒ 早退，一次删除都不发生（语义 6 义务③）。
+    #[test]
+    fn test_i137_all_blank_input_is_noop_and_never_clears_all_actors() {
+        let repo = MemoryRepository::new();
+        seed(&repo, &["zhangsan", "leader"]);
+        repo.remove_task_actor(TASK, &["".to_string(), "  ".to_string()]).unwrap();
+        repo.remove_task_actor(TASK, &[]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(),
+            vec!["zhangsan".to_string(), "leader".to_string()],
+            "空入参两形（纯空白/空列表）都是零删除，不得清空全部参与者");
+    }
+
+    /// 非参与者静默忽略（语义 7 幂等）；任务不存在 ⇒ 零操作、不 panic。
+    #[test]
+    fn test_i137_unknown_actor_ignored_and_unknown_task_is_noop() {
+        let repo = MemoryRepository::new();
+        seed(&repo, &["zhangsan", "leader"]);
+        repo.remove_task_actor(TASK, &["stranger".into(), " 9999 ".into()]).unwrap();
+        assert_eq!(repo.find_task_actors(TASK).unwrap(),
+            vec!["zhangsan".to_string(), "leader".to_string()],
+            "非参与者静默忽略，既有参与者一行不动");
+        repo.remove_task_actor(404404, &[" 9101 ".into()]).unwrap();
+        assert!(repo.find_task_actors(404404).unwrap().is_empty(),
+            "删除腿对不存在的 taskId 是零操作，不得 panic");
     }
 }

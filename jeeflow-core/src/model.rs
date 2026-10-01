@@ -853,6 +853,49 @@ pub fn normalize_actors(raw: &[String]) -> Vec<String> {
     out
 }
 
+/// 归属值**删除腿**展开（issues/137 §3-6 · spec 06 §processTask/removeTaskActor 语义 6，
+/// owner 2026-10-02 拍「两形并集」）：把待删列表展开成 `DELETE` 真正要绑的值——
+/// **空值一律丢弃，非空值同时保留「原值」与「trim 值」两形**（保序、按**字面**去重）。
+///
+/// 为什么必须两形、只取一头各有一种假成功（1.8.36 之前八栈正好分成相反的两派，没有一处两全）：
+/// - 只取 **trim 值**（rust 本栈 `memory.rs`/`repository-sqlx` 与 php/csharp/moon 四栈八处的
+///   旧形状）⇒ 门面按语义 6 交出的**行上原值** `" 9101 "`（修复前落下的未 trim 历史脏行）
+///   被削成 `9101`，真库 NO PAD 排序规则下那一行删不掉，门面却报成功——**被摘的人待办还在**；
+/// - 只取 **原值**（go/node/python/java 四栈九处的旧形状）⇒ 第三方绕过门面直连仓储传
+///   `" 8601 "` 时删不掉写侧归一后落库的规范行 `8601`（issues/142 §9.2 那一路）；
+///   且空值照喂 `DELETE`，会把历史 `actor_id=''` 脏行批量误删（那是替脏数据做掉唯一痕迹）。
+///
+/// 两形并集同时满足两侧：脏行按原值形命中、规范行按 trim 形命中。按 §2.11 归一口径
+/// `" 9101 "` 与 `9101` 本就是**同一个人**，两行都删掉才是"摘掉这个人"的正确结果，不构成误删。
+/// **并集包含 trim 形**，因此 issues/142 B 批"删除位 trim"的既有测试无需反向改。
+///
+/// trim 与判空的判据本体仍复用 [`normalize_actors`] 那一枚（spec §2.11 尾注：本函数只加
+/// "原值也进集合"这一层，**不抄第二份 trim/判空代码**）：判空一律 `trim().is_empty()`，
+/// `"0"` 是合法 id 必须留下，且 `"0"` 与 `"00"` 是两个人。去重按**字面**做，不按
+/// "trim 后相同"折叠原值形——`" 9101 "` 与 `"  9101  "` 是两种不同的原值形，
+/// 库里可能正是其中任一种脏法，少带一种就删不掉那一行。
+///
+/// 展开后为空 ⇒ 调用方（两仓 `remove_task_actor`）**早退，一条 `DELETE` 都不发**
+/// （不得退化成"清空该任务全部参与者"）。`task_id` 是主键不是归属值，不进本函数。
+pub fn actor_delete_forms(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len() * 2);
+    for actor in raw {
+        // trim/判空判据本体＝`normalize_actors`（单点，不抄第二份）：
+        // 空白元素 ⇒ 空集合 ⇒ ① 丢弃不喂 DELETE；否则唯一元素就是 trim 形。
+        let trimmed = match normalize_actors(std::slice::from_ref(actor)).pop() {
+            Some(t) => t,
+            None => continue,
+        };
+        if !out.contains(actor) {
+            out.push(actor.clone()); // ② 原值形：保住未 trim 的历史脏行
+        }
+        if !out.contains(&trimmed) {
+            out.push(trimmed); // ② trim 形：保住写侧归一后的规范行
+        }
+    }
+    out
+}
+
 /// 抄送侧的旧名转发（issues/141 G10 当年落地的就是这一枚单点；spec 06 §2.11 尾注
 /// 「各栈的归一判据请复用 §2.10 已落地的那一枚单点……必要时改名成通用的 `normalizeActors`」）。
 ///
@@ -1564,6 +1607,57 @@ mod tests {
             assert_eq!(normalize_cc_actors(&batch), normalize_actors(&batch),
                 "§2.11 尾注：旧名只是转发，两枚名字必须同一判据（入参 {batch:?}）");
         }
+    }
+
+    // ─────────── issues/137 §3-6 · 归属值删除腿「原值 ∪ trim 值」两形并集（语义 6）───────────
+
+    /// 义务①：空串／纯空白／制表换行一律丢弃，一个都不进删除集合；入参空切片 ⇒ 空 Vec
+    /// （调用方据此早退，一条 DELETE 都不发）。
+    #[test]
+    fn test_i137_actor_delete_forms_drops_all_blank_values() {
+        assert_eq!(actor_delete_forms(&v(&["", "   ", "\t", "\n", "\r\n", " \t\n "])),
+            Vec::<String>::new(),
+            "语义 6 义务①：空值一律丢弃，不得喂 DELETE（否则误删 actor_id='' 脏行）");
+        assert!(actor_delete_forms(&v(&[])).is_empty(), "空切片 ⇒ 空 Vec（早退，不发 DELETE）");
+    }
+
+    /// 义务②：非空值**同时**产出「原值」与「trim 值」两形，原值在前（保序）；
+    /// 已经 trim 过的值两形相同 ⇒ 只一份，不让 IN/绑定列表白白翻倍。
+    #[test]
+    fn test_i137_actor_delete_forms_yields_both_forms_raw_first() {
+        assert_eq!(actor_delete_forms(&v(&[" 9101 "])), v(&[" 9101 ", "9101"]),
+            "带空格的值必须两形都进集合：原值删脏行、trim 形删规范行");
+        assert_eq!(actor_delete_forms(&v(&["9101"])), v(&["9101"]),
+            "已 trim 值两形相同 ⇒ 只一份");
+    }
+
+    /// 跨元素去重（按**字面**）：同一原值形重复给 ⇒ 折叠；不同原值形（一个空格/两个空格）
+    /// ⇒ 各自保留——库里可能正是其中任一种脏法，按"trim 后相同"折叠原值形会漏删。
+    #[test]
+    fn test_i137_actor_delete_forms_dedups_literal_forms_across_elements() {
+        assert_eq!(actor_delete_forms(&v(&[" 9101 ", "9101", "9101", " 9101 "])),
+            v(&[" 9101 ", "9101"]),
+            "同一人的两种写法 ⇒ 并集里两形各一次，不得出现四份");
+        assert_eq!(actor_delete_forms(&v(&[" 9101 ", "  9101  "])),
+            v(&[" 9101 ", "9101", "  9101  "]),
+            "不同原值形各自保留（字面去重，不按 trim 后相同折叠），trim 形仍只一份");
+    }
+
+    /// 反向哨兵（§2.11 硬要求④）：判据只吃"trim 后为空"，**不吃**"看起来像空"的正常 id。
+    /// `"0"` 必须留下，且 `"0"` 与 `"00"` 是两个人；`" 0 "` 的原值形也要在（删未 trim 脏行）。
+    #[test]
+    fn test_i137_actor_delete_forms_zero_like_ids_survive_and_stay_distinct() {
+        assert_eq!(actor_delete_forms(&v(&["0", "00", " 0 "])), v(&["0", "00", " 0 "]),
+            "'0'/'00' 都是合法 id 不得丢弃；' 0 ' 的 trim 形与既有 '0' 字面折叠 ⇒ 只补原值形");
+    }
+
+    /// 保序：多个人按入参顺序展开（每人原值在前、trim 形在后），便于 IN 列表与日志逐字对照。
+    #[test]
+    fn test_i137_actor_delete_forms_preserves_input_order() {
+        assert_eq!(actor_delete_forms(&v(&["a", " b ", "c"])), v(&["a", " b ", "b", "c"]),
+            "语义 6 义务②：保序展开");
+        assert_eq!(actor_delete_forms(&v(&["7601", "", "  7602 "])),
+            v(&["7601", "  7602 ", "7602"]), "混给只丢空的，其余保序");
     }
 
     /// 正向对照：非空抄送人原样保留、顺序不动（判据不吃正常值）。
