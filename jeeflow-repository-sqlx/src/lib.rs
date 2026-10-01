@@ -3978,6 +3978,163 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════
+    // issues/137 A · A 案的 **sqlx 真库腿**（内存路见 jeeflow-core `engine.rs` 的
+    //   `test_i137a_*` 一族五格）。
+    //
+    // 为什么这一族必须有一条真库格：`wf_process_instance.expire_time` 是 `DATETIME(3)` 列，
+    // 而改前搬进这一列的是**定义级表达式的原串**（`"2h"`）。内存仓把它当 String 存 ⇒ 全绿；
+    // 真库在 `STRICT_TRANS_TABLES`（160 那台 MySQL 8.0.46 实测 sql_mode 含之）下**硬拒**——
+    // 实测 errno 1292(22007) `Incorrect datetime value: '2h' for column 'expire_time'`
+    // （工单案文写的 1366 是字符列那一族的返回码，DATETIME 列这台给的是 1292），
+    // 非严格模式则静默存成 `0000-00-00`。"内存绿 ≠ 落库绿"这一族按红线做**两步变异对照**：
+    //   ① 摘掉求值只搬原串 ⇒ 内存多格红 ＋ 本格红（INSERT 先炸）；
+    //   ② 只摘落库绑定（值算对了但绑参给 NULL）⇒ 内存全绿、**只有本格红**。
+    //
+    // 判据（一律打在库列的**值**上，不写"非空"空判）：
+    //   ① 顶层配 `2h` ⇒ 库列＝注入钟+7200s 那个**具体时刻**（不是原串、不是 now()）；
+    //   ③ 顶层没配 ⇒ 库列 `IS NULL`（不赋 now、不赋空串），而同夹具任务行照旧有到期值
+    //     ⇒ 证明"实例列没值"不是整条求值没跑（两列各归各的源，issues/126 回归不被带坏）。
+    //
+    // 时钟按 M5 同款注入固定串（`ClockScope` 持进程级互斥 + drop 复原），故这里能逐值断言
+    // 而不是拿真实 now 去凑带宽；并先探一次 DB 会话钟 ≠ 注入钟，否则等值断言无牙。
+    // ID 段 901371／901372 独占，跑前跑后各清一次。
+    // ═══════════════════════════════════════════════════════
+
+    const I37A_FIXED: &str = "2026-08-08 09:00:00";
+    const I37A_WANT: &str = "2026-08-08 11:00:00"; // I37A_FIXED + 2h
+
+    fn i37a_fixed_clock() -> String {
+        I37A_FIXED.to_string()
+    }
+
+    /// 一条 start → apply → end 的线性流；`top_expire` 给的是**流程定义根上**的
+    /// `expireTime` JSON 字面量（`None` ⇒ 整个键都不加）。
+    /// 节点 `apply` 上**始终**配着 `expireTime`：这样"实例列为空"只可能是"实例不读节点档"，
+    /// 而不是"整条求值没跑"。
+    fn i37a_flow_content(name: &str, top_expire: Option<&str>) -> Vec<u8> {
+        let top = match top_expire {
+            Some(raw) => format!(r#","expireTime":{raw}"#),
+            None => String::new(),
+        };
+        format!(r#"{{"name":"{name}"{top},"displayName":"i137a","type":"approval",
+            "nodes":[
+                {{"id":"start","type":"snaker:start","text":{{"value":"开始"}},"properties":{{}}}},
+                {{"id":"apply","type":"snaker:task","text":{{"value":"申请"}},
+                  "properties":{{"assignee":"applicant","expireTime":"2h"}}}},
+                {{"id":"end","type":"snaker:end","text":{{"value":"结束"}},"properties":{{}}}}],
+            "edges":[
+                {{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"}},
+                {{"id":"e2","sourceNodeId":"apply","targetNodeId":"end"}}]}}"#)
+            .as_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_mysql_i137a_instance_expire_time_lands_evaluated() {
+        if skip_mysql() { return; }
+        // 注入必须**先于**任何写库，且横跨 spawn_blocking / block_in_place 的线程
+        // （时钟是进程级 static，全线程可见）——同 M5 的姿势
+        let _clock = jeeflow_core::clock::ClockScope::injected(i37a_fixed_clock);
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            for id in [901371i64, 901372] {
+                clean_by_define(&pool, id).await;
+            }
+
+            // 探针自证：DB 会话钟与注入钟若同读数，下面的等值断言分不出基准来源 ⇒ 无牙，先报红
+            let db_now: String = sqlx::query("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s') AS n")
+                .fetch_one(&pool).await.unwrap().get("n");
+            assert_ne!(db_now, I37A_FIXED,
+                "137 A：库钟 NOW() 恰好等于注入钟串 ⇒ 本环境这条判据无牙");
+
+            let mk_engine = |repo: Arc<SqlxRepository>| {
+                let ctx = jeeflow_core::context::ServiceContext::new()
+                    .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+                    .with_ext_repository(repo as Arc<dyn ProcessExtRepository>)
+                    // ⚠️ worker_id 必须与同二进制里其它引擎用例（i142 用 `new(1)`）**不同**：
+                    // 共享测试库里跑的是同一个毫秒雪花，两个用例同毫秒各发一号 ⇒ id 完全相同
+                    // ⇒ 真库 `Duplicate entry ... for key 'PRIMARY'`（实测 1/1 命中过，
+                    // 见本轮收口报告附带发现）。137 段独占 worker，不与既有 1 号 worker 抢。
+                    .with_id_generator(Arc::new(jeeflow_core::id_gen::DefaultIdGenerator::new(137)));
+                jeeflow_core::engine::JeeflowEngineImpl::new(ctx)
+            };
+
+            // ── 格①：顶层配 2h ⇒ 库列落**求值结果**那个具体时刻 ─────────────────
+            let mut define = ProcessDefine {
+                id: 901371, name: "rust_i37a_on".into(), display_name: "i137a 配了".into(),
+                define_type: "approval".into(), state: 1,
+                content: i37a_flow_content("rust_i37a_on", Some("\"2h\"")),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            repo.save_define(&mut define).unwrap();
+            let inst_on = mk_engine(repo.clone()).start_async(define.id, "applicant",
+                &jeeflow_core::json::FlowData::new()).await.unwrap();
+
+            let row = sqlx::query("SELECT DATE_FORMAT(expire_time, '%Y-%m-%d %H:%i:%s') AS et, \
+                     DATE_FORMAT(create_time, '%Y-%m-%d %H:%i:%s') AS ct \
+                     FROM wf_process_instance WHERE id = ?")
+                .bind(inst_on.instance_id).fetch_one(&pool).await.unwrap();
+            let et: Option<String> = row.get("et");
+            let ct: Option<String> = row.get("ct");
+            assert_eq!(ct.as_deref(), Some(I37A_FIXED),
+                "内部对照：同一行 create_time 取的就是注入钟（两列同基准）");
+            assert_eq!(et.as_deref(), Some(I37A_WANT),
+                "判据①（真库）：wf_process_instance.expire_time 该是定义级表达式求出的时刻 \
+                 {I37A_WANT}；搬原串会把 INSERT 打成实测 1292(22007) Incorrect datetime value，\
+                 兜底 now() 则落成库钟 {db_now}+偏移");
+            // 聚合读回（走 SELECT + get_opt_datetime 那条路）与库面读数必须同一个值
+            let back = repo.find_instance_by_id(inst_on.instance_id).unwrap().unwrap();
+            assert_eq!(back.expire_time.as_deref(), Some(I37A_WANT),
+                "读回路径与库面对不上：实得 {:?}", back.expire_time);
+            // 同一次发起的**任务行**照旧带到期（issues/126 写点①不被本改动带坏）
+            let task_exp: Option<String> = sqlx::query(
+                "SELECT DATE_FORMAT(expire_time, '%Y-%m-%d %H:%i:%s') AS e FROM wf_process_task \
+                 WHERE process_instance_id = ? AND task_name = 'apply'")
+                .bind(inst_on.instance_id).fetch_one(&pool).await.unwrap().get("e");
+            assert_eq!(task_exp.as_deref(), Some(I37A_WANT),
+                "回归：任务行 expire_time 与实例列同值（同一枚尺子、同一份 args）");
+
+            // ── 格③：顶层没配 ⇒ 库列 IS NULL（节点那列照旧有值）─────────────────
+            let mut define_off = ProcessDefine {
+                id: 901372, name: "rust_i37a_off".into(), display_name: "i137a 没配".into(),
+                define_type: "approval".into(), state: 1,
+                content: i37a_flow_content("rust_i37a_off", None),
+                version: 1, create_time: None, create_user: Some("rust_test".into()),
+                update_time: None, update_user: None,
+            };
+            repo.save_define(&mut define_off).unwrap();
+            let inst_off = mk_engine(repo.clone()).start_async(define_off.id, "applicant",
+                &jeeflow_core::json::FlowData::new()).await.unwrap();
+            let off_row = sqlx::query("SELECT DATE_FORMAT(expire_time, '%Y-%m-%d %H:%i:%s') AS et, \
+                     DATE_FORMAT(create_time, '%Y-%m-%d %H:%i:%s') AS ct \
+                     FROM wf_process_instance WHERE id = ?")
+                .bind(inst_off.instance_id).fetch_one(&pool).await.unwrap();
+            let off_exp: Option<String> = off_row.get("et");
+            let off_ct: Option<String> = off_row.get("ct");
+            assert_eq!(off_ct.as_deref(), Some(I37A_FIXED),
+                "内部对照：这行确实落库了（不是\"行没读到\"混成\"值为空\"）");
+            assert_eq!(off_exp, None,
+                "判据③（真库）：定义没配顶层 expireTime ⇒ 该列必须 IS NULL，\
+                 实得 {off_exp:?}（赋 now()/空串/0000-00-00 都在这儿现形）");
+            assert_eq!(repo.find_instance_by_id(inst_off.instance_id).unwrap().unwrap().expire_time,
+                None, "读回路径同样该是 NULL");
+            let off_task_exp: Option<String> = sqlx::query(
+                "SELECT DATE_FORMAT(expire_time, '%Y-%m-%d %H:%i:%s') AS e FROM wf_process_task \
+                 WHERE process_instance_id = ? AND task_name = 'apply'")
+                .bind(inst_off.instance_id).fetch_one(&pool).await.unwrap().get("e");
+            assert_eq!(off_task_exp.as_deref(), Some(I37A_WANT),
+                "内部对照：节点档照旧生效 ⇒ 上一格的 NULL 是\"实例不读节点档\"，不是求值没跑");
+
+            for id in [901371i64, 901372] {
+                clean_by_define(&pool, id).await;
+            }
+        });
+        // drop(_clock) 复原默认基准，别把注入钟留给同批并发的其它用例
+    }
+
+    // ═══════════════════════════════════════════════════════
     // issues/142 B 批 · 任务参与者写侧归属值归一（sqlx 真库这一支 · spec 06 §2.11）
     //   普查实读的 rust 形状：**两仓分叉**——本仓 `add_task_actor` 是盲插（无判空、无 trim、
     //   **连判重都没有**），而同栈内存仓判重 ⇒ 同一串入参两仓两个答案，正是 issues/117

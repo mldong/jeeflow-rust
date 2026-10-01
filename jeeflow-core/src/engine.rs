@@ -948,9 +948,28 @@ impl JeeflowEngineImpl {
         // 4. Create instance
         let mut instance = ProcessInstance::create(&define, operator, &full_args);
 
-        // 5. Set expire time
+        // 5. Set expire time —— issues/137 A（owner 2026-10-01 拍 **A 案**：实例级 `expire_time`
+        //    ＝「定义级表达式的**求值结果**」）：
+        //      · 基准＝java `JeeflowEngineImpl.java:93-96`（顶层 `model.getExpireTime()` 判非空 ⇒
+        //        `instance.setExpireTime(FlowUtil.processTime(expireTime, args))`），
+        //        同形状 boot2 内置版 `ProcessInstanceServiceImpl.java:157-160`；
+        //      · 改前本栈是 `instance.expire_time = Some(et.clone())`——**原串搬运**。表达式原串
+        //        （如 `"2h"`）进 `wf_process_instance.expire_time` 那枚 `DATETIME(3)` 列，在
+        //        `STRICT_TRANS_TABLES`（160 那台 MySQL 8.0.46 实测 sql_mode 含之）下被**硬拒**——
+        //        实测 errno 1292(22007) `Incorrect datetime value: '2h' for column 'expire_time'`
+        //        （工单案文写的 1366 是字符列那一族的码，DATETIME 列这台给的是 1292，见本轮收口报告），
+        //        非严格模式下静默存 `0000-00-00`——两种都是"内存绿、真库红"的病灶形状，不是这一列该有的语义；
+        //      · 求值用的 args＝**发起参数那份**（`full_args`：已并入 `u_*` 用户信息与 `autoGenTitle`），
+        //        与 java 传的同一个 `args` 同档；
+        //      · 定义**没配**顶层 `expireTime` ⇒ 一个字都不动，该列保持 `ProcessInstance::create`
+        //        给的 `None`（不赋 `now()`、不赋空串）；
+        //      · 配了但算不出（误配 / 负数档）⇒ `process_time` 给 `None` ⇒ 落 NULL，沿用 §3-2（判非负）
+        //        ／§3-3（前缀裁空白）已定的落穿语义，**不兜底 now**（`apply_expire_time` 头注释里那条
+        //        "任何一档都不许返回基准时刻"的禁令同样管着实例这一列）；
+        //      · 求值器复用任务级写点那同一枚 [`crate::expire_time::process_time`]（基准走 issues/120
+        //        的 `clock::current_time_str()` 单源），**不新造第二把尺子**。
         if let Some(et) = &model.expire_time {
-            instance.expire_time = Some(et.clone());
+            instance.expire_time = crate::expire_time::process_time(Some(et.as_str()), &full_args);
         }
 
         // 6. Assign IDs
@@ -3513,6 +3532,243 @@ mod tests {
         let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
         exp_expire_about(&exp_doing(&repo, inst.instance_id, "approve", 1)[0],
             7200, "加号档 +2h（正向对照：只裁负不裁加号）");
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/137 A · **实例级** expire_time 按 A 案求值（V6，rust 腿 · 内存仓路）
+    //
+    // 裁定＝`wf_process_instance.expire_time` 那一列写的是**流程定义顶层** `expireTime`
+    // 表达式（解析点 `parser.rs` 的 `root.get_str("expireTime")`，spec/02「流程期望完成时间」）
+    // 的**求值结果**，基准＝java `JeeflowEngineImpl.java:93-96` ＋ boot2 内置版
+    // `ProcessInstanceServiceImpl.java:157-160`。
+    // 改前本栈形状＝`instance.expire_time = Some(et.clone())` 的**原串搬运**，
+    // 原串（`"2h"`）进 `DATETIME(3)` 列在 STRICT_TRANS_TABLES 下被硬拒（实测 errno 1292）。
+    // 五条判据各至少一格，且判据一律打在**值**上（具体时刻 / `None`），不写"非空"空判：
+    //   ① 落的是求值结果不是原串        → `..._is_evaluated_value_not_raw_expression`
+    //   ② args＝已注入用户信息与 autoGenTitle 的那份 → `..._against_injected_start_args`
+    //   ③ 定义没配 ⇒ 该列保持 NULL       → `..._absent_definition_keeps_column_null`
+    //   ④ 配了但算不出 ⇒ NULL，不兜底 now → `..._unparsable_or_negative_stays_null`
+    //   ⑤ 复用任务级同一枚尺子               → `..._shares_the_task_level_evaluator_tiers`
+    //     （"走引擎钟出口"那一半落在下面的真库腿）
+    // 真库（160 MySQL）对应腿：`jeeflow-repository-sqlx` 的
+    // `test_mysql_i137a_instance_expire_time_lands_evaluated`（那一支注入固定钟，
+    // 把"具体时刻＝注入钟+2h"与"实例列跟引擎钟出口走"逐值钉死）。
+    //
+    // ⚠️ 本栈内存腿**刻意不注入进程级时钟**：`ClockScope` 的互斥只约束同样持锁的用例，
+    //    不持锁的既有用例（issues/126 一族按 `expire − create` 带宽判）会在持锁窗口里
+    //    读到注入钟的基准 ⇒ 实测漂到 131811s 把既有一格打死（本轮第一次全量跑就撞上了）。
+    //    ⇒ 这里的"值"判据＝**同行 expire − create 恰为表达式偏移**（既有 `exp_expire_about`
+    //    同带宽 -5s/+60s）＋绝对档/变量档的**字面时刻**（与钟无关）；
+    //    "走钟出口"那一判交给真库腿与 `expire_time.rs::test_process_time_follows_engine_clock`。
+    // 本节只新增格子，未改任何既有断言的期望值。
+    // ═══════════════════════════════════════════════════════
+
+    /// issues/137 A 夹具：在 [`exp_flow`] 那条线性流上再挂**流程定义顶层**的 `expireTime` 键。
+    /// `top_expire_json` 给的是 **JSON 值字面量**（`Some("\"2h\"")` / `Some("null")` /
+    /// `Some("\"\"")`），`None` ⇒ 一个键都不加（＝"定义没配"那一档，判据③）。
+    /// 刻意不改 `exp_flow` 的签名：那条服务 issues/126 的既有一族用例，动它＝动既有测试。
+    fn i37a_flow(name: &str, top_expire_json: Option<&str>, specs: &[(&str, &str)]) -> String {
+        let body = exp_flow(name, specs);
+        match top_expire_json {
+            None => body,
+            Some(raw) => {
+                let injected = body.replacen(
+                    r#""displayName""#,
+                    &format!(r#""expireTime":{raw},"displayName""#),
+                    1,
+                );
+                // 夹具失效（锚点没命中 ⇒ 顶层键压根没挂上）必须**当场响**，
+                // 否则"没配"那一格会拿假夹具把"配了"两档判成 NULL＝假绿。
+                assert_ne!(injected, body, "夹具注入点失效：顶层 expireTime 没挂上去");
+                injected
+            }
+        }
+    }
+
+    /// 读回**仓储里**那条实例行。issues/113 教训：只有读回值能证明"这一列真进了库"，
+    /// 引擎返回的聚合对象不能；"行没读到"与"值为空"也分开断。
+    fn i37a_instance(repo: &Arc<MemoryRepository>, iid: i64) -> ProcessInstance {
+        repo.find_instance_by_id(iid).unwrap()
+            .unwrap_or_else(|| panic!("仓储里查不到实例 {iid}（这是\"行没读到\"那一档）"))
+    }
+
+    /// 实例那一列必须为空（判据③④共用），并要求行本身读到了＋create_time 有值（内部对照）。
+    fn i37a_expire_null(inst: &ProcessInstance, why: &str) {
+        assert!(inst.create_time.is_some(), "内部对照：{why} 这行的 create_time 应有值");
+        assert_eq!(inst.expire_time, None,
+            "{why}：wf_process_instance.expire_time 被赋成 {:?}，期望保持 NULL\
+             （不造默认值、不写空串、不兜底 now()）", inst.expire_time);
+    }
+
+    /// 实例那一列必须是"同行 expire − create 恰为表达式偏移"的**具体时刻**
+    /// （判据①⑤共用；带宽 -5s/+60s 与本文件既有 [`exp_expire_about`] 同一把尺子）。
+    /// 三条牙缺一不可：
+    ///  · 值必须是能解析的 `yyyy-MM-dd HH:mm:ss`（原串 `"2h"` 在这儿现形＝本工单病灶）；
+    ///  · 偏移必须≈表达式（占位 `now()` 会算出 ≈0＝新建即逾期，issues/126 病灶同族）；
+    ///  · 行本身要读得到（`i37a_instance` 已保证），"行没读到"与"值为空"不混。
+    fn i37a_expire_about(inst: &ProcessInstance, want: i64, who: &str) {
+        let exp = inst.expire_time.as_deref()
+            .unwrap_or_else(|| panic!("{who}：配了到期表达式，expire_time 却是空"));
+        let secs = crate::expire_time::to_epoch_secs(exp);
+        assert!(secs.is_some(),
+            "{who}：该列该落**求值结果**（`yyyy-MM-dd HH:mm:ss` 19 位时刻），实得 {exp:?}\
+            ——表达式原串进 DATETIME(3) 列在 STRICT_TRANS_TABLES 下被硬拒（实测 errno 1292）");
+        let cre = inst.create_time.as_deref()
+            .unwrap_or_else(|| panic!("{who}：create_time 应有值（内部对照）"));
+        assert_ne!(exp, cre, "{who}：expire 与 create 同值＝拿当前时间兜了个占位");
+        let delta = secs.unwrap() - crate::expire_time::to_epoch_secs(cre).unwrap();
+        assert!(delta >= want - 5 && delta <= want + 60,
+            "{who}：expire − create = {delta}s，期望 ≈{want}s（带宽 -5s/+60s）；\
+             占位 now() 会算出 ≈0 ⇒ 新建即逾期");
+    }
+
+    /// 判据①：顶层配 `2h` ⇒ 实例列落的是**求值结果**（create+7200s 那个时刻），不是原串 `"2h"`；
+    /// 顶层配**绝对档** ⇒ 落那个字面时刻本身（与钟无关，判据是逐值的）。
+    /// 摘掉求值只搬原串 ⇒ 本格两条都红；换成"恒 None"⇒ 两条都红。
+    #[tokio::test]
+    async fn test_i137a_instance_expire_is_evaluated_value_not_raw_expression() {
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i37a_rel";
+        let did = save_define(&repo, name,
+            &i37a_flow(name, Some("\"2h\""), &[("approve", r#""assignee":"zhangsan""#)]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        let row = i37a_instance(&repo, inst.instance_id);
+
+        assert_ne!(row.expire_time.as_deref(), Some("2h"),
+            "表达式**原串**不得进实例的 expire_time（那是本工单要修掉的病灶形状）");
+        i37a_expire_about(&row, 7_200, "顶层配 2h 的实例行");
+
+        // 绝对档：定义根上直接写时刻 ⇒ 该列必须一字不差是那个时刻（不依赖任何钟）
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i37a_abs";
+        let did = save_define(&repo, name, &i37a_flow(name, Some("\"2027-03-04 05:06:07\""),
+            &[("approve", r#""assignee":"zhangsan""#)]));
+        let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+        assert_eq!(i37a_instance(&repo, inst.instance_id).expire_time.as_deref(),
+            Some("2027-03-04 05:06:07"),
+            "绝对档：定义级表达式本身就是时刻 ⇒ 该列＝那个字面时刻");
+    }
+
+    /// 判据②：求值用的 args＝**发起参数那份**（已注入 `u_*` 用户信息与 `autoGenTitle`），
+    /// 对齐 java 传的同一个 `args`。三档一起钉：
+    /// (a) 调用方给的变量名 ⇒ 取到值（防"整个变量档被摘成恒 NULL"的假绿）；
+    /// (b)(c) 调用方**也**塞了引擎要覆盖的那两个键（值故意是一个合法时刻）⇒ 引擎注入的那份胜出，
+    ///     变量档取到的是"人话串/自动标题"而非时刻 ⇒ 该列 NULL。
+    ///     若实现把 args 传成**注入前的 raw args**，(b)(c) 会拿到 `2026-12-31 10:00:00` ⇒ 当场红。
+    #[tokio::test]
+    async fn test_i137a_instance_expire_against_injected_start_args() {
+        const DUE: &str = "2026-12-31 10:00:00";
+
+        // (a) 正向：表达式＝调用方变量的键名 ⇒ 取该变量的值
+        let (engine, repo) = make_surrogate_engine();
+        let name = "i37a_arg_var";
+        let did = save_define(&repo, name,
+            &i37a_flow(name, Some("\"dueAt\""), &[("approve", r#""assignee":"zhangsan""#)]));
+        let mut args = FlowData::new();
+        args.insert_str("dueAt", DUE);
+        let inst = engine.start_async(did, "zhangsan", &args).await.unwrap();
+        assert_eq!(i37a_instance(&repo, inst.instance_id).expire_time.as_deref(), Some(DUE),
+            "变量档：顶层 expireTime=\"dueAt\" 该取发起参数 dueAt 的那个时刻");
+
+        // (b)(c) 引擎注入的两个键各自盖掉调用方同名值 ⇒ 求值看到的是**注入后**那份
+        for (i, key) in ["u_realName", "autoGenTitle"].iter().enumerate() {
+            let (engine, repo) = make_surrogate_engine();
+            let name = format!("i37a_arg_inj{i}");
+            let did = save_define(&repo, &name, &i37a_flow(&name,
+                Some(&format!("\"{key}\"")), &[("approve", r#""assignee":"zhangsan""#)]));
+            let mut caller = FlowData::new();
+            caller.insert_str(*key, DUE); // 注入前的那份才是这个值
+            let inst = engine.start_async(did, "zhangsan", &caller).await.unwrap();
+            let row = i37a_instance(&repo, inst.instance_id);
+            // 前置对照：仓储里的实例变量确实已被引擎改写成"人话"那份（不是时刻串）。
+            // 这一句先立住，下面两判才不是拿"键压根不存在"混成"注入生效"。
+            assert_ne!(row.variables.get_str(key), Some(DUE),
+                "前置对照失效：实例变量里 {key} 仍是调用方那份＝夹具没造出\"覆盖\"这一档");
+            assert_ne!(row.expire_time.as_deref(), Some(DUE),
+                "判据②：求值用的必须是**注入用户信息与 autoGenTitle 之后**那份 args；\
+                 这里读回了调用方那份的 {key}＝传成了 raw args");
+            assert_eq!(row.expire_time, None,
+                "{key} 注入后的值不是时刻 ⇒ 变量档终局算不出 ⇒ 该列 NULL，实得 {:?}",
+                row.expire_time);
+        }
+    }
+
+    /// 判据③：定义**没配**顶层 `expireTime` ⇒ 该列保持 NULL。三形一并钉：
+    /// 缺键 / JSON null / 空串（java 侧 `StringUtils.isNotEmpty` 判的就是后两形）。
+    /// 夹具同时把 **任务节点**的 `expireTime` 配上 ⇒ 证明"实例列没值"不是因为整条求值没跑，
+    /// 也不是任务那一列被误当实例那一列（两列各归各的源）。
+    #[tokio::test]
+    async fn test_i137a_instance_expire_absent_definition_keeps_column_null() {
+        for (i, top) in [None, Some("null"), Some("\"\"")].iter().enumerate() {
+            let (engine, repo) = make_surrogate_engine();
+            let name = format!("i37a_absent{i}");
+            let did = save_define(&repo, &name, &i37a_flow(&name, *top,
+                &[("approve", r#""assignee":"zhangsan","expireTime":"2h""#)]));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            let row = i37a_instance(&repo, inst.instance_id);
+            i37a_expire_null(&row, ["顶层缺 expireTime 键", "顶层配成 JSON null", "顶层配成空串"][i]);
+            // 内部对照：任务级那一列照旧算得出（issues/126 五处写点没被这次改动带坏）
+            exp_expire_about(&exp_doing(&repo, inst.instance_id, "approve", 1)[0],
+                7200, "同夹具的任务行（写点①）");
+        }
+    }
+
+    /// 判据④：配了但**算不出**（误配 / 负数档 / 单位符后带空白）⇒ 该列 NULL，
+    /// 沿用 §3-2（判非负）／§3-3（前缀裁空白）已定的落穿语义，**不许兜底 now()**。
+    /// `assert_ne!(…, Some(base))` 是这一格真正的牙：占位 `now()` 与"没配"在库面上看不出差别，
+    /// 但 `expire − create ≈ 0`＝建单即逾期（issues/126 病灶同族）。
+    #[tokio::test]
+    async fn test_i137a_instance_expire_unparsable_or_negative_stays_null() {
+        for (idx, expr) in ["not-a-time", "2027-03-04", "xh", "-5h", "-5d", "\" 2h \""].iter().enumerate() {
+            // 数组里带引号的那条**本身就是** JSON 字面量（" 2h "：单位符后带空白），其余按"串"包一层
+            let json = if expr.starts_with('"') { expr.to_string() } else { format!("\"{expr}\"") };
+            let (engine, repo) = make_surrogate_engine();
+            let name = format!("i37a_bad{idx}");
+            let did = save_define(&repo, &name, &i37a_flow(&name, Some(&json),
+                &[("approve", r#""assignee":"zhangsan""#)]));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            let row = i37a_instance(&repo, inst.instance_id);
+            assert_eq!(row.expire_time, None,
+                "顶层 expireTime={json} 算不出 ⇒ 该列 NULL（不兜底 now、不写空串），实得 {:?}",
+                row.expire_time);
+            assert!(row.create_time.is_some(),
+                "内部对照：顶层 expireTime={json} 这行确实建出来了（不是\"行没读到\"混成\"值为空\"）");
+        }
+    }
+
+    /// 判据⑤：实例这一列**复用任务级写点同一枚尺子**（`expire_time::process_time`），
+    /// 不是新造的第二把。做法＝把只属于那枚尺子的档位逐值打在实例列上：
+    /// `s/m/h/d` 四单位、§3-3 的"前缀裁空白"（`" 2h"`）、§3-2 的"只裁负不裁加号"（`"+2h"`）、
+    /// 跨月的 `31d`。第二把尺子（自己 split 一遍 `+`/空白/单位）必在某一档上给不同答案。
+    /// 再与尺子**直接调用的答案对账**（同一份 args，两路差值 ≤2s＝同一枚求值器；
+    /// 秒级tick 允许的漂移，与原串/占位 now 那种错法差着量级）。
+    /// "必须走 issues/120 的钟出口"这一判落在真库腿：`test_mysql_i137a_...`（注入固定钟 ⇒
+    /// 逐值断 `expire = 注入串+2h`，若实现偷取系统时间就落在外面），本栈不在此重复注入
+    /// （理由见本节头注）。
+    #[tokio::test]
+    async fn test_i137a_instance_expire_shares_the_task_level_evaluator_tiers() {
+        // (表达式, 期望偏移秒)
+        let cases: &[(&str, i64)] = &[
+            ("90s", 90), ("45m", 2_700), ("2h", 7_200), ("+2h", 7_200), (" 2h", 7_200),
+            ("3d", 3 * 86_400), ("31d", 31 * 86_400),
+        ];
+        for (idx, (expr, off)) in cases.iter().enumerate() {
+            let (engine, repo) = make_surrogate_engine();
+            let name = format!("i37a_tier{idx}");
+            let did = save_define(&repo, &name, &i37a_flow(&name, Some(&format!("\"{expr}\"")),
+                &[("approve", r#""assignee":"zhangsan""#)]));
+            let inst = engine.start_async(did, "zhangsan", &FlowData::new()).await.unwrap();
+            let row = i37a_instance(&repo, inst.instance_id);
+            i37a_expire_about(&row, *off, &format!("顶层 expireTime={expr:?}（尺子档位）"));
+            // 与尺子本身对账：同一枚 process_time、同一份 args ⇒ 两路答案必须同一时刻
+            let also = crate::expire_time::process_time(Some(*expr), &row.variables)
+                .unwrap_or_else(|| panic!("尺子对 {expr:?} 自己就算不出，档位表写错了"));
+            let drift = crate::expire_time::to_epoch_secs(&also).unwrap()
+                - crate::expire_time::to_epoch_secs(row.expire_time.as_deref().unwrap()).unwrap();
+            assert!(drift.abs() <= 2,
+                "实例列与任务级共用的那枚求值器相差 {drift}s（期望 ≤2s，只是取整秒的 tick）\
+                 ⇒ 差得多＝落库那一路另起了第二把尺子");
+        }
     }
 }
 
