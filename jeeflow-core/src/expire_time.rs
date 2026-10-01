@@ -434,6 +434,81 @@ mod tests {
         }
     }
 
+    /// 正向（issues/137 E · owner 2026-10-01 拍"统一 trim"，spec/04 §相对档前缀允许两端空白，
+    /// 基准＝java `FlowUtil.parseIntOrNull` `bf1f401`）：**前缀两端的空白不影响这一档**。
+    ///
+    /// 各栈整数解析对空白的容忍度天然不同（java `Integer.parseInt`、python `int()`、.NET
+    /// `TryParse` 默认收前后空白；go 在 `Atoi` 前显式 `TrimSpace`；php 的正则 `^…$` 锚死、
+    /// 本轮补了 trim），判点是"**不许出现别家算得出、这一家算不出**"。本栈 [`relative_secs`]
+    /// 一直在前缀上做 `.trim()` ⇒ 本栈属"实测已合规"，产品代码零改动，这格的职责是把那处
+    /// **隐式依赖**钉成有名字的判据：谁摘掉那枚 `.trim()`，①当场红。
+    ///
+    /// 三条分界（与 java 基准 `paddedRelativePrefixStillApplies` 同尺，判据是**固定钟上的精确时刻**）：
+    /// ① 前缀带空白（空格 / tab / 数字与单位符之间）⇒ 照样算出基准+2h；`d` 档走 `add_calendar_days`
+    ///    另一条通路，同一把尺子；
+    /// ② **单位符后面**带空白 ⇒ 末位不是 s/m/h/d ⇒ 认不出单位 ⇒ 落穿绝对档 ⇒ `None`
+    ///    （"裁的边界只到前缀"的钉子：整串去空白后 `"2h "` 就变成合法的 `2h` 了）；
+    /// ③ `" 2.5h"` ⇒ 裁完空白照样是小数误配 ⇒ 仍 `None`（trim 不是把"裁空白"做成"裁容错"）；
+    /// ④ 判负（137 D）在 trim **之后**照旧生效：带空白的负数档仍 `None`，不是回拨后的过去时刻；
+    /// ⑤ 变量档键名与绝对档的串**同样不 trim**（裁它们改的是另一件没立过法的事）。
+    #[test]
+    fn test_padded_relative_prefix_still_applies() {
+        // ① 前缀空白三形 + 天档同尺
+        for expr in [" 2h", "\t2h", "2 h"] {
+            assert_eq!(
+                ev(expr, &[]).as_deref(),
+                Some("2026-09-28 14:00:00"),
+                "前缀带空白的 {expr:?} 必须仍算出基准+2h（实得 {:?}）——摘掉 relative_secs 的 .trim() 就红在这里",
+                ev(expr, &[])
+            );
+        }
+        assert_eq!(
+            ev(" 2d", &[]).as_deref(),
+            Some("2026-09-30 12:00:00"),
+            "天档走 add_calendar_days 另一条通路，同一把尺子"
+        );
+
+        // ② 单位符后面带空白 ⇒ 末位认不出单位 ⇒ 落穿 ⇒ None
+        for expr in ["2h ", "2d ", "+2h  ", " 2h "] {
+            assert_eq!(
+                ev(expr, &[]),
+                None,
+                "单位符后带空白的 {expr:?} 该落穿成空（实得 {:?}）；这里若算出了值，说明裁空白被做成了\"整个表达式去空白\"",
+                ev(expr, &[])
+            );
+        }
+
+        // ③ 裁完空白仍是误配（小数）⇒ 仍 None
+        assert_eq!(
+            ev(" 2.5h", &[]),
+            None,
+            "\" 2.5h\" 裁完空白照样是小数误配 ⇒ 落穿；trim 不是把\"裁空白\"做成\"裁容错\""
+        );
+
+        // ④ 带空白的负数相对档：判负在 trim 之后照旧生效（137 D）
+        for expr in [" -5h", " -5d", " -30s"] {
+            assert_eq!(
+                ev(expr, &[]),
+                None,
+                "带空白的负数相对档 {expr:?} 必须仍是空（实得 {:?}）——放行负偏移＝新建即逾期",
+                ev(expr, &[])
+            );
+        }
+
+        // ⑤ 变量档键名与绝对档的串不 trim（与 ② 合起来是"整串 trim"变异的两个试金石）
+        assert_eq!(
+            ev(" dueAt ", &[("dueAt", JsonValue::string("2026-12-31 10:00:00"))]),
+            None,
+            "变量档键名不 trim ⇒ \" dueAt \" 取不到 dueAt（若这里取到了值，说明做成了整个表达式去空白）"
+        );
+        assert_eq!(
+            ev("dueAt", &[("dueAt", JsonValue::string("2026-12-31 10:00:00"))]).as_deref(),
+            Some("2026-12-31 10:00:00"),
+            "对照：精确键名照旧命中（证明上一行不是变量档整体坏了造成的假绿）"
+        );
+        assert_eq!(ev(" 2026-12-31 10:00:00", &[]), None, "绝对档的字符串本身不 trim");
+    }
+
     /// 负向：`None` / 空串 / 纯空白三档都算"没配"
     #[test]
     fn test_unconfigured_returns_none() {
