@@ -1502,11 +1502,18 @@ impl ProcessExtRepository for SqlxRepository {
     fn page_surrogates(&self, query: &PageQuery) -> JeeflowResult<PageResult<ProcessSurrogate>> {
         self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
-            let op = query.operator.clone();
+            // issues/152 ②：归属列 operator 空值 ⇒ 空页，不再下推 `(? IS NULL OR operator = ?)` 旁路
+            // （形状同 page_instances 的 issues/129 那一句）。原旁路在 `Some("")` 这一档不是"不加条件"，
+            // 而是**等值命中历史死行**（rust 门面 save 曾把 operator 落成空串，见 issues/152 ③）——
+            // 台账页会把别人的死行摊出来；`None` 那一档则整个不过滤＝全库。两层判据都不能留。
+            // 内存仓 MemoryRepository::page_surrogates 同答案（spec 06 §4.5 条款 6）。
+            let op = match query.operator.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return Ok(PageResult::new(page_num, page_size, 0, Vec::new())),
+            };
             let count_row = sqlx::query(
-                "SELECT COUNT(*) AS cnt FROM wf_process_surrogate WHERE (? IS NULL OR operator = ?)"
+                "SELECT COUNT(*) AS cnt FROM wf_process_surrogate WHERE operator = ?"
             )
-            .bind(op.clone())
             .bind(op.clone())
             .fetch_one(&self.pool)
             .await
@@ -1516,10 +1523,9 @@ impl ProcessExtRepository for SqlxRepository {
                 "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
                         create_time, create_user, update_time, update_user \
                  FROM wf_process_surrogate \
-                 WHERE (? IS NULL OR operator = ?) \
+                 WHERE operator = ? \
                  ORDER BY id DESC LIMIT ? OFFSET ?"
             )
-            .bind(op.clone())
             .bind(op)
             .bind(page_size)
             .bind(offset)
@@ -1964,6 +1970,47 @@ mod tests {
         ] {
             sqlx::query(sql).execute(&pool).await.unwrap();
         }
+    }
+
+    /// issues/152 ② · SQL 仓那一层的归属兜底（真库读数，T1）：`page_surrogates` 的归属通道
+    /// （`query.operator`）没给或给的是空值 ⇒ **空页**。
+    /// 原形状 `WHERE (? IS NULL OR operator = ?)` 有两格漏：`None` 整个不过滤＝全库台账；
+    /// `Some("")` 不是"不加条件"而是**等值捞出 operator='' 的死行**（正是 ③ 门面写侧造出来的形状）。
+    /// 内存仓同判据见 `jeeflow-facade::tests::test_i152_surrogate_repo_blank_ownership_returns_empty_page`
+    /// （spec 06 §4.5 条款 6：同栈两仓同答案）。SKIP_MYSQL=1 时本条不跑。
+    #[test]
+    fn test_mysql_i152_surrogate_page_blank_operator_no_full_scan() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            setup_schema(&pool).await;
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 915201 AND 915219")
+                .execute(&pool).await.unwrap();
+            // 两条真人行 + 一条 operator='' 的死行（③ 的形状，空归属档绝不能把它捞出来）
+            seed_surrogate(&pool, 915201, Some("leave"), "u152a", "agent152a",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+            seed_surrogate(&pool, 915202, Some("leave"), "u152b", "agent152b",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+            seed_surrogate(&pool, 915203, Some("leave"), "", "agent152dead",
+                Some("2000-01-01 00:00:00"), Some("2999-12-31 23:59:59"), Some(1)).await;
+
+            let repo = SqlxRepository::new(pool.clone());
+            for blank in [None, Some(""), Some("   "), Some("\t")] {
+                let mut q = PageQuery::new(1, 20);
+                q.operator = blank.map(str::to_string);
+                assert_eq!(repo.page_surrogates(&q).unwrap().record_count, 0,
+                    "152: 归属值 [{:?}] 为空不得读全库、也不得捞出 operator='' 的死行", blank);
+            }
+            // 正向对照：真值必须出行（否则上面那串 0 是"查询恒空"假绿；bind 错位也在这里炸）
+            let mut q = PageQuery::new(1, 20);
+            q.operator = Some("u152a".to_string());
+            let page = repo.page_surrogates(&q).unwrap();
+            assert_eq!(page.record_count, 1, "152: u152a 应有 1 条委托");
+            assert_eq!(page.rows[0].id, 915201, "152: 归属过滤必须落在自己那一行");
+
+            sqlx::query("DELETE FROM wf_process_surrogate WHERE id BETWEEN 915201 AND 915219")
+                .execute(&pool).await.unwrap();
+        });
     }
 
     /// M3: Persist ARCHIVE — bizData stored as plain text in wf_process_instance.variable

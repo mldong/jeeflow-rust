@@ -756,7 +756,20 @@ impl ProcessExtRepository for MemoryRepository {
 
     fn page_surrogates(&self, query: &PageQuery) -> JeeflowResult<PageResult<ProcessSurrogate>> {
         let s = self.surrogates.lock().unwrap();
-        let rows: Vec<ProcessSurrogate> = s.values().cloned().collect();
+        // issues/152 ②：`query.operator` 是本栈「我的委托」的归属通道（形状同 page_instances
+        // 里 issues/129 那一句）——缺失或空值 ⇒ 空页，绝不折叠成"不过滤"读全库台账。
+        // 判据与 `jeeflow-repository-sqlx::page_surrogates` 同一条（spec 06 §4.5 条款 6：
+        // 同栈两仓在归属这一格必须同答案）。顺带补 id DESC：原先按 HashMap 随机遍历序出页，
+        // 与 sqlx 侧 `ORDER BY id DESC` 在第 2 页就会给不同答案。
+        let owner = query.operator.as_deref().map(str::trim).unwrap_or("");
+        if owner.is_empty() {
+            return Ok(PageResult::new(query.page_num, query.page_size, 0, vec![]));
+        }
+        let mut rows: Vec<ProcessSurrogate> = s.values()
+            .filter(|r| r.operator == owner)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.id.cmp(&a.id));
         let total = rows.len() as i64;
         let start = ((query.page_num - 1) * query.page_size) as usize;
         let end = std::cmp::min(start + query.page_size as usize, rows.len());

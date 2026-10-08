@@ -2285,7 +2285,11 @@ impl JeeflowFacade {
 
     fn process_surrogate_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let query = PageQuery::new(arg_i64_or(args, "pageNum", 1)?, arg_i64_or(args, "pageSize", 20)?);
+        let mut query = PageQuery::new(arg_i64_or(args, "pageNum", 1)?, arg_i64_or(args, "pageSize", 20)?);
+        // issues/152 ②：`operator` 在本栈是「我的委托」的归属通道（与 process_instance_page :1128 逐字同形），
+        // 走 §2.5 归一（缺键／空串／全空白 ⇒ user1）。修前这里既不注入也不下推 ⇒ "只看自己授出的委托"
+        // 全靠集成壳注入 operator，换宿主／直调 SPI 就退化成全库台账（spec 06 §2.5 表 + §4.5 归属不变式）。
+        query.operator = Some(operator_arg(args, &["operator"]));
         let page = ext.page_surrogates(&query)?;
         let rows: Vec<Json> = page.rows.iter().map(surrogate_to_json).collect();
         let result = PageResult::new(page.page_num, page.page_size, page.record_count, rows);
@@ -2297,7 +2301,11 @@ impl JeeflowFacade {
         let mut sg = ProcessSurrogate {
             id: 0,
             process_name: arg_str_or(args, "processName", ""),
-            operator: arg_str_or(args, "operator", ""),
+            // issues/152 ③：改前是 `arg_str_or(args, "operator", "")`——缺省/空白落**空串**，
+            // 而空串行是「死行」：get_surrogate 的 `WHERE operator = ?` 永不命中它，
+            // 台账里看得见、待办永远不并人（比报错更难查）。本栈早有 [`operator_arg`]（§2.5 归一：
+            // 缺键／空串／全空白 ⇒ user1），只是这条腿漏用了。spec 06 §4.5「新建时授权人默认取操作人」。
+            operator: operator_arg(args, &["operator"]),
             surrogate: arg_str_or(args, "surrogate", ""),
             start_time: arg_str(args, "startTime"),
             end_time: arg_str(args, "endTime"),
@@ -2316,6 +2324,15 @@ impl JeeflowFacade {
             .ok_or(JeeflowError::Business(format!("委托不存在: {}", id)))?;
         let updated = ProcessSurrogate {
             surrogate: arg_str(args, "surrogate").unwrap_or(sg.surrogate),
+            // issues/152 ③ 的 update 腿（对齐 java `applySurrogateFields`）：授权人只有**非空显式值**才覆盖，
+            // 缺键／空串／全空白一律保留原授权人——空白档若覆写进去同样造出「死行」（§2.5 空串＝缺键同档）。
+            operator: match arg_str(args, "operator") {
+                Some(raw) => {
+                    let t = raw.trim();
+                    if t.is_empty() { sg.operator.clone() } else { t.to_string() }
+                }
+                None => sg.operator.clone(),
+            },
             start_time: arg_str(args, "startTime").or(sg.start_time),
             end_time: arg_str(args, "endTime").or(sg.end_time),
             // enabled：未传保持原值，传了走写侧归一（脏值 → 0 停用，见 parse_surrogate_enabled）。
@@ -5524,6 +5541,16 @@ mod tests {
     /// 部署两步审批流（apply[applicant] → approve[user2] → end），startAndExecute 自动完成
     /// apply，返回 (instance_id, 进行中的 approve 任务 id)。任务参与者为 user2。
     async fn start_two_step_flow(facade: &JeeflowFacade, flow_name: &str) -> (i64, i64) {
+        start_two_step_flow_assigned(facade, flow_name, "user2").await
+    }
+
+    /// 同 [`start_two_step_flow`]，但审批节点的 assignee 由调用方给
+    /// （issues/152 档 4 要用 §2.5 归一缺省 `user1` 当审批人，才验得出"那一行真能被本人待办命中"）。
+    async fn start_two_step_flow_assigned(
+        facade: &JeeflowFacade,
+        flow_name: &str,
+        approve_assignee: &str,
+    ) -> (i64, i64) {
         let mut a1 = HashMap::new();
         a1.insert("name".to_string(), json!(flow_name));
         a1.insert("displayName".to_string(), json!(flow_name));
@@ -5537,7 +5564,7 @@ mod tests {
                 "nodes":[
                     {{"id":"start","type":"snaker:start","text":{{"value":"Start"}}}},
                     {{"id":"apply","type":"snaker:task","text":{{"value":"Apply"}},"properties":{{"assignee":"applicant"}}}},
-                    {{"id":"approve","type":"snaker:task","text":{{"value":"Approve"}},"properties":{{"assignee":"user2"}}}},
+                    {{"id":"approve","type":"snaker:task","text":{{"value":"Approve"}},"properties":{{"assignee":"{a}"}}}},
                     {{"id":"end","type":"snaker:end","text":{{"value":"End"}}}}
                 ],
                 "edges":[
@@ -5546,7 +5573,8 @@ mod tests {
                     {{"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}}
                 ]
             }}"#,
-            n = flow_name
+            n = flow_name,
+            a = approve_assignee
         );
         let mut a2 = HashMap::new();
         a2.insert("id".to_string(), json!(design_id));
@@ -5568,7 +5596,7 @@ mod tests {
         assert_eq!(doing[0].task_name, "approve");
         let task_id = doing[0].task_id;
         let actors = facade.repo().find_task_actors(task_id).unwrap();
-        assert!(actors.contains(&"user2".to_string()), "task actors={:?}", actors);
+        assert!(actors.contains(&approve_assignee.to_string()), "task actors={:?}", actors);
         (inst_id, task_id)
     }
 
@@ -6343,7 +6371,13 @@ mod tests {
             );
             // 回读台账 enabled 值
             let detail_id = {
-                let page = facade.flow("processSurrogate/page", &args_of(vec![])).await;
+                // issues/152 ② 改正既有期望（逐字交代）：这一句原本是不带 operator 的
+                // `facade.flow("processSurrogate/page", &args_of(vec![]))`，靠的是"门面不注入归属
+                // ⇒ page 返回全库台账"那个旧答案。page 现在自己下发 t.operator EQ 归一后的 operator，
+                // 缺省档归一到 user1，而这一轮台账的授权人是 user2 ⇒ 不带 operator 就是 0 行。
+                // 本用例钉的是 enabled 写侧，与归属无关，故按新契约显式带归属人。
+                let page = facade.flow("processSurrogate/page",
+                    &args_of(vec![("operator", json!("user2"))])).await;
                 page["data"]["rows"].as_array().unwrap().first()
                     .and_then(|r| r["id"].as_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| panic!("{} 台账应能查到", note))
@@ -6365,6 +6399,180 @@ mod tests {
             } else {
                 assert!(!actors.contains(&"agent2".to_string()), "{} 不该并入代理人: {:?}", note, actors);
             }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/152 · 委托：① 作用域优先级 / ② 门面归属不变式 / ③ 写侧 operator 三档归一
+    // 判据基准＝jeeflow-java 参考实现（JeeflowFacade.surrogatePage + applySurrogateFields +
+    // JdbcProcessExtRepository.buildWhere + MemoryProcessExtRepository.pageSurrogates），
+    // 条文＝spec 06 §2.5 表（新增 processSurrogate/page 行）＋ §4.5「归属不变式」＋ §4.5 条款 6。
+    // ═══════════════════════════════════════════════════════
+
+    /// `processSurrogate/page` 取回行的授权人列（operator=None 即不带这个键）。
+    async fn surrogate_page_operators(facade: &JeeflowFacade, operator: Option<&str>) -> Vec<String> {
+        let mut args = args_of(vec![("pageSize", json!(50))]);
+        if let Some(o) = operator {
+            args.insert("operator".to_string(), json!(o));
+        }
+        let resp = facade.flow("processSurrogate/page", &args).await;
+        assert_eq!(resp["code"], 0, "processSurrogate/page 应成功: {}", resp);
+        let mut ops: Vec<String> = resp["data"]["rows"].as_array().unwrap().iter()
+            .map(|r| r["operator"].as_str().unwrap_or("<null>").to_string())
+            .collect();
+        ops.sort();
+        ops
+    }
+
+    /// 走门面配一条委托（时间窗给足，判据只由本用例想钉的那一维决定）。
+    async fn save_surrogate_via_facade(
+        facade: &JeeflowFacade, operator: Option<&str>, agent: &str, process_name: &str,
+    ) -> String {
+        let mut pairs = vec![
+            ("surrogate", json!(agent)),
+            ("processName", json!(process_name)),
+            ("startTime", json!("2000-01-01 00:00:00")),
+            ("endTime", json!("2999-12-31 23:59:59")),
+        ];
+        if let Some(op) = operator {
+            pairs.push(("operator", json!(op)));
+        }
+        let saved = facade.flow("processSurrogate/save", &args_of(pairs)).await;
+        assert_eq!(saved["code"], 0,
+            "save {}→{} 应成功: {}", operator.unwrap_or("<缺键>"), agent, saved);
+        saved["data"]["id"].as_str().unwrap().to_string()
+    }
+
+    /// 档 1（①）：同授权人并存「全流程」(processName 空) ＋「精确」且都窗内 ⇒ **精确接管**。
+    /// 全流程那条**后写、id 更大**：若实现按"跨作用域取最新一条"（＝内置 boot2 版「全流程优先」），
+    /// 就会接管成 agent_global —— 本用例钉的就是引擎不得复活那个方向。
+    /// 判据层的同一形状已钉在 `jeeflow-core::surrogate::tests::test_pick_surrogate_takes_max_id_and_falls_back`
+    /// （含"精确判否 ⇒ 兜底全流程"那一腿，见 test_pick_surrogate_exact_scope_invalid_still_checks_global_scope），
+    /// 本条补的是门面＋建单这一整条路。
+    #[tokio::test]
+    async fn test_i152_surrogate_exact_scope_beats_global_through_facade() {
+        let facade = make_facade();
+        save_surrogate_via_facade(&facade, Some("user2"), "agent_exact", "i152-scope-flow").await;
+        save_surrogate_via_facade(&facade, Some("user2"), "agent_global", "").await;   // id 更大
+
+        let (_iid, task) = start_two_step_flow(&facade, "i152-scope-flow").await;
+        let mut actors = facade.repo().find_task_actors(task).unwrap();
+        actors.sort();
+        assert_eq!(actors, vec!["agent_exact".to_string(), "user2".to_string()],
+            "精确作用域那条必须接管（全流程盖精确＝内置版方向，不得复活）");
+        assert!(!actors.contains(&"agent_global".to_string()));
+    }
+
+    /// 档 4（③ 的门票，改前本栈必红）：门面 save 的 operator 三档（缺键／空串／全空白）
+    /// 一律走 §2.5 归一落 `user1`，**不得落空串**——空串行是「死行」：
+    /// `get_surrogate` 的 `WHERE operator = ?` 永不命中它，台账看得见、待办永远不并人。
+    /// 正面判据：以归一后的授权人（user1）建单，代理人真并进 wf_process_task_actor。
+    #[tokio::test]
+    async fn test_i152_surrogate_save_operator_three_tiers_land_on_user1_and_apply() {
+        for (label, given) in
+            [("缺键", None), ("空串", Some("")), ("全空白", Some("   "))]
+        {
+            let facade = make_facade();
+            let id = save_surrogate_via_facade(
+                &facade, given, "agent152", "i152-default-flow").await;
+            let detail = facade
+                .flow("processSurrogate/detail", &args_of(vec![("id", json!(id))])).await;
+            assert_eq!(detail["data"]["operator"].as_str(), Some("user1"),
+                "{label}档必须落 §2.5 归一缺省 user1（空串＝死行），实得 {:?}: {}",
+                detail["data"]["operator"].as_str(), detail);
+
+            // 正面判据：这一行必须能被该缺省用户的后续待办命中
+            let (_iid, task) =
+                start_two_step_flow_assigned(&facade, "i152-default-flow", "user1").await;
+            let actors = facade.repo().find_task_actors(task).unwrap();
+            assert!(actors.contains(&"agent152".to_string()),
+                "{label}档的行要能被 user1 的待办命中，实得 {:?}", actors);
+        }
+    }
+
+    /// 档 4 的 update 腿（B）：operator 缺键／空串／全空白一律**保留原授权人**，
+    /// 只有显式非空值才覆盖（java `applySurrogateFields` 同形；空白档覆写同样造死行）。
+    #[tokio::test]
+    async fn test_i152_surrogate_update_operator_tiers_keep_original() {
+        for (label, given, want) in [
+            ("缺键", None, "op152"),
+            ("空串", Some(""), "op152"),
+            ("全空白", Some("   "), "op152"),
+            ("显式非空", Some("someoneelse"), "someoneelse"),
+        ] {
+            let facade = make_facade();
+            let id = save_surrogate_via_facade(&facade, Some("op152"), "dep152", "i152-upd-flow").await;
+            let mut pairs = vec![("id", json!(id.clone())), ("surrogate", json!("dep152b"))];
+            if let Some(v) = given {
+                pairs.push(("operator", json!(v)));
+            }
+            let upd = facade.flow("processSurrogate/update", &args_of(pairs)).await;
+            assert_eq!(upd["code"], 0, "{label} update 应成功: {}", upd);
+            let detail = facade
+                .flow("processSurrogate/detail", &args_of(vec![("id", json!(id))])).await;
+            assert_eq!(detail["data"]["operator"].as_str(), Some(want),
+                "{label}档 update 后授权人应为 {}，实得 {:?}（空白档抹掉原授权人＝造死行）",
+                want, detail["data"]["operator"].as_str());
+            assert_eq!(detail["data"]["surrogate"].as_str(), Some("dep152b"),
+                "{label}档回归：其余字段照常更新");
+        }
+    }
+
+    /// 档 5（② 门面层）：`processSurrogate/page` 归属——带 operator 只见自己；
+    /// 不带／空串／全空白 ⇒ 只出归一缺省 `user1` 的行，**绝不允许退化成全库台账**。
+    /// 反向哨兵＝zhangsan 那行真实存在（缺省档若读全库就会多出一行，判据当场红）。
+    #[tokio::test]
+    async fn test_i152_surrogate_page_ownership_only_own_rows() {
+        let facade = make_facade();
+        save_surrogate_via_facade(&facade, Some("user1"), "depMine", "i152-page-flow").await;
+        save_surrogate_via_facade(&facade, Some("zhangsan"), "depOther", "i152-page-flow").await;
+
+        // 正向对照：两档各有行（否则"只出 user1"是空表自等假绿）
+        assert_eq!(surrogate_page_operators(&facade, Some("user1")).await, vec!["user1".to_string()]);
+        assert_eq!(surrogate_page_operators(&facade, Some("zhangsan")).await,
+            vec!["zhangsan".to_string()]);
+        // 缺省三档 ⇒ 归一到 user1，不得全库（2 行）
+        for (label, op) in [("缺 operator", None), ("空串", Some("")), ("全空白", Some("   "))] {
+            assert_eq!(surrogate_page_operators(&facade, op).await, vec!["user1".to_string()],
+                "{label}档不得退化成全库台账");
+        }
+        assert!(surrogate_page_operators(&facade, Some("nobody152")).await.is_empty(),
+            "不存在的人必须 0 行");
+    }
+
+    /// 档 5（② 仓储层第二道，本栈内存仓）：绕过门面直调 `page_surrogates`，
+    /// 归属通道 `query.operator` 整条没给（None）或给的是空值 ⇒ **空页**。
+    /// sqlx 仓同判据（真库读数见 `jeeflow-repository-sqlx` 的 test_mysql_i152_*，属 T1）。
+    #[test]
+    fn test_i152_surrogate_repo_blank_ownership_returns_empty_page() {
+        let repo = Arc::new(MemoryRepository::new());
+        for op in ["user1", "zhangsan"] {
+            let mut sg = ProcessSurrogate {
+                id: 0,
+                process_name: "i152-repo-flow".into(),
+                operator: op.into(),
+                surrogate: format!("dep-{}", op),
+                start_time: Some("2000-01-01 00:00:00".into()),
+                end_time: Some("2999-12-31 23:59:59".into()),
+                enabled: 1,
+                create_time: None, create_user: None,
+                update_time: None, update_user: None,
+            };
+            repo.save_surrogate(&mut sg).unwrap();
+        }
+
+        for blank in [None, Some(""), Some("   "), Some("\t")] {
+            let mut q = PageQuery::new(1, 20);
+            q.operator = blank.map(str::to_string);
+            assert_eq!(repo.page_surrogates(&q).unwrap().record_count, 0,
+                "归属值 [{:?}] 为空不得退化成全库", blank);
+        }
+        // 正向对照：真值必须出行（防"恒空假绿"）
+        for op in ["user1", "zhangsan"] {
+            let mut q = PageQuery::new(1, 20);
+            q.operator = Some(op.to_string());
+            assert_eq!(repo.page_surrogates(&q).unwrap().record_count, 1,
+                "{} 应有 1 条委托", op);
         }
     }
 
