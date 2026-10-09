@@ -783,7 +783,11 @@ impl ProcessRepository for SqlxRepository {
     fn find_history_tasks(&self, instance_id: i64) -> JeeflowResult<Vec<ProcessTask>> {
         self.block_on(async {
             let rows = sqlx::query(
-                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ?"
+                // issues/154①（spec/06 §4.6 approvalRecord 口径①）：**必须** `ORDER BY id ASC`——
+                // 雪花 id 单调，同秒并发插入时它比 `create_time`/`update_time` 确定；此前整条没有
+                // ORDER BY，审批记录的行序就成了"存储顺序的偶然"。只补这一条任务腿，
+                // `find_doing_tasks` 等其它腿本轮不动（未在立法范围内）。
+                "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ? ORDER BY id ASC"
             )
             .bind(instance_id)
             .fetch_all(&self.pool)
@@ -4528,5 +4532,64 @@ mod tests {
             "非参与者静默忽略，既有参与者一行不动");
         assert!(task_actor_rows(&pool, 404404).await.is_empty(), "不存在任务的参与者台账仍为空");
         clean_i142_task_actor(&pool, task_id).await;
+    }
+
+    /// issues/154①（spec/06 §4.6 approvalRecord 口径①）：`find_history_tasks` 必须
+    /// `ORDER BY id ASC`——雪花 id 单调，同秒并发插入时它比 `create_time`/`update_time` 确定。
+    ///
+    /// ⚠ 诚实交代：这条是**回归钉**，不是变异捕捉器。InnoDB 的聚簇扫描与二级索引
+    /// （`process_instance_id` + PK）本就按主键升序返回，把 `ORDER BY` 摘掉在真库上大概率
+    /// 仍出升序 ⇒ 别拿这条的绿去当"摘掉 ORDER BY 会红"的证据。真正判这一格的是 SQL 文本
+    /// 本身（本轮现读已带 `ORDER BY id ASC`）与跨栈门禁的 approvalRecord 行序格。
+    #[tokio::test]
+    async fn test_mysql_i154_find_history_tasks_is_id_ascending() {
+        if skip_mysql() { return; }
+        let inst_id: i64 = 915410;
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+        sqlx::query("DELETE FROM wf_process_task WHERE process_instance_id = ?")
+            .bind(inst_id).execute(&pool).await.unwrap();
+
+        let pool2 = pool.clone();
+        let ids = run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            // 插入序刻意与 id 序相反（915413 → 915411）：出口行序只认 id
+            for (name, task_id) in [("n3", 915413i64), ("n2", 915412), ("n1", 915411)] {
+                let mut task = ProcessTask {
+                    task_id,
+                    process_instance_id: inst_id,
+                    task_name: name.into(),
+                    display_name: name.into(),
+                    task_type: 0,
+                    perform_type: 0,
+                    task_state: 20,
+                    actor_id: Some("user1".into()),
+                    actor_ids: vec!["user1".into()],
+                    finish_time: Some("2026-10-09 10:00:00".into()),
+                    expire_time: None,
+                    form_key: None,
+                    parent_task_id: None,
+                    variables: jeeflow_core::json::FlowData::new(),
+                    create_time: Some("2026-10-09 10:00:00".into()),
+                    create_user: Some("user1".into()),
+                    update_time: None,
+                    update_user: None,
+                };
+                repo.save_task(&mut task).unwrap();
+            }
+            repo.find_history_tasks(inst_id)
+                .unwrap()
+                .iter()
+                .map(|t| t.task_id)
+                .collect::<Vec<i64>>()
+        }).await;
+
+        assert_eq!(
+            ids,
+            vec![915411, 915412, 915413],
+            "find_history_tasks 必须按 id ASC 出口（spec/06 §4.6 approvalRecord 口径①）"
+        );
+        sqlx::query("DELETE FROM wf_process_task WHERE process_instance_id = ?")
+            .bind(inst_id).execute(&pool).await.unwrap();
     }
 }

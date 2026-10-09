@@ -1301,9 +1301,16 @@ impl JeeflowFacade {
         let mut node_progress = json!({});
         if let Some(def) = self.repo.find_define_by_id(inst.define_id)? {
             if let Ok(model) = jeeflow_core::parser::ModelParser::parse(&def.content_str()) {
-                node_progress = build_node_progress(&model, &history_tasks);
+                let ctx = self.engine.context();
+                node_progress = build_node_progress(
+                    &model,
+                    &history_tasks,
+                    ctx.user_provider.as_ref(),
+                );
                 if let Some(start) = model.get_start() {
                     let mut visited = std::collections::HashSet::new();
+                    // 决策边的求值原料与两侧参考实现同形：实例变量（go/java 的 `vars`）
+                    // ＋ 历史任务（前置任务变量在那一层并进去），SPI 从 ServiceContext 取。
                     collect_high_light_path(
                         &model,
                         &start.id,
@@ -1311,6 +1318,9 @@ impl JeeflowFacade {
                         &mut history,
                         &mut edges,
                         &mut visited,
+                        inst.variables.inner(),
+                        &history_tasks,
+                        ctx.expression_evaluator.as_ref(),
                     );
                 }
             }
@@ -1328,23 +1338,25 @@ impl JeeflowFacade {
     fn process_instance_approval_record(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let id = arg_id(args, &["processInstanceId", "id"])?
             .ok_or(JeeflowError::Business("缺少id参数".into()))?;
-        let inst = self
-            .repo
-            .find_instance_by_id(id)?
-            .ok_or(JeeflowError::InstanceNotFound(id))?;
-        let instance_vars = flow_data_to_object(&inst.variables);
+        // issues/154②（spec/06 §4.6 approvalRecord 口径②）：视图端点**不因实例 id 不存在报错**——
+        // 这里不再查实例（旧的 `InstanceNotFound` 早退与那份实例变量一起删掉），实例不存在时
+        // `find_history_tasks` 自然返回零行 ⇒ 出口空数组。基准＝java `approvalRecord`
+        // （它压根没有 findInstanceById 这一步）。
         let tasks = self.repo.find_history_tasks(id)?;
         let records: Vec<Json> = tasks
             .iter()
             .map(|t| {
-                let task_vars = flow_data_to_object(&t.variables);
-                // 对齐 Go taskRowToMap：任务变量空时回退实例变量（UI 读 ext.u_realName）
-                let ext = if task_vars.as_object().map(|m| m.is_empty()).unwrap_or(true) {
-                    instance_vars.clone()
-                } else {
-                    task_vars.clone()
-                };
+                // issues/154③（spec 口径③）：任务变量为空 ⇒ `ext` 出**空对象**，不回落实例变量。
+                // 旧注释写的「对齐 Go taskRowToMap」是谎——go 的 `approvalRecord` 直接取
+                // `t.Variables`，没有回退那一支；回退会让"任务变量"与"实例变量"两种语义共用一个键，
+                // 前端分辨不出办理人来源。
+                let ext = flow_data_to_object(&t.variables);
                 json!({
+                    // issues/154①④：行主键在引擎自己的出口就字符串化，**不得**指望门面那层
+                    // `stringify_ids` 兜底（transform_output 是门面级兜底，宿主改动即失效；19 位
+                    // 雪花出 number 会被 JS 截精度，同 issues/75/92 那族坑）。
+                    // java 同形状＝`vo.put("id", String.valueOf(t.getTaskId()))` 作首列。
+                    "id": Json::String(t.task_id.to_string()),
                     "task_name": t.task_name,
                     "display_name": t.display_name,
                     "task_type": t.task_type,
@@ -1454,8 +1466,11 @@ impl JeeflowFacade {
     }
 
     fn process_instance_cc_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        // issues/154④（spec/06 §4.6 ccList 参数表）：分页默认值统一 `pageNum=1 / pageSize=10`，
+        // 与其它分页 action 同口径——rust 旧默认 20 已判分叉。只改这一条 action，
+        // 其余 action 的 20 不在本轮立法范围内。
         let page_num = arg_i64_or(args, "pageNum", 1)?;
-        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let page_size = arg_i64_or(args, "pageSize", 10)?;
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = Some(operator_arg(args, &["operator"]));
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
@@ -2401,6 +2416,13 @@ fn json_value_to_serde(v: &JsonValue) -> Json {
 }
 
 /// 对齐 Java collectPath：沿输出边补全 history / edges；遇活跃节点仍收集边，但停止深入。
+///
+/// 决策节点的带表达式出边（spec/06 §4.6 highLight 义务 2／issues/153）：**先求值再过滤**——
+/// 表达式为 false 的那条分支未实际执行，边名与目标节点都不收。此前实现是「带 expr 的出边整条
+/// `continue` 丢弃」（等于恒 false），那是分叉不是基准；「不求值全量收集」同样违反本条。
+/// 逐字对照 java `collectPath` 的
+/// `node instanceof DecisionModel && isNotEmpty(tm.getExpr()) && !evalDecisionExpr(...) → continue`。
+#[allow(clippy::too_many_arguments)]
 fn collect_high_light_path(
     model: &jeeflow_core::parser::ProcessModel,
     node_id: &str,
@@ -2408,17 +2430,34 @@ fn collect_high_light_path(
     history: &mut Vec<String>,
     edges: &mut Vec<String>,
     visited: &mut std::collections::HashSet<String>,
+    instance_vars: &HashMap<String, JsonValue>,
+    history_tasks: &[ProcessTask],
+    evaluator: Option<&Arc<dyn ExpressionEvaluator>>,
 ) {
     if visited.contains(node_id) {
         return;
     }
     visited.insert(node_id.to_string());
+    let is_decision = model
+        .nodes
+        .iter()
+        .find(|n| n.id == node_id)
+        .map(|n| n.node_type == jeeflow_core::parser::NodeType::Decision)
+        .unwrap_or(false);
     for edge in model.get_output_edges(node_id) {
-        // 决策边带 expr 时：无表达式引擎则保守跳过（对齐 Java evaluator==null → false）
-        let src = model.nodes.iter().find(|n| n.id == node_id);
-        if src.map(|n| n.node_type == jeeflow_core::parser::NodeType::Decision).unwrap_or(false) {
+        // 决策档：空表达式不过滤（java `StringUtils.isNotEmpty(tm.getExpr())` 同一判据）
+        if is_decision {
             if let Some(expr) = edge.expr() {
-                if !expr.is_empty() {
+                if !expr.is_empty()
+                    && !eval_decision_expr(
+                        model,
+                        node_id,
+                        &expr,
+                        instance_vars,
+                        history_tasks,
+                        evaluator,
+                    )
+                {
                     continue;
                 }
             }
@@ -2436,14 +2475,64 @@ fn collect_high_light_path(
         if active.contains(tid) {
             continue;
         }
-        collect_high_light_path(model, tid, active, history, edges, visited);
+        collect_high_light_path(
+            model,
+            tid,
+            active,
+            history,
+            edges,
+            visited,
+            instance_vars,
+            history_tasks,
+            evaluator,
+        );
     }
+}
+
+/// 决策出边表达式求值（spec/06 §4.6 highLight 义务 2；基准＝java `evalDecisionExpr`
+/// ＋ go `evalDecisionExpr`）：args ＝ 实例变量 ∪ 决策节点**前置任务**（输入边第一个源节点）
+/// 的任务变量——与引擎运行时 `DecisionModel.exec` 同一份原料。
+///
+/// ⚠ **降级档**：`IExpressionEvaluator` **未注册**时整档判 false（java 的
+/// `if (evaluator == null) return false;` 那一支）。spec 只允许"未注册"这一种判 false 的缺省，
+/// 它是缺省保护而不是常态——注册了 SPI 就必须真求值，旧注释「无表达式引擎则保守跳过（对齐 Java
+/// evaluator==null → false）」把降级档当成了唯一路径，掩盖了"注册了也不求值"的分叉。
+///
+/// 判 true 的形状也与两侧逐字一致：只有求值结果**恰为布尔 true** 才算走过（java
+/// `Boolean.TRUE.equals(...)`／go `b, _ := result.(bool)`），求值报错、返回数字或字符串
+/// 一律判 false（不套用引擎运行时 `evaluate_expression` 的数字/字符串宽松折算——那两条腿不同档）。
+fn eval_decision_expr(
+    model: &jeeflow_core::parser::ProcessModel,
+    decision_id: &str,
+    expr: &str,
+    instance_vars: &HashMap<String, JsonValue>,
+    history_tasks: &[ProcessTask],
+    evaluator: Option<&Arc<dyn ExpressionEvaluator>>,
+) -> bool {
+    let Some(evaluator) = evaluator else {
+        return false; // 降级档：SPI 未注册（见上方注释），整档判 false
+    };
+    let mut args: HashMap<String, JsonValue> = instance_vars.clone();
+    if let Some(input) = model.get_input_edges(decision_id).first() {
+        if !input.source_node_id.is_empty() {
+            if let Some(t) = history_tasks
+                .iter()
+                .find(|t| t.task_name == input.source_node_id)
+            {
+                for (k, v) in t.variables.inner() {
+                    args.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    matches!(evaluator.eval(expr, &args), Ok(JsonValue::Bool(true)))
 }
 
 /// 对齐 Java/Go buildNodeProgress（会签成员进度；动态参与人无成员则跳过）
 fn build_node_progress(
     model: &jeeflow_core::parser::ProcessModel,
     tasks: &[ProcessTask],
+    user_provider: Option<&Arc<dyn UserProvider>>,
 ) -> Json {
     let mut progress = serde_json::Map::new();
     let mut seen = std::collections::HashSet::new();
@@ -2506,7 +2595,10 @@ fn build_node_progress(
         let members_out: Vec<Json> = members
             .iter()
             .map(|uid| {
-                let mut m = json!({"id": uid, "name": ""});
+                // spec/06 §4.6 highLight 义务 3（issues/153）：`name` 必须经 IUserProvider 解析
+                // realName，**只有查不到才允许空串**。此前是硬编码 `""`——SPI 注册了但这一路没接，
+                // 正是义务 3 点名的那种违反（前端拿不到姓名，只剩降级显示 id）。
+                let mut m = json!({"id": uid, "name": resolve_user_name(user_provider, uid)});
                 if let Some(obj) = m.as_object_mut() {
                     if done_set.contains(uid) {
                         obj.insert("done".into(), Json::Bool(true));
@@ -2530,6 +2622,20 @@ fn build_node_progress(
         progress.insert(name, item);
     }
     Json::Object(progress)
+}
+
+/// 成员姓名解析（spec/06 §4.6 highLight 义务 3；基准＝java `resolveUserName`）：
+/// 走 `IUserProvider::get_user` 取 realName。返回空串的**只有**这四档，与 java 逐字同判：
+/// SPI 未注册 / 查无此人 / realName 为空 / provider 报错——前端对这些降级显示 id。
+/// 调用姿势照本栈既有那一支（`process_task_candidate_page` 里 `ctx.user_provider`），不另开一套。
+fn resolve_user_name(user_provider: Option<&Arc<dyn UserProvider>>, user_id: &str) -> String {
+    let Some(up) = user_provider else {
+        return String::new();
+    };
+    match up.get_user(user_id) {
+        Ok(Some(info)) if !info.real_name.is_empty() => info.real_name,
+        _ => String::new(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -4677,6 +4783,450 @@ mod tests {
             history
         );
         assert!(!edges.is_empty(), "historyEdgeNames should not be empty: {:?}", edges);
+    }
+
+    // ─── issues/153·154（spec/06 §4.6）：highLight 三条义务 + approvalRecord 四条口径 ───
+
+    /// 极简数值求值桩（形状照 java 测试桩 `TestExpressionEvaluator.evalSimple` 的数值档）：
+    /// 先把上下文里的数值变量替换进表达式，再按 `>= <= != == > <` 比一次，答案出**布尔**。
+    /// 注册它 ⇒ `IExpressionEvaluator` 处在"已注册"档，highLight 必须走真求值，
+    /// 不得再落进"未注册 ⇒ 整档判 false"的降级档（spec/06 §4.6 义务 2）。
+    struct TestExprEvaluator;
+
+    impl ExpressionEvaluator for TestExprEvaluator {
+        fn eval(
+            &self,
+            expression: &str,
+            context: &HashMap<String, JsonValue>,
+        ) -> JeeflowResult<JsonValue> {
+            Ok(JsonValue::Bool(eval_numeric(expression, context)))
+        }
+    }
+
+    fn eval_numeric(expr: &str, ctx: &HashMap<String, JsonValue>) -> bool {
+        let mut s = expr.trim().to_string();
+        // 键排序后替换：避免 HashMap 随机序让"短键吃掉长键"的结果在一次跑一次不跑之间漂
+        let mut keys: Vec<&String> = ctx.keys().collect();
+        keys.sort();
+        for k in keys {
+            if let Some(JsonValue::Number(n)) = ctx.get(k) {
+                let v = if *n == (*n as i64) as f64 {
+                    format!("{}", *n as i64)
+                } else {
+                    n.to_string()
+                };
+                s = s.replace(k.as_str(), &v);
+            }
+        }
+        // 两字符档必须排在一字符档前面，否则 ">=" 会被 ">" 先截走
+        for (op, ord) in [(">=", 0), ("<=", 1), ("!=", 2), ("==", 3), (">", 4), ("<", 5)] {
+            if let Some(pos) = s.find(op) {
+                let left = s[..pos].trim().parse::<f64>();
+                let right = s[pos + op.len()..].trim().parse::<f64>();
+                return match (left, right) {
+                    (Ok(a), Ok(b)) => match ord {
+                        0 => a >= b,
+                        1 => a <= b,
+                        2 => a != b,
+                        3 => a == b,
+                        4 => a > b,
+                        _ => a < b,
+                    },
+                    _ => false,
+                };
+            }
+        }
+        false
+    }
+
+    /// 只认 leader 一人的 IUserProvider：照出义务 3 的两档——接上了出真名，**查不到**才允许空串。
+    struct NameProvider;
+
+    impl UserProvider for NameProvider {
+        fn get_user(&self, user_id: &str) -> JeeflowResult<Option<UserInfo>> {
+            if user_id == "leader" {
+                return Ok(Some(UserInfo {
+                    user_id: user_id.into(),
+                    real_name: "组长张三".into(),
+                    dept_id: "dept1".into(),
+                    dept_name: "研发部".into(),
+                    post_id: "post1".into(),
+                    post_name: "组长".into(),
+                }));
+            }
+            Ok(None)
+        }
+    }
+
+    fn make_facade_with_expr_and_names() -> JeeflowFacade {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_user_provider(Arc::new(NameProvider))
+            .with_expression_evaluator(Arc::new(TestExprEvaluator))
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        JeeflowFacade::new(ctx)
+    }
+
+    /// 读仓内共享夹具（八语言同一份，编辑源在 jeeflow-java，本仓 flows/ 是镜像副本）——
+    /// 只读不新增：新增流程 JSON 会被发版漂移门禁判红。
+    /// 走 manifest 相对路径而不借 `jeeflow_core::flowsdir`：那个模块在 core 那边是
+    /// `#[cfg(any(test, feature = "dev-flows"))]` 门控的，门面 crate 不开该 feature
+    /// （为一条测试去改 crate 依赖面不划算），而镜像刷新由 core 自己的用例与发版门禁保证。
+    fn load_shared_flow(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../flows")
+            .join(format!("{name}.json"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读取共享夹具失败 {}: {e}", path.display()))
+    }
+
+    /// 决策流程的 historyEdgeNames ＝ **恰为**求值为 true 的边集合（spec/06 §4.6 义务 2）。
+    /// 用例形状照 java `JeeflowFacadeTest.testHighLightFiltersDecisionBranch`（:1178-1215）：
+    /// amount=500 ⇒ e4（amount<=1000 → task3）走过，e3（amount>1000 → task2）未走。
+    #[tokio::test]
+    async fn test_i153_high_light_edges_are_exactly_the_true_decision_branches() {
+        let facade = make_facade_with_expr_and_names();
+        let content = load_shared_flow("03-decision-expr");
+        let mut define = ProcessDefine {
+            id: 0,
+            name: "decision-expr".into(),
+            display_name: "决策表达式流程".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: content.as_bytes().to_vec(),
+            version: 1,
+            create_time: None,
+            create_user: Some("applicant".into()),
+            update_time: None,
+            update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+
+        // amount=500 发起（startAndExecute 自动办完 apply）
+        let mut start_args = HashMap::new();
+        start_args.insert("processDefineId".to_string(), json!(define.id));
+        start_args.insert("operator".to_string(), json!("applicant"));
+        start_args.insert("amount".to_string(), json!(500));
+        let started = facade
+            .flow("processInstance/startAndExecute", &start_args)
+            .await;
+        assert_eq!(started["code"], 0, "发起失败: {:?}", started);
+        let iid = started["data"]["processInstanceId"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap();
+
+        // 推进：task1(leader) → decision1 求值 → task3(director) → end
+        for (node, actor) in [("task1", "leader"), ("task3", "director")] {
+            let doing = facade.repo().find_doing_tasks(iid, &[]).unwrap();
+            let task = doing.iter().find(|t| t.task_name == node).unwrap_or_else(|| {
+                panic!(
+                    "{node} 应为进行中任务，实得 {:?}",
+                    doing.iter().map(|t| &t.task_name).collect::<Vec<_>>()
+                )
+            });
+            let mut exec_args = HashMap::new();
+            exec_args.insert("processTaskId".to_string(), json!(task.task_id));
+            exec_args.insert("operator".to_string(), json!(actor));
+            exec_args.insert("submitType".to_string(), json!(1));
+            let resp = facade.flow("processTask/execute", &exec_args).await;
+            assert_eq!(resp["code"], 0, "办理 {node} 失败: {:?}", resp);
+        }
+
+        let mut hl_args = HashMap::new();
+        hl_args.insert("id".to_string(), json!(iid));
+        let hl = facade.flow("processInstance/highLight", &hl_args).await;
+        assert_eq!(hl["code"], 0, "{:?}", hl);
+
+        let edges: Vec<&str> = hl["data"]["historyEdgeNames"]
+            .as_array()
+            .expect("historyEdgeNames")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let mut sorted_edges = edges.clone();
+        sorted_edges.sort();
+        // 走过的边＝主干 e0/e_apply_1/e2 ＋求值为 true 的 e4 ＋ e4 之后的 e6；
+        // 恒 true（不求值全收）会多出 e3/e5，恒 false（旧"整条丢弃"）会缺 e4/e6 ⇒ 两侧都判红
+        assert_eq!(
+            sorted_edges,
+            vec!["e0", "e2", "e4", "e6", "e_apply_1"],
+            "historyEdgeNames 必须恰为求值为 true 的边集合（spec/06 §4.6 义务 2），实得 {:?}",
+            edges
+        );
+
+        let nodes: Vec<&str> = hl["data"]["historyNodeNames"]
+            .as_array()
+            .expect("historyNodeNames")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(nodes.contains(&"task3"), "走过的 task3 必须高亮: {:?}", nodes);
+        assert!(!nodes.contains(&"task2"), "未走分支的 task2 不得高亮: {:?}", nodes);
+    }
+
+    /// nodeProgress 成员 `name` 经 IUserProvider 解析（spec/06 §4.6 义务 3）：
+    /// 查得到 ⇒ 出 realName；**只有查不到**才允许空串（前端降级显示 id）。
+    #[tokio::test]
+    async fn test_i153_high_light_node_progress_resolves_member_name() {
+        let facade = make_facade_with_expr_and_names();
+        let mut define = ProcessDefine {
+            id: 0,
+            name: "np-flow".into(),
+            display_name: "NP".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: r#"{
+                "name":"np-flow","displayName":"NP","type":"approval",
+                "nodes":[
+                    {"id":"start","type":"snaker:start","text":{"value":"S"}},
+                    {"id":"apply","type":"snaker:task","text":{"value":"A"},
+                     "properties":{"assignee":"applicant"}},
+                    {"id":"approve","type":"snaker:task","text":{"value":"B"},
+                     "properties":{"assignee":"leader","performType":1}},
+                    {"id":"end","type":"snaker:end","text":{"value":"E"}}
+                ],
+                "edges":[
+                    {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                    {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                    {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+                ]
+            }"#
+            .as_bytes()
+            .to_vec(),
+            version: 1,
+            create_time: None,
+            create_user: None,
+            update_time: None,
+            update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+
+        let mut inst = ProcessInstance {
+            instance_id: 0,
+            parent_id: None,
+            define_id: define.id,
+            state: 10,
+            parent_node_name: None,
+            business_no: None,
+            operator: "applicant".into(),
+            expire_time: None,
+            variables: FlowData::new(),
+            tasks: vec![],
+            create_time: Some("2026-10-09 10:00:00".into()),
+            create_user: Some("applicant".into()),
+            update_time: None,
+            update_user: None,
+            define: None,
+        };
+        facade.repo().save_instance(&mut inst).unwrap();
+
+        // approve 节点两行：leader 已完成（IUserProvider 查得到）＋ ghost 进行中（查无此人）。
+        // 行序不进判据（内存仓 HashMap 无序），成员一律按 id 取。
+        for (actor, state, finish) in
+            [("leader", 20, Some("2026-10-09 11:00:00")), ("ghost", 10, None)]
+        {
+            let mut task = ProcessTask {
+                task_id: 0,
+                process_instance_id: inst.instance_id,
+                task_name: "approve".into(),
+                display_name: "审批".into(),
+                task_type: 0,
+                perform_type: 1,
+                task_state: state,
+                actor_id: Some(actor.into()),
+                actor_ids: vec![actor.into()],
+                finish_time: finish.map(|s| s.to_string()),
+                expire_time: None,
+                form_key: None,
+                parent_task_id: None,
+                variables: FlowData::new(),
+                create_time: Some("2026-10-09 10:00:00".into()),
+                create_user: Some(actor.into()),
+                update_time: None,
+                update_user: None,
+            };
+            facade.repo().save_task(&mut task).unwrap();
+        }
+
+        let mut hl_args = HashMap::new();
+        hl_args.insert("id".to_string(), json!(inst.instance_id));
+        let hl = facade.flow("processInstance/highLight", &hl_args).await;
+        assert_eq!(hl["code"], 0, "{:?}", hl);
+        let members = hl["data"]["nodeProgress"]["approve"]["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("approve 成员进度应存在，实得 {:?}", hl["data"]["nodeProgress"]));
+        let member = |uid: &str| -> &Json {
+            members
+                .iter()
+                .find(|m| m["id"].as_str() == Some(uid))
+                .unwrap_or_else(|| panic!("成员 {uid} 应存在，实得 {members:?}"))
+        };
+        assert_eq!(
+            member("leader")["name"],
+            json!("组长张三"),
+            "name 必须经 IUserProvider 解析 realName（spec/06 §4.6 义务 3），不得恒空串"
+        );
+        assert_eq!(
+            member("ghost")["name"],
+            json!(""),
+            "查不到人才允许空串，实得 {:?}",
+            member("ghost")
+        );
+    }
+
+    /// approvalRecord 出口四条口径（spec/06 §4.6，issues/154）：
+    /// ④九键齐（含行主键 `id`，且**必须是字符串**）／③任务变量空 ⇒ `ext` 出空对象不回落实例变量／
+    /// ②实例 id 不存在 ⇒ 空数组不报错。①行序 `ORDER BY id ASC` 在 SQL 仓那条腿上钉
+    /// （`jeeflow-repository-sqlx` 的 `test_mysql_i154_find_history_tasks_is_id_ascending`），
+    /// 内存仓的 `find_history_tasks` 走 HashMap 迭代、本就无序，在这一层断言行序只会得到随机答案。
+    #[tokio::test]
+    async fn test_i154_approval_record_nine_keys_string_id_and_ext_no_fallback() {
+        let facade = make_facade();
+        let mut define = ProcessDefine {
+            id: 0,
+            name: "ar-flow".into(),
+            display_name: "AR".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: b"{}".to_vec(),
+            version: 1,
+            create_time: None,
+            create_user: None,
+            update_time: None,
+            update_user: None,
+        };
+        facade.repo().save_define(&mut define).unwrap();
+
+        // 实例变量带两份料：任务变量为空时，旧的"回落实例变量"会把它们原样灌进 ext
+        let mut inst_vars = FlowData::new();
+        inst_vars.insert_i64("amount", 500);
+        inst_vars.insert_str("u_realName", "实例级姓名");
+        let mut inst = ProcessInstance {
+            instance_id: 0,
+            parent_id: None,
+            define_id: define.id,
+            state: 10,
+            parent_node_name: None,
+            business_no: None,
+            operator: "applicant".into(),
+            expire_time: None,
+            variables: inst_vars,
+            tasks: vec![],
+            create_time: Some("2026-10-09 10:00:00".into()),
+            create_user: Some("applicant".into()),
+            update_time: None,
+            update_user: None,
+            define: None,
+        };
+        facade.repo().save_instance(&mut inst).unwrap();
+
+        let mut no_vars = FlowData::new();
+        no_vars.remove("不存在的键"); // 保持空变量（口径③的实验体）
+        let mut with_vars = FlowData::new();
+        with_vars.insert_str("opinion", "同意");
+        for (name, task_id, vars, state, actor, finish) in [
+            ("apply", 915401i64, no_vars.clone(), 20, "applicant", Some("2026-10-09 10:05:00")),
+            ("task1", 915402, with_vars, 20, "leader", Some("2026-10-09 11:00:00")),
+            ("task2", 915403, no_vars, 10, "director", None),
+        ] {
+            let mut task = ProcessTask {
+                task_id,
+                process_instance_id: inst.instance_id,
+                task_name: name.into(),
+                display_name: name.into(),
+                task_type: 0,
+                perform_type: 0,
+                task_state: state,
+                actor_id: Some(actor.into()),
+                actor_ids: vec![actor.into()],
+                finish_time: finish.map(|s| s.to_string()),
+                expire_time: None,
+                form_key: None,
+                parent_task_id: None,
+                variables: vars,
+                create_time: Some("2026-10-09 10:00:00".into()),
+                create_user: Some(actor.into()),
+                update_time: None,
+                update_user: None,
+            };
+            facade.repo().save_task(&mut task).unwrap();
+        }
+
+        let mut args = HashMap::new();
+        args.insert("id".to_string(), json!(inst.instance_id));
+        let resp = facade.flow("processInstance/approvalRecord", &args).await;
+        assert_eq!(resp["code"], 0, "{:?}", resp);
+        let rows = resp["data"].as_array().expect("approvalRecord 出行数组");
+        assert_eq!(rows.len(), 3, "三行任务都应出口，实得 {rows:?}");
+
+        let row_of = |n: &str| -> &Json {
+            rows.iter()
+                .find(|r| r["taskName"].as_str() == Some(n))
+                .unwrap_or_else(|| panic!("行 {n} 应存在，实得 {rows:?}"))
+        };
+
+        for row in rows {
+            let mut keys: Vec<&str> = row.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec![
+                    "displayName", "ext", "finishTime", "id", "operator", "performType",
+                    "taskName", "taskState", "taskType"
+                ],
+                "approvalRecord 出口必须恰为九键（spec/06 §4.6 口径④，旧八键缺 id），实得 {keys:?}"
+            );
+            assert!(
+                row["id"].is_string(),
+                "id 必须是字符串——19 位雪花出 number 会被 JS 截精度（口径④／issues/75·92 同族），实得 {:?}",
+                row["id"]
+            );
+            assert!(
+                row.get("variable").is_none(),
+                "variable 原串不得再出现在出口（issues/124），实得 {row:?}"
+            );
+        }
+
+        assert_eq!(row_of("apply")["id"], json!("915401"), "行主键＝任务行 id");
+        assert_eq!(
+            row_of("apply")["ext"],
+            json!({}),
+            "任务变量为空 ⇒ ext 出空对象，**不得**回落实例变量（spec/06 §4.6 口径③），实得 {:?}",
+            row_of("apply")["ext"]
+        );
+        assert_eq!(row_of("task1")["ext"], json!({"opinion": "同意"}), "任务变量原样出口");
+
+        // 口径②：实例 id 不存在 ⇒ 空数组，视图端点不报「流程实例不存在」
+        let mut missing = HashMap::new();
+        missing.insert("id".to_string(), json!(424242424i64));
+        let resp2 = facade.flow("processInstance/approvalRecord", &missing).await;
+        assert_eq!(
+            resp2["code"],
+            0,
+            "实例不存在不得报错（spec/06 §4.6 口径②），实得 {resp2:?}"
+        );
+        assert_eq!(resp2["data"], json!([]), "实例不存在 ⇒ 空数组");
+    }
+
+    /// ccList 分页默认值档位（spec/06 §4.6 ccList 参数表／issues/154④）。
+    #[tokio::test]
+    async fn test_i154_cc_list_default_page_size_is_ten() {
+        // issues/154④（spec/06 §4.6 ccList 参数表）：分页默认值统一 pageNum=1 / pageSize=10，
+        // rust 旧默认 20 已判分叉。信封会把查询档位回显出来，所以这一格在内存仓上就能钉死。
+        let facade = make_facade();
+        let resp = facade.flow("processInstance/ccList", &HashMap::new()).await;
+        assert_eq!(resp["code"], 0, "{:?}", resp);
+        assert_eq!(resp["data"]["pageSize"], json!(10), "ccList 不传 pageSize 时默认必须是 10");
+        assert_eq!(resp["data"]["pageNum"], json!(1), "ccList 不传 pageNum 时默认是 1");
+        // 显式传值不受默认档影响（防把"改默认"写成"改强制"）
+        let mut args = HashMap::new();
+        args.insert("pageSize".to_string(), json!(20));
+        let resp2 = facade.flow("processInstance/ccList", &args).await;
+        assert_eq!(resp2["data"]["pageSize"], json!(20), "显式 pageSize 必须照传值走，实得 {resp2:?}");
     }
 
     #[tokio::test]
