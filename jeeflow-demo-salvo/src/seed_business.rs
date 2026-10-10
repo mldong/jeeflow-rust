@@ -36,7 +36,11 @@ fn in_progress() -> &'static [Row] {
     &ROWS
 }
 
-/// 已完成 9 条：advance() 推到 state=20（分支无关）
+/// 已完成 9 条：advance() 推到 state=20（分支无关）。
+/// issues/166 A（2026-10-11）：F5/F8/F9 补 finalAmount=8000——三行的 deptLeader 本是
+/// 15 文件编号时代 11-assignee-vars 的判定变量，flows 目录插入 06-…-expire.json 后
+/// define=12 已是 10-mixed-mode（八仓同序），决策边 finalAmount>5000/<=5000 没这把键
+/// 无路可走；补键走 e8→boss→end（与旧蒙臂 edges[0] 同形），矩阵"9 行已完成"原意复原。
 fn finished() -> &'static [Row] {
     use std::sync::LazyLock;
     static ROWS: LazyLock<Vec<Row>> = LazyLock::new(|| {
@@ -45,11 +49,11 @@ fn finished() -> &'static [Row] {
             (8, "userB", json!({}), vec!["boss", "manager"]),          // F2
             (2, "manager", json!({}), vec!["boss"]),                   // F3
             (10, "director", json!({}), vec![]),                       // F4
-            (12, "userC", json!({"deptLeader": "leader"}), vec![]),    // F5
+            (12, "userC", json!({"deptLeader": "leader", "finalAmount": 8000}), vec![]),    // F5
             (1, "director", json!({}), vec![]),                        // F6
             (5, "manager", json!({}), vec![]),                         // F7
-            (12, "userA", json!({"deptLeader": "director"}), vec![]),  // F8
-            (12, "userB", json!({"deptLeader": "user1"}), vec![]),     // F9
+            (12, "userA", json!({"deptLeader": "director", "finalAmount": 8000}), vec![]),  // F8
+            (12, "userB", json!({"deptLeader": "user1", "finalAmount": 8000}), vec![]),     // F9
         ]
     });
     &ROWS

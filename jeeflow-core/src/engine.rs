@@ -375,6 +375,15 @@ impl JeeflowEngineImpl {
                         let next = next.clone();
                         self.execute_node(exec, &next)?;
                     }
+                } else {
+                    // issues/164 A：零命中（两条 expr 边全 false / 变量缺失 / 零出边 /
+                    // 自定义处理器未命中）⇒ 显式报错，对齐 java `DecisionModel.exec` 尾部
+                    // `NOT_FOUND_NEXT_NODE`（20010001，文案逐字取 WfErrEnum；python issues/161
+                    // 已走同一条路）。旧形状此处静默落出＝令牌不前进也不报错，办理人看到
+                    // code=0"成功"、实例挂在 state=10 却没有任何人的待办（僵尸实例）。
+                    return Err(JeeflowError::Business(
+                        "decision节点无法确定下一步执行路线".to_string(),
+                    ));
                 }
             }
             NodeType::Fork => {
@@ -1924,6 +1933,101 @@ mod tests {
             engine.execute_task_async(apply_task.task_id, "applicant", &FlowData::new()).await.unwrap();
         }
         inst.instance_id
+    }
+
+    // ── issues/164 · 决策节点「零命中 ⇒ 显式报错（NOT_FOUND_NEXT_NODE 同档）」──
+    // 改前形状：选边 found=None 后静默落出 Decision 分支——令牌不前进也不报错，办理人看到
+    // code=0"成功"、实例停在 state=10 且没有任何人的待办（僵尸实例）。本案 A（2026-10-11 拍，
+    // python issues/161 已走同一条路）＝零命中返 `JeeflowError::Business`，文案逐字取 java
+    // `WfErrEnum.NOT_FOUND_NEXT_NODE`。夹具＝内联决策流程（两条 expr 边 **可同时为 false**：
+    // 共享夹具 03 是 `>1000`/`<=1000` 恒有一条真，照不到这一档），不新增共享 flows/。
+    const I164_NOT_FOUND_NEXT_NODE_MSG: &str = "decision节点无法确定下一步执行路线";
+
+    fn i164_flow_json() -> String {
+        r#"{
+            "name": "i164-decision-nomatch",
+            "displayName": "决策无命中(164夹具)",
+            "type": "approval",
+            "nodes": [
+                {"id": "start", "type": "snaker:start", "text": {"value": "开始"}},
+                {"id": "apply", "type": "snaker:task", "text": {"value": "发起申请"},
+                 "properties": {"assignee": "applicant", "performType": 0}},
+                {"id": "task1", "type": "snaker:task", "text": {"value": "填写报销单"},
+                 "properties": {"assignee": "leader", "performType": 0}},
+                {"id": "decision1", "type": "snaker:decision", "text": {"value": "金额判断"},
+                 "properties": {"expr": "", "handleClass": ""}},
+                {"id": "task2", "type": "snaker:task", "text": {"value": "经理审批"},
+                 "properties": {"assignee": "manager", "performType": 0}},
+                {"id": "task3", "type": "snaker:task", "text": {"value": "总监审批"},
+                 "properties": {"assignee": "director", "performType": 0}},
+                {"id": "end", "type": "snaker:end", "text": {"value": "结束"}}
+            ],
+            "edges": [
+                {"id": "e0", "sourceNodeId": "start", "targetNodeId": "apply"},
+                {"id": "e1", "sourceNodeId": "apply", "targetNodeId": "task1"},
+                {"id": "e2", "sourceNodeId": "task1", "targetNodeId": "decision1"},
+                {"id": "e3", "sourceNodeId": "decision1", "targetNodeId": "task2",
+                 "properties": {"expr": "amount > 1000"}},
+                {"id": "e4", "sourceNodeId": "decision1", "targetNodeId": "task3",
+                 "properties": {"expr": "amount < 0"}},
+                {"id": "e5", "sourceNodeId": "task2", "targetNodeId": "end"},
+                {"id": "e6", "sourceNodeId": "task3", "targetNodeId": "end"}
+            ]
+        }"#.to_string()
+    }
+
+    /// ① 核心格：两 expr 边全 false（amount=500）⇒ 显式报错且文案与 java 逐字同文；
+    /// 实例停 DOING、零后续待办（改前此格红：静默停住不报错）。
+    #[tokio::test]
+    async fn test_i164_decision_nomatch_errors() {
+        let (engine, repo) = make_compliance_engine();
+        let did = save_define(&repo, "i164-nomatch", &i164_flow_json());
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(tasks.len(), 1, "发起后应停在 task1");
+
+        let mut args = FlowData::new();
+        args.insert_i64("amount", 500);
+        let err = engine.execute_task_async(tasks[0].task_id, "leader", &args)
+            .await.expect_err("两 expr 边全 false 必须报错（改前此格红：静默停住）");
+        assert!(err.message().contains(I164_NOT_FOUND_NEXT_NODE_MSG),
+            "文案须与 java NOT_FOUND_NEXT_NODE 逐字同文，实得: {}", err.message());
+
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "任务已消耗，实例应仍停在 DOING");
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert!(doing.is_empty(), "零命中后不得再产生任何待办（僵尸实例判据）");
+    }
+
+    /// ② 对照档：amount=5000 ⇒ e3 为真照常走 task2——抛错只在"零命中"档。
+    #[tokio::test]
+    async fn test_i164_decision_match_still_routes() {
+        let (engine, repo) = make_compliance_engine();
+        let did = save_define(&repo, "i164-match", &i164_flow_json());
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+
+        let mut args = FlowData::new();
+        args.insert_i64("amount", 5000);
+        engine.execute_task_async(tasks[0].task_id, "leader", &args)
+            .await.expect("有命中档不得报错");
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(doing.len(), 1, "有命中档应推进");
+        assert_eq!(doing[0].task_name, "task2", "amount=5000 应走 task2");
+    }
+
+    /// ③ 缺 amount（变量没填，两 expr 同样全 false）⇒ 同档报错。
+    #[tokio::test]
+    async fn test_i164_decision_missing_var_errors() {
+        let (engine, repo) = make_compliance_engine();
+        let did = save_define(&repo, "i164-missing", &i164_flow_json());
+        let iid = start_and_apply(&engine, &repo, did).await;
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+
+        let err = engine.execute_task_async(tasks[0].task_id, "leader", &FlowData::new())
+            .await.expect_err("缺判定变量也必须同档报错");
+        assert!(err.message().contains(I164_NOT_FOUND_NEXT_NODE_MSG),
+            "实得: {}", err.message());
     }
 
     // ── v1.0 core scenarios (1-10) ──
