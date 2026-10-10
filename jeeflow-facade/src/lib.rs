@@ -1320,7 +1320,7 @@ impl JeeflowFacade {
                         &mut visited,
                         inst.variables.inner(),
                         &history_tasks,
-                        ctx.expression_evaluator.as_ref(),
+                        ctx.expression_evaluator_or_default(),
                     );
                 }
             }
@@ -2432,7 +2432,7 @@ fn collect_high_light_path(
     visited: &mut std::collections::HashSet<String>,
     instance_vars: &HashMap<String, JsonValue>,
     history_tasks: &[ProcessTask],
-    evaluator: Option<&Arc<dyn ExpressionEvaluator>>,
+    evaluator: &dyn ExpressionEvaluator,
 ) {
     if visited.contains(node_id) {
         return;
@@ -2493,25 +2493,26 @@ fn collect_high_light_path(
 /// ＋ go `evalDecisionExpr`）：args ＝ 实例变量 ∪ 决策节点**前置任务**（输入边第一个源节点）
 /// 的任务变量——与引擎运行时 `DecisionModel.exec` 同一份原料。
 ///
-/// ⚠ **降级档**：`IExpressionEvaluator` **未注册**时整档判 false（java 的
-/// `if (evaluator == null) return false;` 那一支）。spec 只允许"未注册"这一种判 false 的缺省，
-/// 它是缺省保护而不是常态——注册了 SPI 就必须真求值，旧注释「无表达式引擎则保守跳过（对齐 Java
-/// evaluator==null → false）」把降级档当成了唯一路径，掩盖了"注册了也不求值"的分叉。
+/// ⚠ **求值通道（issues/158）**：这里**不再**有"SPI 未注册 ⇒ 整档判 false"的降级档。
+/// spec/06 §4.6 义务 2 允许那条降级档，但本栈把它做成**结构性不可达**：宿主没注册时用引擎内置
+/// 默认求值器（[`ServiceContext::expression_evaluator_or_default`] →
+/// `jeeflow_core::default_evaluator::DefaultExpressionEvaluator`）。理由是 rust 的**运行时**从来都有
+/// 一条内置腿（旧 `engine.rs::simple_eval`），实例照它定了支；门面若在同一个"没注册"的配置下判 false，
+/// 就会出现"运行时走了那条支、门面说没走"——活栈读数＝salvo `L2-39` 47/1 缺 `e_dec_yes`，
+/// 而同夹具打在 csharp（引擎自带默认件）上是 48/0。两条腿共用一个出口之后该分叉不再可能。
 ///
 /// 判 true 的形状也与两侧逐字一致：只有求值结果**恰为布尔 true** 才算走过（java
-/// `Boolean.TRUE.equals(...)`／go `b, _ := result.(bool)`），求值报错、返回数字或字符串
-/// 一律判 false（不套用引擎运行时 `evaluate_expression` 的数字/字符串宽松折算——那两条腿不同档）。
+/// `Boolean.TRUE.equals(...)`／go `b, _ := result.(bool)`／csharp `result is true`），求值报错、
+/// 返回数字或字符串一律判 false（不套用引擎运行时 `evaluate_expression` 的数字/字符串宽松折算——
+/// 那两条腿不同档，本条只钉门面）。
 fn eval_decision_expr(
     model: &jeeflow_core::parser::ProcessModel,
     decision_id: &str,
     expr: &str,
     instance_vars: &HashMap<String, JsonValue>,
     history_tasks: &[ProcessTask],
-    evaluator: Option<&Arc<dyn ExpressionEvaluator>>,
+    evaluator: &dyn ExpressionEvaluator,
 ) -> bool {
-    let Some(evaluator) = evaluator else {
-        return false; // 降级档：SPI 未注册（见上方注释），整档判 false
-    };
     let mut args: HashMap<String, JsonValue> = instance_vars.clone();
     if let Some(input) = model.get_input_edges(decision_id).first() {
         if !input.source_node_id.is_empty() {

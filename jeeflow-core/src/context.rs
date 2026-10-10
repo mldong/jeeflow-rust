@@ -119,6 +119,18 @@ impl ServiceContext {
         self
     }
 
+    /// 决策/条件表达式的**单一求值出口**（issues/158）：宿主注册了 SPI 就走宿主，没注册走引擎内置
+    /// [`DefaultExpressionEvaluator`]。引擎运行时与门面 `highLight` 必须都从这里取，
+    /// 否则同一个实例会出现"运行时走了那条支、门面判没走"的分叉（salvo `L2-39` 47/1 的形状）。
+    /// 形状照 jeeflow-csharp 的 `ServiceContext.ExpressionEvaluatorOrDefault`——
+    /// 有了默认件，spec/06 §4.6 义务 2 那条"未注册才允许整档判 false"的降级档在本栈结构性不可达。
+    pub fn expression_evaluator_or_default(&self) -> &dyn ExpressionEvaluator {
+        match &self.expression_evaluator {
+            Some(eval) => eval.as_ref(),
+            None => &crate::default_evaluator::DefaultExpressionEvaluator,
+        }
+    }
+
     pub fn with_transaction_template(mut self, tx: Arc<dyn TransactionTemplate>) -> Self {
         self.transaction_template = Some(tx);
         self

@@ -10,6 +10,7 @@ pub mod clock;
 pub mod expire_time;
 pub mod json;
 pub mod spi;
+pub mod default_evaluator;
 pub mod context;
 pub mod event;
 pub mod id_gen;

@@ -658,93 +658,20 @@ impl JeeflowEngineImpl {
                 _ => false,
             }
         } else {
-            // Simple built-in expression evaluator
-            self.simple_eval(expr, exec)
+            self.builtin_eval(expr, exec)
         }
     }
 
-    /// Simple expression evaluator for basic comparisons.
-    fn simple_eval(&self, expr: &str, exec: &Execution) -> bool {
-        let expr = expr.trim();
-
-        // Handle ${var} references
-        let resolved = self.resolve_var_refs(expr, exec);
-
-        // Handle comparison operators
-        for op in &[">=", "<=", "!=", "==", ">", "<"] {
-            if let Some(pos) = resolved.find(op) {
-                let left = resolved[..pos].trim();
-                let right = resolved[pos + op.len()..].trim();
-                return match *op {
-                    ">" => self.compare_values(left, right) == Some(std::cmp::Ordering::Greater),
-                    "<" => self.compare_values(left, right) == Some(std::cmp::Ordering::Less),
-                    ">=" => self.compare_values(left, right).map(|o| o != std::cmp::Ordering::Less).unwrap_or(false),
-                    "<=" => self.compare_values(left, right).map(|o| o != std::cmp::Ordering::Greater).unwrap_or(false),
-                    "==" => self.compare_values(left, right) == Some(std::cmp::Ordering::Equal),
-                    "!=" => self.compare_values(left, right).map(|o| o != std::cmp::Ordering::Equal).unwrap_or(true),
-                    _ => false,
-                };
-            }
+    /// 内置求值档（issues/158）：宿主未注册 `IExpressionEvaluator` 时走这里，
+    /// 且与门面 `highLight` 的决策边求值**同一个函数**（[`crate::default_evaluator::evaluate_builtin`]）——
+    /// 旧形状是运行时有一条内置腿、门面在 SPI 为 `None` 时整档判 false，同一个实例两条腿两个答案。
+    /// `gate_vars`（会签门控计数）并进原料，保住旧内置认得 `#nrOfCompletedInstances` 那类变量的能力。
+    fn builtin_eval(&self, expr: &str, exec: &Execution) -> bool {
+        let mut vars: HashMap<String, JsonValue> = exec.args.inner().clone();
+        for (k, v) in exec.gate_vars.inner() {
+            vars.insert(k.clone(), v.clone());
         }
-
-        // Boolean literal
-        match resolved.to_lowercase().as_str() {
-            "true" => true,
-            "false" => false,
-            _ => !resolved.is_empty() && resolved != "0" && resolved != "null",
-        }
-    }
-
-    fn resolve_var_refs(&self, expr: &str, exec: &Execution) -> String {
-        let mut result = expr.to_string();
-        // Replace ${var} patterns
-        while let Some(start) = result.find("${") {
-            if let Some(end) = result[start..].find('}') {
-                let var_name = &result[start + 2..start + end];
-                let value = exec.args.get_str(var_name)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "0".to_string());
-                result = format!("{}{}{}", &result[..start], value, &result[start + end + 1..]);
-            } else {
-                break;
-            }
-        }
-        // Replace #var patterns (countersign gate variables like #nrOfCompletedInstances)
-        let mut out = String::new();
-        let mut i = 0;
-        let chars = result.as_bytes();
-        while i < chars.len() {
-            if chars[i] == b'#' && i + 1 < chars.len() && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == b'_') {
-                let start = i + 1;
-                let mut end = start;
-                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == b'_') {
-                    end += 1;
-                }
-                let var_name = &result[start..end];
-                // Look up in gate_vars first, then args (handle both string and numeric values)
-                let value = exec.gate_vars.get_str(var_name)
-                    .or_else(|| exec.args.get_str(var_name))
-                    .map(|s| s.to_string())
-                    .or_else(|| exec.gate_vars.get_i64(var_name).map(|n| n.to_string()))
-                    .or_else(|| exec.args.get_i64(var_name).map(|n| n.to_string()))
-                    .unwrap_or_else(|| "0".to_string());
-                out.push_str(&value);
-                i = end;
-            } else {
-                out.push(chars[i] as char);
-                i += 1;
-            }
-        }
-        out
-    }
-
-    fn compare_values(&self, left: &str, right: &str) -> Option<std::cmp::Ordering> {
-        // Try numeric comparison first
-        if let (Ok(l), Ok(r)) = (left.parse::<f64>(), right.parse::<f64>()) {
-            return l.partial_cmp(&r);
-        }
-        // Fall back to string comparison
-        Some(left.cmp(right))
+        crate::default_evaluator::evaluate_builtin(expr, &vars)
     }
 
     /// Fire pre-interceptors.
@@ -1201,7 +1128,7 @@ impl JeeflowEngineImpl {
                     exec.process_instance.variables.insert_i64("nrOfCompletedInstances", finished_count as i64);
 
                     let cond_str = cond.as_ref().unwrap().trim();
-                    let merged = self.simple_eval(cond_str, &exec);
+                    let merged = self.builtin_eval(cond_str, &exec);
 
                     if merged {
                         self.abandon_countersign_remaining(&mut exec, node_id)?;
