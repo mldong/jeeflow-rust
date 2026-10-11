@@ -142,10 +142,20 @@ impl JeeflowEngineImpl {
     /// 载荷四键按规范 11 §11.3：`instanceId` / `taskId` / `operator` / `submitType`，
     /// `sourceId`＝taskId。
     ///
-    /// 5 与 6 **互斥**（§11.3 码 6 括注）：由调用点保证——同意/会签办理/重新提交走
-    /// [`execute_task_async`] 发 5，退回/拒绝（submitType 2/3/6）走 `execute_jump_inner` /
-    /// [`execute_and_jump_to_end_async`] 发 6；同一次动作不会两支都发。
-    /// 拒绝/跳转/退发起人不再各开一号，靠载荷 `submitType` 区分（§11.2 原则 2）。
+    /// 5/6 分派判据（spec 11 §11.3 码 6／§11.4-6；issues/168 向 java 参考实现
+    /// `JeeflowEngineImpl.REJECT_SUBMIT_TYPES` 逐字同集）：载荷 `submitType` 属退回族
+    /// 2 拒绝／3 退回上一步／6 退回发起人／**20 会签拒绝（软拒绝）** ⇒ 6，其余（0/1/4/5 与缺省）⇒ 5。
+    fn is_reject_submit_type(submit_type: Option<i64>) -> bool {
+        matches!(submit_type, Some(2) | Some(3) | Some(6) | Some(20))
+    }
+
+    /// 5 与 6 **互斥**（§11.3 码 6 括注）：一次动作只发其中一支。
+    /// 分派轴＝**载荷 `submitType`**（§11.2 原则 2「拒绝/跳转/退发起人不再各开一号，靠载荷
+    /// submitType 区分」）——`execute_task_async` 与 `execute_jump_inner` 两处 fire 点都先问
+    /// [`Self::is_reject_submit_type`]；跳转腿另保留**调用点档位作下限**（`FirstTaskNode`／
+    /// `RollbackLineage`／`jump_to_end` 语义即退回，而 `flow.auto` 旁路那类内部动作载荷里
+    /// 没有 submitType，纯载荷派会把它们从 6 翻成 5＝回归）。issues/168 之前本栈只看调用点，
+    /// 于是 submitType=20 经门面实发 5。
     fn notify_task_outcome(
         &self,
         event_type: ProcessEventType,
@@ -1022,12 +1032,18 @@ impl JeeflowEngineImpl {
             self.repo().update_task(t)?;
         }
 
-        // 7.5 Fire 5 TASK_COMPLETE：任务行 state→已完成（20）**落库之后** fire
+        // 7.5 Fire 任务结果事件：任务行 state→已完成（20）**落库之后** fire
         // （规范 11 §11.3 码 5 触发时机／08 场景 30，先 fire 后落库即红）。
-        // 本方法是"同意/申请/重新提交/会签办理"路径 ⇒ 发 5；退回三档（submitType 2/3/6）
-        // 走 execute_jump_inner / execute_and_jump_to_end_async 发 6，两支互斥不并列。
-        // 会签未合并（只办掉一个人那一张）时同样发 5——"这张任务单被办掉"是既成事实。
-        self.notify_task_outcome(ProcessEventType::TaskComplete,
+        // 分派按**载荷 submitType**（issues/168）：退回族 2/3/6/20 ⇒ 6 TASK_REJECT，
+        // 其余（0 发起／1 同意／4 跳转／5 重新提交与缺省）⇒ 5 TASK_COMPLETE。
+        // 会签未合并（只办掉否决者那一张）时发的是 6 而不是 5——spec §11.4-6 逐字
+        // 「否决者本人的那一支按 submitType=20 走 6」；被废弃的兄弟行按"不发清单"处理，不在此 fire。
+        let outcome = if Self::is_reject_submit_type(submit_type) {
+            ProcessEventType::TaskReject
+        } else {
+            ProcessEventType::TaskComplete
+        };
+        self.notify_task_outcome(outcome,
                                  instance.instance_id, task_id, operator, submit_type);
 
         // 8. Find the node for this task
@@ -1258,15 +1274,22 @@ impl JeeflowEngineImpl {
             self.repo().update_task(t)?;
         }
 
-        // 跳转三档的结果事件（规范 11 §11.3 码 5/6，**互斥**：走 reject 就不再 fire complete）：
-        //   JumpTarget::Node        ＝ submitType 4 跳指定节点 → 5 TASK_COMPLETE（码 5 事实列"同意/跳转/会签办理"）
+        // 跳转腿的结果事件（规范 11 §11.3 码 5/6，**互斥**：走 reject 就不再 fire complete）：
+        // 先问**载荷**（issues/168，与 java 同轴）——submitType ∈ {2,3,6,20} ⇒ 6；
+        // 载荷没带或不在退回族时才取调用点档位作下限：
+        //   JumpTarget::Node        ＝ submitType 4 跳指定节点 → 5 TASK_COMPLETE（码 5 事实列"同意/跳转"）
         //   JumpTarget::FirstTaskNode ＝ submitType 6 退回发起人   → 6 TASK_REJECT
         //   JumpTarget::RollbackLineage＝ submitType 3 退回上一步   → 6 TASK_REJECT
+        // 下限不能摘：`flow.auto` 旁路那类内部动作的载荷里没有 submitType，纯载荷派会把这两支翻成 5＝回归。
         // fire 排在被办任务 update_task 落库之后（taskId 可反查）；实例终态 2 由 End 节点
         // / jump_to_end 那一支另 fire，载荷 submitType 供下游分档（§11.2 原则 2 码粗载荷细）。
-        let outcome = match mode {
-            JumpTarget::Node(_) => ProcessEventType::TaskComplete,
-            JumpTarget::FirstTaskNode | JumpTarget::RollbackLineage => ProcessEventType::TaskReject,
+        let outcome = if Self::is_reject_submit_type(submit_type) {
+            ProcessEventType::TaskReject
+        } else {
+            match mode {
+                JumpTarget::Node(_) => ProcessEventType::TaskComplete,
+                JumpTarget::FirstTaskNode | JumpTarget::RollbackLineage => ProcessEventType::TaskReject,
+            }
         };
         self.notify_task_outcome(outcome, instance.instance_id, task_id, operator, submit_type);
 
@@ -1800,6 +1823,130 @@ mod tests {
         let fired = capture.source_ids.lock().unwrap().clone();
         assert_eq!(fired.len(), 1, "驳回路径应 fire 恰好一次 ProcessInstanceEnd，实得 {:?}", fired);
         assert_eq!(fired[0], instance.instance_id, "source_id 应为 instance_id");
+    }
+
+    /// 5/6 流水捕获（issues/168）：只收任务结果两支，记 `(事件类型, sourceId=taskId)`。
+    struct OutcomeCapture {
+        rows: std::sync::Mutex<Vec<(ProcessEventType, i64)>>,
+    }
+
+    impl ProcessEventListener for OutcomeCapture {
+        fn on_event(&self, event: &ProcessEvent) {
+            if event.event_type == ProcessEventType::TaskComplete
+                || event.event_type == ProcessEventType::TaskReject
+            {
+                self.rows.lock().unwrap().push((event.event_type, event.source_id));
+            }
+        }
+    }
+
+    /// 带 5/6 捕获的引擎＋一条 apply(applicant)→…简单流程，返回 (引擎, 仓储, 捕获, defineId)。
+    fn outcome_engine() -> (JeeflowEngineImpl, Arc<MemoryRepository>, Arc<OutcomeCapture>, i64) {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        let capture = Arc::new(OutcomeCapture { rows: std::sync::Mutex::new(Vec::new()) });
+        ctx.register_event_listener(capture.clone());
+        let define_id = make_define(&repo);
+        (JeeflowEngineImpl::new(ctx), repo, capture, define_id)
+    }
+
+    fn doing_task(repo: &MemoryRepository, inst: i64) -> i64 {
+        let tasks = repo.find_doing_tasks(inst, &[]).unwrap();
+        assert!(!tasks.is_empty(), "应有在办任务");
+        tasks[0].task_id
+    }
+
+    /// 正向（issues/168 主判据）：submitType=20（会签软拒绝）经 `execute_task_async`
+    /// 必须发 **6 TASK_REJECT** 且**不发 5**——spec §11.4-6「否决者本人的那一支按
+    /// submitType=20 走 6」，基准＝java `REJECT_SUBMIT_TYPES` 含 20。
+    /// 修复前本栈按调用点分档 ⇒ 该腿实发 5（本用例即当时的红样）。
+    #[test]
+    fn test_submit_type_20_fires_task_reject_not_complete() {
+        let (engine, repo, capture, define_id) = outcome_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+        let tid = doing_task(&repo, instance.instance_id);
+
+        rt.block_on(engine.execute_task_async(tid, "user1", &exp_submit(20))).unwrap();
+
+        let rows = capture.rows.lock().unwrap().clone();
+        let mine: Vec<ProcessEventType> =
+            rows.iter().filter(|(_, s)| *s == tid).map(|(t, _)| *t).collect();
+        assert_eq!(mine, vec![ProcessEventType::TaskReject],
+            "submitType=20 的否决者本人那张任务应只发 6 TASK_REJECT，实得 {:?}",
+            rows.iter().map(|(t, s)| (t.spec_name(), *s)).collect::<Vec<_>>());
+    }
+
+    /// 负向：submitType=1（同意）仍发 5 不发 6，且 `submitType` 键按载荷原样进事件载荷。
+    /// 摘掉载荷判档（改回恒发 5）本用例照绿，故 5/6 两支必须**同时**有钉才谈得上互斥。
+    #[test]
+    fn test_submit_type_agree_fires_task_complete_only() {
+        let (engine, repo, capture, define_id) = outcome_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+        let tid = doing_task(&repo, instance.instance_id);
+
+        rt.block_on(engine.execute_task_async(tid, "user1", &exp_submit(1))).unwrap();
+
+        let rows = capture.rows.lock().unwrap().clone();
+        let mine: Vec<ProcessEventType> =
+            rows.iter().filter(|(_, s)| *s == tid).map(|(t, _)| *t).collect();
+        assert_eq!(mine, vec![ProcessEventType::TaskComplete],
+            "同意应只发 5 TASK_COMPLETE，实得 {:?}",
+            rows.iter().map(|(t, s)| (t.spec_name(), *s)).collect::<Vec<_>>());
+    }
+
+    /// 回归（载荷优先不能把内部动作翻档）：`flow.auto` 旁路的 jump_to_end 载荷里**没有**
+    /// submitType ⇒ 调用点档位仍须发 6（摘掉下限本用例红）。
+    #[test]
+    fn test_internal_jump_to_end_without_submit_type_still_fires_reject() {
+        let (engine, repo, capture, define_id) = outcome_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+        let tid = doing_task(&repo, instance.instance_id);
+
+        rt.block_on(engine.execute_and_jump_to_end_async(tid, "flow.auto", &FlowData::new())).unwrap();
+
+        let rows = capture.rows.lock().unwrap().clone();
+        let mine: Vec<ProcessEventType> =
+            rows.iter().filter(|(_, s)| *s == tid).map(|(t, _)| *t).collect();
+        assert_eq!(mine, vec![ProcessEventType::TaskReject],
+            "jump_to_end 无载荷 submitType 时应按调用点发 6，实得 {:?}",
+            rows.iter().map(|(t, s)| (t.spec_name(), *s)).collect::<Vec<_>>());
+    }
+
+    /// 回归（载荷优先不能把跳转腿翻档）：submitType=4 跳指定节点不属退回族 ⇒ 仍发 5。
+    /// （同族 submitType=3 血缘回退发 6 的既有夹具在 `test_rollback_*` 一组里，简单流程没有可回退的
+    /// 上游血缘，这里不重造——`execute_and_jump_async(None)` 在无 lineage 时按业务错误拒绝。）
+    #[test]
+    fn test_jump_to_node_fires_complete_not_reject() {
+        let (engine, repo, capture, define_id) = outcome_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+        let tid = doing_task(&repo, instance.instance_id);
+
+        // 4 ＝ 跳转指定节点（载荷不在退回族）⇒ 5
+        rt.block_on(engine.execute_and_jump_async(tid, "user1", &exp_submit(4), Some("apply")))
+            .unwrap();
+        let after4 = capture.rows.lock().unwrap().clone();
+        let mine4: Vec<ProcessEventType> =
+            after4.iter().filter(|(_, s)| *s == tid).map(|(t, _)| *t).collect();
+        assert_eq!(mine4, vec![ProcessEventType::TaskComplete],
+            "submitType=4 跳指定节点应发 5，实得 {:?}",
+            after4.iter().map(|(t, s)| (t.spec_name(), *s)).collect::<Vec<_>>());
+    }
+
+    /// 判据本身的单元测试：退回族四档 vs 其余五档（含缺省 None），集合改动必须有钉。
+    #[test]
+    fn test_is_reject_submit_type_membership() {
+        for t in [Some(2), Some(3), Some(6), Some(20)] {
+            assert!(JeeflowEngineImpl::is_reject_submit_type(t), "{:?} 属退回族应发 6", t);
+        }
+        for t in [Some(0), Some(1), Some(4), Some(5), Some(7), None] {
+            assert!(!JeeflowEngineImpl::is_reject_submit_type(t), "{:?} 不属退回族应发 5", t);
+        }
     }
 
     #[test]
