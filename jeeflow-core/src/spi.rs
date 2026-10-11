@@ -86,8 +86,9 @@ pub trait ProcessRepository: Send + Sync {
     fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()>;
     /// 抄送已读回写（`wf_process_cc_instance.state` → 1）。
     ///
-    /// issues/142 B 批 · spec 06-facade.md §2.11 表第四行：入参 `actor_id`（门面的 `operator`）
-    /// **必须先归一再比**——取 trim 后的值，trim 后为空则按各仓既有的"缺参数/默认操作人"档处理。
+    /// issues/142 B 批 · spec 06-facade.md §2.11 表第四行（rust 漏收口随 issues/172 补齐）：入参
+    /// `actor_id`（门面的 `operator`）**必须先归一再比**——取 trim 后的值；trim 后为空 ⇒
+    /// 一行都不动（仓储层 no-op 档；门面层已把空白/缺键回落缺省操作人，两层都挡）。
     /// 不归一就直接比，空 operator 会把 `state=1` 打到历史 `actor_id=''` 的脏行上（越权改别人的
     /// 已读位），带空格的同一人又永远命不中。判据本体＝[`crate::model::normalize_actors`]
     /// （单值档取归一后的那一个元素），**不要另抄一份 `trim()` 判据**。

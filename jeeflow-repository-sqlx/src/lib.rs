@@ -906,10 +906,20 @@ impl ProcessRepository for SqlxRepository {
     }
 
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()> {
+        // issues/142 B 批（spec 06 §2.11 表第四行，要求①「两层都挡」的第二层）· issues/172：
+        // 比较值先过归一单点，归一后为空 ⇒ 一条 UPDATE 都不发（旧形状把入参原样绑进
+        // `actor_id = ?`：带空格打不中规范行，空串会把历史 `actor_id=''` 脏行打成已读）。
+        let actor = match jeeflow_core::model::normalize_actors(&[actor_id.to_string()])
+            .into_iter()
+            .next()
+        {
+            Some(a) => a,
+            None => return Ok(()),
+        };
         self.block_on(async {
             sqlx::query("UPDATE wf_process_cc_instance SET state=1 WHERE process_instance_id=? AND actor_id=?")
                 .bind(instance_id)
-                .bind(actor_id)
+                .bind(&actor)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
@@ -4591,5 +4601,67 @@ mod tests {
         );
         sqlx::query("DELETE FROM wf_process_task WHERE process_instance_id = ?")
             .bind(inst_id).execute(&pool).await.unwrap();
+    }
+
+    /// issues/172 · SQL 仓那一层的 cc 已读归一（真库读数，T1）：`update_cc_status` 的入参
+    /// 归一后再比；归一后为空 ⇒ **一条 UPDATE 都不发**——历史 `actor_id=''` 脏行不得被打成
+    /// 已读（issues/129 病根的写侧对偶；spec 06 §2.11 表第四行「两层都挡」的第二层）。
+    /// 脏行直插绕开写侧归一（`create_cc_instance` 会 trim＋丢空，正常路径建不出）。
+    #[tokio::test]
+    async fn test_mysql_i172_cc_status_read_normalized() {
+        if skip_mysql() { return; }
+        let pool = connect_pool().await;
+        setup_schema(&pool).await;
+
+        const IID: i64 = 917202;
+        // 独占 id 段 9172xx（共享测试库，先清干净再种，判据才不被脏行污染）
+        for sql in [
+            "DELETE FROM wf_process_cc_instance WHERE process_instance_id BETWEEN 917200 AND 917299",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+
+        let pool2 = pool.clone();
+        run_sync(move || {
+            let repo = SqlxRepository::new(pool2);
+            // 前置：规范行经写侧落库（"8601"）；两条脏行直插（"" 与纯空白——写侧归一挡得住）
+            repo.create_cc_instance(IID, "i172", &["8601".to_string()]).unwrap();
+            repo.block_on(async {
+                for (id, actor) in [(917210_i64, ""), (917211_i64, "  ")] {
+                    sqlx::query(
+                        "INSERT INTO wf_process_cc_instance \
+                         (id, process_instance_id, actor_id, state, create_time, create_user) \
+                         VALUES (?, ?, ?, 0, '2026-10-11 08:00:00', 'i172')")
+                        .bind(id).bind(IID).bind(actor)
+                        .execute(&repo.pool).await.unwrap();
+                }
+            });
+            let state_of = |actor: &str| -> i32 {
+                repo.block_on(async {
+                    let row = sqlx::query(
+                        "SELECT state FROM wf_process_cc_instance \
+                         WHERE process_instance_id = ? AND actor_id = ?")
+                        .bind(IID).bind(actor)
+                        .fetch_one(&repo.pool).await.unwrap();
+                    Row::get::<i64, _>(&row, 0) as i32
+                })
+            };
+
+            // ① 归一后再比：' 8601 ' 打得中规范行（改前原样绑 ⇒ 打不中，点了已读没反应）
+            repo.update_cc_status(IID, " 8601 ").unwrap();
+            assert_eq!(state_of("8601"), 1, "172: 入参归一后再比——' 8601 ' 与 '8601' 是同一个人");
+
+            // ② 空值闸：空串/纯空白 ⇒ 一条 UPDATE 都不发，脏行一律不动
+            repo.update_cc_status(IID, "").unwrap();
+            repo.update_cc_status(IID, "   ").unwrap();
+            assert_eq!(state_of(""), 0, "172: 空 operator 不得把 actor_id='' 脏行打成已读");
+            assert_eq!(state_of("  "), 0, "172: 纯空白同档，一条都不发（不得替脏数据洗白）");
+        }).await;
+
+        for sql in [
+            "DELETE FROM wf_process_cc_instance WHERE process_instance_id BETWEEN 917200 AND 917299",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
     }
 }

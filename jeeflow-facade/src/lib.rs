@@ -1300,28 +1300,37 @@ impl JeeflowFacade {
         let mut edges: Vec<String> = Vec::new();
         let mut node_progress = json!({});
         if let Some(def) = self.repo.find_define_by_id(inst.define_id)? {
-            if let Ok(model) = jeeflow_core::parser::ModelParser::parse(&def.content_str()) {
-                let ctx = self.engine.context();
-                node_progress = build_node_progress(
-                    &model,
-                    &history_tasks,
-                    ctx.user_provider.as_ref(),
-                );
-                if let Some(start) = model.get_start() {
-                    let mut visited = std::collections::HashSet::new();
-                    // 决策边的求值原料与两侧参考实现同形：实例变量（go/java 的 `vars`）
-                    // ＋ 历史任务（前置任务变量在那一层并进去），SPI 从 ServiceContext 取。
-                    collect_high_light_path(
+            match jeeflow_core::parser::ModelParser::parse(&def.content_str()) {
+                Ok(model) => {
+                    let ctx = self.engine.context();
+                    node_progress = build_node_progress(
                         &model,
-                        &start.id,
-                        &active,
-                        &mut history,
-                        &mut edges,
-                        &mut visited,
-                        inst.variables.inner(),
                         &history_tasks,
-                        ctx.expression_evaluator_or_default(),
+                        ctx.user_provider.as_ref(),
                     );
+                    if let Some(start) = model.get_start() {
+                        let mut visited = std::collections::HashSet::new();
+                        // 决策边的求值原料与两侧参考实现同形：实例变量（go/java 的 `vars`）
+                        // ＋ 历史任务（前置任务变量在那一层并进去），SPI 从 ServiceContext 取。
+                        collect_high_light_path(
+                            &model,
+                            &start.id,
+                            &active,
+                            &mut history,
+                            &mut edges,
+                            &mut visited,
+                            inst.variables.inner(),
+                            &history_tasks,
+                            ctx.expression_evaluator_or_default(),
+                        );
+                    }
+                }
+                // issues/162（口径＝保留降级面＋落一条可诊断日志，形状照 jeeflow-go v1.8.43 那枚）：
+                // 坏定义只降级模型补全腿（边集/节点补全/nodeProgress 留空，实例与任务行不受影响、
+                // 对外仍 code=0），但不再一声不吭地吞掉——这条静默通道先后藏住过 156（php）与
+                // 160（python）两个真分叉。日志三件齐（实例号/定义号/原因），缺一件等于没落。
+                Err(e) => {
+                    eprintln!("{}", highlight_degrade_warning(id, inst.define_id, &e.detail()))
                 }
             }
         }
@@ -1460,7 +1469,11 @@ impl JeeflowFacade {
     fn process_instance_update_cc_status(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let id = arg_id(args, &["processInstanceId", "id"])?
             .ok_or(JeeflowError::Business("缺少processInstanceId参数".into()))?;
-        let operator = arg_str_or(args, "operator", "user1");
+        // issues/142 B 批（spec 06 §2.11 写点表第 4 行）· issues/172：operator **入参归一后再比**——
+        // `operator_arg` 是既有单点（trim ＋ 空白/缺键回落 user1，与 java `normalizeActor(operatorArg(args))`
+        // 同构）。旧形状 `arg_str_or` 不 trim 且对 present-empty 把空串原样交给仓储（打脏行）。
+        // 两仓写侧还有第二层同枚归一（归一为空 ⇒ 一行不动，spec §2.11 要求①「两层都挡」）。
+        let operator = operator_arg(args, &["operator"]);
         self.repo.update_cc_status(id, &operator)?;
         Ok(json!({}))
     }
@@ -2413,6 +2426,16 @@ fn json_value_to_serde(v: &JsonValue) -> Json {
             Json::Object(map)
         }
     }
+}
+
+/// issues/162 降级日志文本（对齐 jeeflow-go v1.8.43 那枚的形状）：坏流程定义只降级
+/// highLight 的模型补全腿，日志三件齐——实例号／定义号／原因（`detail()`＝契约文案＋底层
+/// 原文，issues/137 的日志侧口径）。eprintln! 与测试断言共用这一枚，文本不许两处各写一遍。
+fn highlight_degrade_warning(instance_id: i64, define_id: i64, err: &str) -> String {
+    format!(
+        "[jeeflow] WARN highLight 模型补全腿解码失败，边集/节点补全/nodeProgress 已降级（实例与任务行不受影响）: instanceId={}, defineId={}, err={}",
+        instance_id, define_id, err
+    )
 }
 
 /// 对齐 Java collectPath：沿输出边补全 history / edges；遇活跃节点仍收集边，但停止深入。
@@ -7845,6 +7868,7 @@ mod tests {
         inner: Arc<MemoryRepository>,
         dirty: Arc<std::sync::Mutex<HashMap<i64, Vec<String>>>>,
         remove_calls: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        cc_status_calls: Arc<std::sync::Mutex<Vec<(i64, String)>>>,
     }
 
     impl DirtyRowSpyRepo {
@@ -7853,6 +7877,7 @@ mod tests {
                 inner,
                 dirty: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 remove_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+                cc_status_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -7884,6 +7909,11 @@ mod tests {
         /// 每次 DELETE 的实参（顺序＝调用顺序）。
         fn remove_calls(&self) -> Vec<Vec<String>> {
             self.remove_calls.lock().unwrap().clone()
+        }
+
+        /// 每次 `update_cc_status` 的实参（issues/172：门面交给仓储的值必须已是归一值）。
+        fn cc_status_calls(&self) -> Vec<(i64, String)> {
+            self.cc_status_calls.lock().unwrap().clone()
         }
     }
 
@@ -7961,6 +7991,7 @@ mod tests {
             self.inner.find_cc_actor_ids(instance_id)
         }
         fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()> {
+            self.cc_status_calls.lock().unwrap().push((instance_id, actor_id.to_string()));
             self.inner.update_cc_status(instance_id, actor_id)
         }
         fn page_todo_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
@@ -8522,6 +8553,44 @@ mod tests {
                 .any(|e| e.starts_with("TASK_TRANSFER/")),
             "transfer 仍 fire 码 7: {:?}",
             recorded_events(&events)
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // issues/172 · updateCCStatus 门面腿：operator 归一后再交仓储
+    // （issues/142 B 批「八栈一起收」在 rust 的漏收口；spec 06-facade.md §2.11 表第四行）
+    // 两仓写侧的第二层会归一（见 jeeflow-core/src/memory.rs 的 `cc_status_i172_tests`）⇒
+    // 光跑端到端**照不出门面腿缺没缺**，这里用 spy 钉第一层：门面交给仓储的 operator 本身
+    // 就必须是归一值（java 同构 `normalizeActor(operatorArg(args))`）。还原病灶（改回
+    // `arg_str_or`）本格会红。
+    // ═══════════════════════════════════════════════════════
+
+    async fn call_update_cc_status(facade: &JeeflowFacade, operator: Option<&str>) -> Json {
+        let mut m = HashMap::new();
+        m.insert("processInstanceId".to_string(), json!(917205));
+        if let Some(op) = operator {
+            m.insert("operator".to_string(), json!(op));
+        }
+        facade.flow("processInstance/updateCCStatus", &m).await
+    }
+
+    /// 三档：带前后空白 ⇒ 交仓储前已 trim；显式空串／缺键 ⇒ 回落 user1
+    /// （issues/129 案 A 行为，不动）。
+    #[tokio::test]
+    async fn test_i172_facade_normalizes_operator_before_repo() {
+        let (facade, repo, _) = make_remove_actor_fixture();
+        assert_eq!(call_update_cc_status(&facade, Some(" 8601 ")).await["code"], 0);
+        assert_eq!(call_update_cc_status(&facade, Some("")).await["code"], 0);
+        assert_eq!(call_update_cc_status(&facade, None).await["code"], 0);
+        assert_eq!(
+            repo.cc_status_calls(),
+            vec![
+                (917205_i64, "8601".to_string()),
+                (917205_i64, "user1".to_string()),
+                (917205_i64, "user1".to_string()),
+            ],
+            "门面交给仓储的 operator 必须是归一值（trim＋空白/缺键回落 user1）——\
+             原样交出＝「两层都挡」的第一层交白卷"
         );
     }
 }

@@ -417,9 +417,17 @@ impl ProcessRepository for MemoryRepository {
     }
 
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()> {
+        // issues/142 B 批（spec 06 §2.11 表第四行，要求①「两层都挡」的第二层）· issues/172：
+        // 比较位先过归一单点（`" 123 "` 与 `"123"` 是同一个人）；归一后为空 ⇒ 一行都不动
+        // （空 operator 不许把 state=1 打到历史 `actor_id=''` 的脏行上——issues/129 病根的写侧对偶）。
+        // 判据本体＝`model::normalize_actors` 单值档（spi.rs 该 trait 注释指名，不另抄 trim）。
+        let actor = match normalize_actors(&[actor_id.to_string()]).into_iter().next() {
+            Some(a) => a,
+            None => return Ok(()),
+        };
         let mut ccs = self.cc_instances.lock().unwrap();
         for cc in ccs.iter_mut() {
-            if cc.process_instance_id == instance_id && cc.actor_id == actor_id {
+            if cc.process_instance_id == instance_id && cc.actor_id == actor {
                 cc.state = 1;
                 // 已读是"人主动读"这个新事实，才动 update_time；重复抄送不动（issues/141 G2 ③）。
                 cc.update_time = Some(current_time_str());
@@ -1898,6 +1906,75 @@ mod actor_i142_tests {
         assert_eq!(repo.find_task_actors(TASK).unwrap(),
             vec!["i142e".to_string(), "".to_string()],
             "归一后为空 ⇒ 一行都不删（issues/129 删除位对偶）");
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+// issues/172 · `update_cc_status` 的 operator 归一＋空值闸（issues/142 B 批「八栈一起收」在
+// rust 的漏收口；audit8 队列 R3）。两层都挡（§2.11 要求①）：门面腿在 jeeflow-facade 的
+// `test_i172_*`，本模块钉仓储第二层——归一后再比；归一后为空 ⇒ 一行都不动。
+//   种脏行必须**绕开写侧归一**（`create_cc_instance` 会 trim＋丢空）：直插 `cc_instances` 台账；
+//   断言打在仓储里真实存着的值上（读回 `state`）。
+// ═══════════════════════════════════════════════════════
+#[cfg(test)]
+mod cc_status_i172_tests {
+    use super::*;
+
+    fn seed(repo: &MemoryRepository, instance_id: i64, actor_id: &str) {
+        repo.cc_instances.lock().unwrap().push(CcInstance {
+            id: 0, process_instance_id: instance_id, actor_id: actor_id.into(), state: 0,
+            create_time: None, create_user: None, update_time: None, update_user: None,
+        });
+    }
+
+    fn state_of(repo: &MemoryRepository, instance_id: i64, actor_id: &str) -> Option<i32> {
+        repo.cc_instances.lock().unwrap().iter()
+            .find(|c| c.process_instance_id == instance_id && c.actor_id == actor_id)
+            .map(|c| c.state)
+    }
+
+    /// 正向/回归：规范值照旧置读（钉"归一不许顺手打偏正常路径"）。
+    #[test]
+    fn test_i172_clean_value_still_marks_read() {
+        let repo = MemoryRepository::new();
+        seed(&repo, 917201, "8601");
+        repo.update_cc_status(917201, "8601").unwrap();
+        assert_eq!(state_of(&repo, 917201, "8601"), Some(1), "规范值照旧命中");
+    }
+
+    /// 归一后再比：带前后空格的同一个人打得中（改前比较不命中 ⇒ 点了已读没反应）。
+    #[test]
+    fn test_i172_padded_value_hits_trimmed_row() {
+        let repo = MemoryRepository::new();
+        seed(&repo, 917202, "8601");
+        repo.update_cc_status(917202, " 8601 ").unwrap();
+        assert_eq!(state_of(&repo, 917202, "8601"), Some(1),
+            "§2.11 表第四行：入参归一后再比——' 8601 ' 与 '8601' 是同一个人");
+    }
+
+    /// 空值闸：归一后为空 ⇒ 一行都不动——历史 `actor_id=''` 脏行不得被打成已读
+    /// （改前实测：空串原样绑 WHERE ⇒ 脏行 state 0→1，越权改别人的已读位）。
+    #[test]
+    fn test_i172_blank_operator_leaves_dirty_row_unread() {
+        let repo = MemoryRepository::new();
+        let iid = 917203;
+        seed(&repo, iid, "8601");
+        seed(&repo, iid, "");            // 历史脏行（写侧归一挡得住 ⇒ 只能直插种）
+        seed(&repo, iid, "  ");          // 未 trim 空白脏行
+        repo.update_cc_status(iid, "").unwrap();
+        repo.update_cc_status(iid, "   ").unwrap();
+        assert_eq!(state_of(&repo, iid, ""), Some(0), "空 operator 不得把 actor_id='' 脏行打成已读");
+        assert_eq!(state_of(&repo, iid, "  "), Some(0), "纯空白同档：一行都不动");
+        assert_eq!(state_of(&repo, iid, "8601"), Some(0), "空值档也不许顺手打别的人");
+    }
+
+    /// 哨兵：`"0"` 是正常 id，归一后仍是 `"0"`，照旧置读（判空不许用假值判据）。
+    #[test]
+    fn test_i172_sentinel_zero_is_a_person() {
+        let repo = MemoryRepository::new();
+        seed(&repo, 917204, "0");
+        repo.update_cc_status(917204, "0").unwrap();
+        assert_eq!(state_of(&repo, 917204, "0"), Some(1), "'0' 是正常 id，不得被当空值丢掉");
     }
 }
 
