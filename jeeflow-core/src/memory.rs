@@ -163,6 +163,28 @@ impl MemoryRepository {
     fn next_id(&self) -> i64 {
         self.id_counter.fetch_add(1, Ordering::SeqCst)
     }
+
+    /// 读侧参与者水合（issues/167）：`task_actors` map（内存仓的参与者表）是读侧事实源——
+    /// 有本任务条目 ⇒ 以条目为准（条目 = 建单参与者 ∪ 事后 `add_task_actor` 增量 − remove
+    /// 增量，与 sqlx 仓 `tasks_from_rows`/`find_task_by_id` 的「参与者表为准」同语义，
+    /// 对齐 Java `findTaskById` 的 setActorIds）；无条目 ⇒ 保留任务对象自带 `actor_ids`
+    /// （直存任务、零参与者建单两档原样）。
+    ///
+    /// 修前只有 `get_all_tasks` 一处弱水合（对象为空才补），`find_task_by_id` 等其余读路径
+    /// 全裸读对象副本 ⇒ 门面 startAndExecute 的自办腿先 `add_task_actor(操作人)` 再
+    /// execute，引擎 `is_allowed`（读 `find_task_by_id` 的对象副本）看不到增量 ⇒ 无 apply
+    /// 节点流程的首任务自办恒被拒（demo :8091 种子 I13 实测，七栈对照全放行）。
+    /// 调用方注意锁序：本函数只在已持有 `task_actors` 锁的前提下被调（先锁 tasks 再锁
+    /// task_actors，全仓同一顺序，无反向路径）。
+    fn hydrated_actor_ids(
+        actors_map: &HashMap<i64, Vec<String>>,
+        task: &ProcessTask,
+    ) -> Vec<String> {
+        match actors_map.get(&task.task_id) {
+            Some(actors) => actors.clone(),
+            None => task.actor_ids.clone(),
+        }
+    }
 }
 
 impl Default for MemoryRepository {
@@ -236,7 +258,14 @@ impl ProcessRepository for MemoryRepository {
 
     fn find_task_by_id(&self, task_id: i64) -> JeeflowResult<Option<ProcessTask>> {
         let tasks = self.tasks.lock().unwrap();
-        Ok(tasks.get(&task_id).cloned())
+        // issues/167：读侧参与者水合（见 hydrated_actor_ids）——修前裸读对象副本，
+        // 门面 startAndExecute 自办腿 add_task_actor(操作人) 后引擎 is_allowed 读不到。
+        let actors = self.task_actors.lock().unwrap();
+        Ok(tasks.get(&task_id).map(|t| {
+            let mut t = t.clone();
+            t.actor_ids = Self::hydrated_actor_ids(&actors, &t);
+            t
+        }))
     }
 
     fn save_task(&self, task: &mut ProcessTask) -> JeeflowResult<()> {
@@ -254,35 +283,50 @@ impl ProcessRepository for MemoryRepository {
 
     fn find_doing_tasks(&self, instance_id: i64, task_names: &[String]) -> JeeflowResult<Vec<ProcessTask>> {
         let tasks = self.tasks.lock().unwrap();
+        let actors = self.task_actors.lock().unwrap();
         let result: Vec<ProcessTask> = tasks.values()
             .filter(|t| {
                 t.process_instance_id == instance_id
                     && t.task_state == TaskState::Doing.code()
                     && (task_names.is_empty() || task_names.contains(&t.task_name))
             })
-            .cloned()
+            .map(|t| {
+                let mut t = t.clone();
+                t.actor_ids = Self::hydrated_actor_ids(&actors, &t);
+                t
+            })
             .collect();
         Ok(result)
     }
 
     fn find_done_tasks(&self, instance_id: i64, task_names: &[String]) -> JeeflowResult<Vec<ProcessTask>> {
         let tasks = self.tasks.lock().unwrap();
+        let actors = self.task_actors.lock().unwrap();
         let result: Vec<ProcessTask> = tasks.values()
             .filter(|t| {
                 t.process_instance_id == instance_id
                     && t.task_state == TaskState::Finished.code()
                     && (task_names.is_empty() || task_names.contains(&t.task_name))
             })
-            .cloned()
+            .map(|t| {
+                let mut t = t.clone();
+                t.actor_ids = Self::hydrated_actor_ids(&actors, &t);
+                t
+            })
             .collect();
         Ok(result)
     }
 
     fn find_history_tasks(&self, instance_id: i64) -> JeeflowResult<Vec<ProcessTask>> {
         let tasks = self.tasks.lock().unwrap();
+        let actors = self.task_actors.lock().unwrap();
         let result: Vec<ProcessTask> = tasks.values()
             .filter(|t| t.process_instance_id == instance_id)
-            .cloned()
+            .map(|t| {
+                let mut t = t.clone();
+                t.actor_ids = Self::hydrated_actor_ids(&actors, &t);
+                t
+            })
             .collect();
         Ok(result)
     }
@@ -392,13 +436,18 @@ impl ProcessRepository for MemoryRepository {
         // issues/129：`is_none()` 短路＝放行全库待办（旁路型缺口，比缺过滤器更隐蔽）。
         // 与 page_done_tasks 的 117 姿势同形：operator 为空（None 或全空白）→ 空页。
         let op_s = query.operator.as_deref().map(str::trim).unwrap_or("");
+        // issues/167：过滤集合同样吃读侧水合——门面加签/自办腿写进参与者 map 的增量
+        // 必须能命中待办（sqlx 仓本条是 INNER JOIN wf_process_task_actor，同语义）。
+        let actors = self.task_actors.lock().unwrap();
         let mut rows: Vec<TaskRow> = tasks.values()
             .filter(|t| {
                 t.task_state == TaskState::Doing.code()
                     && !op_s.is_empty()
-                    && t.actor_ids.iter().any(|a| a.as_str() == op_s)
+                    && Self::hydrated_actor_ids(&actors, t).iter().any(|a| a.as_str() == op_s)
             })
             .map(|t| {
+                let mut t = t.clone();
+                t.actor_ids = Self::hydrated_actor_ids(&actors, &t);
                 let inst = instances.get(&t.process_instance_id);
                 let define = inst.and_then(|i| defines.get(&i.define_id));
                 TaskRow {
@@ -647,8 +696,13 @@ impl ProcessRepository for MemoryRepository {
 
     fn count_todo_tasks(&self, user_id: &str) -> JeeflowResult<i64> {
         let tasks = self.tasks.lock().unwrap();
+        // issues/167：与 page_todo_tasks 同一口径——过滤集合吃读侧水合。
+        let actors = self.task_actors.lock().unwrap();
         let count = tasks.values()
-            .filter(|t| t.task_state == TaskState::Doing.code() && t.actor_ids.contains(&user_id.to_string()))
+            .filter(|t| {
+                t.task_state == TaskState::Doing.code()
+                    && Self::hydrated_actor_ids(&actors, t).contains(&user_id.to_string())
+            })
             .count() as i64;
         Ok(count)
     }
@@ -663,11 +717,10 @@ impl ProcessRepository for MemoryRepository {
         let task_actors = self.task_actors.lock().unwrap();
         Ok(tasks.values().map(|t| {
             let mut task = t.clone();
-            if task.actor_ids.is_empty() {
-                if let Some(actors) = task_actors.get(&t.task_id) {
-                    task.actor_ids = actors.clone();
-                }
-            }
+            // issues/167：升级为与其它读路径同一档水合（map 条目为准）——原"对象为空才补"
+            // 的弱水合会漏掉非空任务的事后加签增量（sqlx 仓 get_all_tasks 走
+            // tasks_from_rows，参与者表为准，拿得到增量）。
+            task.actor_ids = Self::hydrated_actor_ids(&task_actors, &task);
             task
         }).collect())
     }
@@ -872,14 +925,19 @@ mod tests {
         let doing = repo.find_doing_tasks(inst.instance_id, &[]).unwrap();
         assert_eq!(doing.len(), 1);
 
-        // Add actor
+        // Add actor（issues/167 起读侧以参与者 map 为事实源，与 sqlx 仓同答案——
+        // sqlx save_task 只写任务行不写参与者行，直存对象上的 actor_ids 本就不进参与者表；
+        // 参与者读写一律走 add/find_task_actors 通道）
         repo.add_task_actor(task.task_id, &["user2".into()]).unwrap();
         let actors = repo.find_task_actors(task.task_id).unwrap();
         assert!(actors.contains(&"user2".into()));
 
         // Count todo
-        let count = repo.count_todo_tasks("user1").unwrap();
+        let count = repo.count_todo_tasks("user2").unwrap();
         assert_eq!(count, 1);
+        // 直存对象上的 user1 不在 map 条目里 ⇒ 水合后不可见（与 sqlx 同答案）
+        let count = repo.count_todo_tasks("user1").unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

@@ -250,13 +250,19 @@ impl AppState {
     fn new() -> Self {
         let repo = Arc::new(MemoryRepository::new());
         load_seed(&repo);
-        let ctx = ServiceContext::new()
+        let mut ctx = ServiceContext::new()
             .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
             .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
             .with_user_provider(Arc::new(DemoUserProvider))
             .with_org_user_provider(Arc::new(DemoOrgUserProvider))
             .with_user_search_provider(Arc::new(DemoUserSearchProvider))
             .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        // issues/167：注册 7 个内置 assignment handler（对齐 go demo `RegisterBuiltinAssignments`
+        // / node demo `registerBuiltinAssignments`，rust demo 此前是八家唯一漏注册的）——
+        // 共享 flows 里 11-assignment-handler.json（define=14，种子 I13）四个任务节点全靠
+        // handler 解析参与者，漏注册 ⇒ task1 零参与者、自办腿之后的 task2（发起人审批）也
+        // 零参与者，与七栈 demo 形状分叉。provider 必须先于本调用注册（见注册函数注释）。
+        jeeflow_core::interceptor::register_builtin_assignment_handlers(&mut ctx);
 
         let facade = Arc::new(JeeflowFacade::new(ctx));
         AppState { facade, repo }

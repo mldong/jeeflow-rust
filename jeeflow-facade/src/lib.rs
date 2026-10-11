@@ -6665,6 +6665,85 @@ mod tests {
         assert_eq!(wd134_task_rows(&facade, iid), rows_before, "两条负向都不该改写任务行");
     }
 
+    // ─── issues/167：无 apply 节点流程的首任务自办（startAndExecute）───
+
+    /// issues/167：无 apply 节点流程 + 首任务参与者由 assignmentHandler 解析（空表单 ⇒
+    /// 零参与者 DOING 行）时，startAndExecute 的自办腿必须放行。
+    ///
+    /// 基准对照（2026-10-11 现读）：java 门面 startAndExecute 先 `addTaskActor(操作人)`
+    /// 再 execute，且 java `findTaskById` 从参与者表水合 actorIds ⇒ 自办必过 isAllowed；
+    /// go 引擎 isAllowed 在对象副本之外还有 `repo.FindTaskActors` 仓储兜底 ⇒ 同过。
+    /// rust 引擎只读 `task.is_allowed`（对象副本），内存仓 find_task_by_id 等读路径又不
+    /// 水合 task_actors map（sqlx 仓水合，注释原话「对齐 Java findTaskById 的
+    /// setActorIds」）⇒ 门面加进参与者表的 leader 引擎看不见，自办腿恒被拒
+    /// （demo :8091 种子 I13 实测 `PermissionDenied: Operator leader not allowed on task N`）。
+    /// 修法＝内存仓读路径对齐 sqlx 仓：task_actors map 是读侧参与者事实源。
+    /// 变异对照：修前本测试红（同上 PermissionDenied）。
+    #[tokio::test]
+    async fn test_start_and_execute_no_apply_handler_first_task_self_handle() {
+        let repo = Arc::new(MemoryRepository::new());
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        // demo :8091 的 I13 形状：11-assignment-handler.json 首任务 = FormFieldAssigneeHandler
+        jeeflow_core::interceptor::register_builtin_assignment_handlers(&mut ctx);
+        let facade = JeeflowFacade::new(ctx);
+
+        // 部署无 apply 节点流程：start → task1(表单字段解析) → task2(发起人审批) → end
+        let mut a1 = HashMap::new();
+        a1.insert("name".to_string(), json!("no-apply-handler-flow"));
+        a1.insert("displayName".to_string(), json!("no-apply-handler-flow"));
+        let r1 = facade.flow("processDesign/save", &a1).await;
+        assert_eq!(r1["code"], 0, "save failed: {:?}", r1);
+        let design_id = r1["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(design_id));
+        a2.insert(
+            "content".to_string(),
+            json!(r#"{
+                "name":"no-apply-handler-flow","displayName":"no-apply-handler-flow","type":"approval",
+                "nodes":[
+                    {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                    {"id":"task1","type":"snaker:task","text":{"value":"按表单字段"},
+                     "properties":{"assignmentHandler":"com.mldong.jeeflow.interceptor.impl.FormFieldAssigneeHandler"}},
+                    {"id":"task2","type":"snaker:task","text":{"value":"发起人审批"},
+                     "properties":{"assignmentHandler":"com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler"}},
+                    {"id":"end","type":"snaker:end","text":{"value":"End"}}
+                ],
+                "edges":[
+                    {"id":"e1","sourceNodeId":"start","targetNodeId":"task1"},
+                    {"id":"e2","sourceNodeId":"task1","targetNodeId":"task2"},
+                    {"id":"e3","sourceNodeId":"task2","targetNodeId":"end"}
+                ]
+            }"#),
+        );
+        assert_eq!(facade.flow("processDesign/updateDefine", &a2).await["code"], 0);
+        let mut a3 = HashMap::new();
+        a3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &a3).await["code"], 0);
+
+        // startAndExecute op=leader，不带 f_task1 ⇒ task1 零参与者（与 demo I13 同形）
+        let mut a4 = HashMap::new();
+        a4.insert("name".to_string(), json!("no-apply-handler-flow"));
+        a4.insert("operator".to_string(), json!("leader"));
+        let r4 = facade.flow("processDefine/startAndExecute", &a4).await;
+        assert_eq!(r4["code"], 0, "无 apply 流程首任务自办被权限拒: {:?}", r4);
+        let inst_id: i64 = r4["data"]["processInstanceId"].as_str().unwrap().parse().unwrap();
+
+        // 自办腿生效：task1 已办结，流程推进到 task2（发起人审批 ⇒ 参与者=leader）
+        let doing = facade.repo().find_doing_tasks(inst_id, &[]).unwrap();
+        assert_eq!(doing.len(), 1, "task1 自办后应只剩 task2 进行中");
+        assert_eq!(doing[0].task_name, "task2");
+        assert!(doing[0].actor_ids.contains(&"leader".to_string()),
+            "task2（发起人审批）参与者应含 leader: {:?}", doing[0].actor_ids);
+        // 已办列表：task1 operator=leader（自办留痕）
+        let done = facade.repo().find_done_tasks(inst_id, &[]).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].task_name, "task1");
+        assert_eq!(done[0].actor_id.as_deref(), Some("leader"));
+    }
+
     // ─── transfer：正向留痕 + 挪待办 ───
 
     #[tokio::test]
