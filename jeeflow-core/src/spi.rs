@@ -252,7 +252,14 @@ pub trait ExpressionEvaluator: Send + Sync {
 pub trait TransactionTemplate: Send + Sync {
     /// Execute an action within a transaction.
     /// Uses a boxed closure for dyn compatibility.
-    fn execute_in_tx(&self, action: Box<dyn FnOnce() -> JeeflowResult<Box<dyn std::any::Any + Send>> + Send>) -> JeeflowResult<Box<dyn std::any::Any + Send>>;
+    ///
+    /// `'a`（R9/145-5）：闭包允许借用调用方栈上的参数——引擎入口的 operator/args 都是借用，
+    /// 动作同步执行完即返回，闭包不逃逸本调用。**join 语义由实现方负责**：调用线程上已有
+    /// 事务时并入外层（不重开 BEGIN、不提交）；空转/原子/归属三档判据见 spec/12 §12.4。
+    fn execute_in_tx<'a>(
+        &self,
+        action: Box<dyn FnOnce() -> JeeflowResult<Box<dyn std::any::Any + Send>> + Send + 'a>,
+    ) -> JeeflowResult<Box<dyn std::any::Any + Send>>;
 }
 
 // ═══════════════════════════════════════════════════════

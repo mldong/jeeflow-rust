@@ -6,8 +6,216 @@ use jeeflow_core::error::{JeeflowError, JeeflowResult};
 use jeeflow_core::model::*;
 use jeeflow_core::spi::*;
 use sqlx::mysql::MySqlPool;
-use sqlx::Row;
+use sqlx::{Executor, MySqlConnection, Row};
+use std::any::Any;
+use std::cell::RefCell;
 use std::sync::Arc;
+
+// ═══════════════════════════════════════════════════════
+// 事务槽＋语句执行目标路由（audit8 R9 / 145-5；spec/12 §12.4 三档）
+// ═══════════════════════════════════════════════════════
+
+thread_local! {
+    /// 线程事务槽：`SqlxTransactionTemplate::execute_in_tx` 期间持有本线程的事务。
+    ///
+    /// **thread-local，不是进程级槽**：spec/12 §12.1 line 15 明确禁止进程级可变句柄槽——
+    /// 归属档判据要求 A 线程未提交的事务不得把 B 线程的写并进去（B 独立发起/提交）。
+    /// 槽的借用不跨线程：语句执行 = `block_in_place` + 同线程嵌套 `block_on`，
+    /// 事务跨度全同步（引擎内核同步、`execute_in_tx` 闭包同步）。
+    static TX_SLOT: RefCell<Option<sqlx::Transaction<'static, sqlx::MySql>>> =
+        const { RefCell::new(None) };
+}
+
+/// 语句执行目标（R9/145-5）：事务内 → 事务连接（同源）；事务外 → 池（逐句取连接，修前行为逐字不变）。
+pub enum SqlxExec<'a> {
+    Pool(&'a MySqlPool),
+    Tx(&'a mut MySqlConnection),
+}
+
+impl<'a> SqlxExec<'a> {
+    /// 重借用（同一目标、缩短借用）：一个块内多条语句共用同一执行目标时逐句重借
+    /// （`Executor` 的语句方法按值消费目标）。
+    pub fn reborrow(&mut self) -> SqlxExec<'_> {
+        match self {
+            SqlxExec::Pool(p) => SqlxExec::Pool(*p),
+            SqlxExec::Tx(c) => SqlxExec::Tx(&mut **c),
+        }
+    }
+}
+
+impl std::fmt::Debug for SqlxExec<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SqlxExec::Pool(_) => write!(f, "SqlxExec::Pool"),
+            SqlxExec::Tx(_) => write!(f, "SqlxExec::Tx"),
+        }
+    }
+}
+
+/// `Executor` 实现（仅必须方法 `fetch_many`；`&Pool` 侧 executor 生命周期自由、
+/// `&mut MySqlConnection` 侧按借用收窄——两分支在 `'c = 'a` 处合流）。
+impl<'c, 'a: 'c> Executor<'c> for SqlxExec<'a> {
+    type Database = sqlx::MySql;
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> futures_core::stream::BoxStream<
+        'e,
+        Result<
+            sqlx::Either<sqlx::mysql::MySqlQueryResult, sqlx::mysql::MySqlRow>,
+            sqlx::Error,
+        >,
+    >
+    where
+        'c: 'e,
+        E: 'q + sqlx::Execute<'q, sqlx::MySql>,
+    {
+        match self {
+            SqlxExec::Pool(p) => <&MySqlPool as sqlx::Executor<'c>>::fetch_many(p, query),
+            SqlxExec::Tx(c) => {
+                let conn: &'e mut MySqlConnection = c;
+                <&mut MySqlConnection as sqlx::Executor<'e>>::fetch_many(conn, query)
+            }
+        }
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> futures_core::future::BoxFuture<'e, Result<Option<sqlx::mysql::MySqlRow>, sqlx::Error>>
+    where
+        'c: 'e,
+        E: 'q + sqlx::Execute<'q, sqlx::MySql>,
+    {
+        match self {
+            SqlxExec::Pool(p) => <&MySqlPool as sqlx::Executor<'c>>::fetch_optional(p, query),
+            SqlxExec::Tx(c) => {
+                let conn: &'e mut MySqlConnection = c;
+                <&mut MySqlConnection as sqlx::Executor<'e>>::fetch_optional(conn, query)
+            }
+        }
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [<sqlx::MySql as sqlx::Database>::TypeInfo],
+    ) -> futures_core::future::BoxFuture<
+        'e,
+        Result<<sqlx::MySql as sqlx::Database>::Statement<'q>, sqlx::Error>,
+    >
+    where
+        'c: 'e,
+    {
+        match self {
+            SqlxExec::Pool(p) => {
+                <&MySqlPool as sqlx::Executor<'c>>::prepare_with(p, sql, parameters)
+            }
+            SqlxExec::Tx(c) => {
+                let conn: &'e mut MySqlConnection = c;
+                <&mut MySqlConnection as sqlx::Executor<'e>>::prepare_with(conn, sql, parameters)
+            }
+        }
+    }
+
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> futures_core::future::BoxFuture<'e, Result<sqlx::Describe<sqlx::MySql>, sqlx::Error>>
+    where
+        'c: 'e,
+    {
+        match self {
+            SqlxExec::Pool(p) => <&MySqlPool as sqlx::Executor<'c>>::describe(p, sql),
+            SqlxExec::Tx(c) => {
+                let conn: &'e mut MySqlConnection = c;
+                <&mut MySqlConnection as sqlx::Executor<'e>>::describe(conn, sql)
+            }
+        }
+    }
+}
+
+/// 线程上是否已有活动事务（join 判据；集成方写腿同源接线也读它）。
+pub fn in_thread_tx() -> bool {
+    TX_SLOT.with(|s| s.borrow().is_some())
+}
+
+/// 语句执行目标解析（**集成方写腿共用出口**，C99 ⑥ rust 腿）：
+/// 同线程有事务 → 走事务连接；否则 → 调用方自己的池。
+/// `f` 在槽借用期间**同步**执行（内部 `block_on` 同线程驱动；不得重入）。
+pub fn with_thread_tx_exec<R>(pool: &MySqlPool, f: impl FnOnce(SqlxExec<'_>) -> R) -> R {
+    TX_SLOT.with(|slot| {
+        let mut b = slot.borrow_mut();
+        match b.as_mut() {
+            Some(tx) => f(SqlxExec::Tx(&mut **tx)),
+            None => f(SqlxExec::Pool(pool)),
+        }
+    })
+}
+
+/// 槽清理守卫：任何离场路径（含 panic 展开）清空槽；panic 路径上未提交的事务
+/// 由 sqlx `Transaction::drop` 排队回滚，连接随 `PoolConnection` 归还池。
+struct TxSlotGuard;
+impl Drop for TxSlotGuard {
+    fn drop(&mut self) {
+        let _ = TX_SLOT.with(|s| s.borrow_mut().take());
+    }
+}
+
+fn block_on_any<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+/// SQLx 事务模板（`ITransactionTemplate` 的 rust 实现；spec/05 §234「事务包装由仓储提供」）。
+///
+/// 语义（spec/12 §12.4 三档判据的真库测试见 `tx-tier-145` 测试件）：
+/// - 原子档：`action` 返回 `Err`（或闭包内 `?` 传播）⇒ 整笔 ROLLBACK；
+/// - 归属档：A 线程事务未提交/回滚期间，B 线程经本模板的写走 **B 自己的事务连接**（thread-local），
+///   互不并入；同线程嵌套调用 **join** 外层（不重开 BEGIN、不提交、随外层回滚连坐）；
+/// - 空转档：`action` 内经仓储/集成写腿完成的写与后续读走**同一枚事务连接**（提交前独立连接读不到）。
+pub struct SqlxTransactionTemplate {
+    pool: MySqlPool,
+}
+
+impl SqlxTransactionTemplate {
+    pub fn new(pool: MySqlPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl TransactionTemplate for SqlxTransactionTemplate {
+    fn execute_in_tx<'a>(
+        &self,
+        action: Box<dyn FnOnce() -> JeeflowResult<Box<dyn Any + Send>> + Send + 'a>,
+    ) -> JeeflowResult<Box<dyn Any + Send>> {
+        // join：本线程已有活动事务 ⇒ 并入外层（嵌套档：不重复 BEGIN、失败由外层回滚连坐）
+        if in_thread_tx() {
+            return action();
+        }
+        let tx = block_on_any(self.pool.begin())
+            .map_err(|e| JeeflowError::Internal(format!("tx begin: {e}")))?;
+        TX_SLOT.with(|s| *s.borrow_mut() = Some(tx));
+        let _guard = TxSlotGuard;
+        let result = action();
+        let tx = TX_SLOT.with(|s| s.borrow_mut().take());
+        match result {
+            Ok(v) => {
+                if let Some(tx) = tx {
+                    block_on_any(tx.commit())
+                        .map_err(|e| JeeflowError::Internal(format!("tx commit: {e}")))?;
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                if let Some(tx) = tx {
+                    let _ = block_on_any(tx.rollback());
+                }
+                Err(e)
+            }
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════
 // MySQL DDL — 8 tables (spec/08)
@@ -87,7 +295,7 @@ impl SqlxRepository {
     /// - `process_name` 非空 → 精确腿 `process_name = ?`；
     /// - `process_name` 为空 → 全流程兜底腿 `process_name IS NULL OR = ''`。
     async fn query_newest_surrogate(
-        &self,
+        exec: SqlxExec<'_>,
         operator: &str,
         process_name: &str,
     ) -> JeeflowResult<Option<ProcessSurrogate>> {
@@ -110,7 +318,7 @@ impl SqlxRepository {
             q = q.bind(process_name);
         }
         let row = q
-            .fetch_optional(&self.pool)
+            .fetch_optional(exec)
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
         Ok(row.map(|r| map_surrogate(&r)))
@@ -128,6 +336,12 @@ impl SqlxRepository {
     /// 且与集成层 `wf_db::block_on` 口径一致。
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+    }
+
+    /// 语句执行目标路由（R9/145-5，spec/12 §12.4）：事务内 → 本线程事务连接（同源）；
+    /// 否则 → 池（逐句取连接，修前行为逐字不变）。仓储全部语句点经它取目标。
+    pub fn with_exec<R>(&self, f: impl FnOnce(SqlxExec<'_>) -> R) -> R {
+        with_thread_tx_exec(&self.pool, f)
     }
 
     /// Initialize the schema by executing the DDL.
@@ -252,7 +466,7 @@ fn get_opt_i32(r: &sqlx::mysql::MySqlRow, col: &str) -> Option<i32> {
 /// 参与者按 task_id 批量水合——权限判定 is_allowed 依赖 actor_ids，漏查会把真实处理人
 /// 全部判为"无权限"。sqlx MySQL 驱动不支持 IN(?) 直接绑 Vec：手动展开占位符逐个 bind。
 async fn tasks_from_rows(
-    pool: &MySqlPool,
+    exec: SqlxExec<'_>,
     rows: Vec<sqlx::mysql::MySqlRow>,
 ) -> JeeflowResult<Vec<ProcessTask>> {
     let task_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
@@ -269,7 +483,7 @@ async fn tasks_from_rows(
             q = q.bind(*id);
         }
         let actor_rows = q
-            .fetch_all(pool)
+            .fetch_all(exec)
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
         for a in actor_rows {
@@ -415,10 +629,10 @@ fn map_surrogate(r: &sqlx::mysql::MySqlRow) -> ProcessSurrogate {
 
 /// issues/141 G2 写侧判重的读侧 SQL（`create_cc_instance` 与 `find_cc_actor_ids` 共用一支，
 /// 判据只有一份）。逐行返回、不加 DISTINCT。
-async fn select_cc_actor_ids(pool: &MySqlPool, instance_id: i64) -> JeeflowResult<Vec<String>> {
+async fn select_cc_actor_ids(exec: SqlxExec<'_>, instance_id: i64) -> JeeflowResult<Vec<String>> {
     let rows = sqlx::query("SELECT actor_id FROM wf_process_cc_instance WHERE process_instance_id = ?")
         .bind(instance_id)
-        .fetch_all(pool)
+        .fetch_all(exec)
         .await
         .map_err(|e| JeeflowError::Internal(e.to_string()))?;
     Ok(rows.iter().map(|r| r.get::<String, _>("actor_id")).collect())
@@ -429,10 +643,10 @@ async fn select_cc_actor_ids(pool: &MySqlPool, instance_id: i64) -> JeeflowResul
 /// 不另抄第二份 SELECT——判重与读回必须看到同一批行。逐行返回，**不加 DISTINCT**
 /// （与 [`select_cc_actor_ids`] 同口径：判重只看"这个人在这个任务上有没有行"，
 /// 存量脏行原样留着，issues/141 G2 owner 拍板）。
-async fn select_task_actor_ids(pool: &MySqlPool, task_id: i64) -> JeeflowResult<Vec<String>> {
+async fn select_task_actor_ids(exec: SqlxExec<'_>, task_id: i64) -> JeeflowResult<Vec<String>> {
     let rows = sqlx::query("SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ?")
         .bind(task_id)
-        .fetch_all(pool)
+        .fetch_all(exec)
         .await
         .map_err(|e| JeeflowError::Internal(e.to_string()))?;
     Ok(rows.iter().map(|r| r.get::<String, _>("actor_id")).collect())
@@ -440,12 +654,12 @@ async fn select_task_actor_ids(pool: &MySqlPool, task_id: i64) -> JeeflowResult<
 
 impl ProcessRepository for SqlxRepository {
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let row = sqlx::query(
                 "SELECT id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user FROM wf_process_define WHERE id = ?"
             )
             .bind(define_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
@@ -462,11 +676,11 @@ impl ProcessRepository for SqlxRepository {
                 update_time: get_opt_datetime(&r, "update_time"),
                 update_user: r.get("update_user"),
             }))
-        })
+        }))
     }
 
     fn save_define(&self, define: &mut ProcessDefine) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let content_str = String::from_utf8_lossy(&define.content).to_string();
             // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if define.id == 0 {
@@ -489,15 +703,15 @@ impl ProcessRepository for SqlxRepository {
             .bind(define.version)
             .bind(&define.create_time)
             .bind(&define.create_user)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn update_define(&self, define: &ProcessDefine) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             sqlx::query(
                 "UPDATE wf_process_define SET display_name=?, type=?, state=?, content=?, version=?, update_user=? WHERE id=?"
             )
@@ -508,43 +722,43 @@ impl ProcessRepository for SqlxRepository {
             .bind(define.version)
             .bind(&define.update_user)
             .bind(define.id)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn update_define_state(&self, define_id: i64, state: i32) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             sqlx::query("UPDATE wf_process_define SET state=? WHERE id=?")
                 .bind(state)
                 .bind(define_id)
-                .execute(&self.pool)
+                .execute(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn remove_define(&self, define_id: i64) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             sqlx::query("DELETE FROM wf_process_define WHERE id=?")
                 .bind(define_id)
-                .execute(&self.pool)
+                .execute(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn find_instance_by_id(&self, instance_id: i64) -> JeeflowResult<Option<ProcessInstance>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let row = sqlx::query(
                 "SELECT id, parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_time, create_user, update_time, update_user FROM wf_process_instance WHERE id = ?"
             )
             .bind(instance_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
@@ -559,10 +773,10 @@ impl ProcessRepository for SqlxRepository {
                 "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ?"
             )
             .bind(instance_id_v)
-            .fetch_all(&self.pool)
+            .fetch_all(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
-            let tasks = tasks_from_rows(&self.pool, task_rows).await?;
+            let tasks = tasks_from_rows(exec.reborrow(), task_rows).await?;
 
             Ok(Some(ProcessInstance {
                 instance_id: r.get("id"),
@@ -581,11 +795,11 @@ impl ProcessRepository for SqlxRepository {
                 update_user: r.get("update_user"),
                 define: None,
             }))
-        })
+        }))
     }
 
     fn save_instance(&self, instance: &mut ProcessInstance) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let var_json = flow_data_to_json(&instance.variables);
             // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if instance.instance_id == 0 {
@@ -608,15 +822,15 @@ impl ProcessRepository for SqlxRepository {
             .bind(&var_json)
             .bind(&instance.create_time)
             .bind(&instance.create_user)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn update_instance(&self, instance: &ProcessInstance) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let var_json = flow_data_to_json(&instance.variables);
             // issues/125：update_time 由引擎时钟出口供给并绑参，SQL 文本里不留 NOW()——
             // MySQL 的 NOW() 取 @@session.time_zone 的墙钟，而 create_time 是引擎钟写的裸墙钟，
@@ -631,20 +845,20 @@ impl ProcessRepository for SqlxRepository {
                 .bind(&instance.update_user)
                 .bind(&now)
                 .bind(instance.instance_id)
-                .execute(&self.pool)
+                .execute(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn find_task_by_id(&self, task_id: i64) -> JeeflowResult<Option<ProcessTask>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let row = sqlx::query(
                 "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE id = ?"
             )
             .bind(task_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
@@ -653,7 +867,7 @@ impl ProcessRepository for SqlxRepository {
             // 权限判定 is_allowed 依赖 actor_ids，漏查会把真实处理人全部判为"无权限"。
             let actor_rows = sqlx::query("SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ?")
                 .bind(task_id)
-                .fetch_all(&self.pool)
+                .fetch_all(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let actor_ids: Vec<String> = actor_rows
@@ -681,11 +895,11 @@ impl ProcessRepository for SqlxRepository {
                 update_time: get_opt_datetime(&r, "update_time"),
                 update_user: r.get("update_user"),
             }))
-        })
+        }))
     }
 
     fn save_task(&self, task: &mut ProcessTask) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let var_json = flow_data_to_json(&task.variables);
             // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if task.task_id == 0 {
@@ -721,15 +935,15 @@ impl ProcessRepository for SqlxRepository {
             .bind(&var_json)
             .bind(&task.create_time)
             .bind(&task.create_user)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn update_task(&self, task: &ProcessTask) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let var_json = flow_data_to_json(&task.variables);
             // issues/125：同 update_instance——update_time 走引擎时钟出口绑参，SQL 里不留 NOW()。
             // 只取一次，本条语句的 finish_time（来自聚合根，也是引擎钟产的）与它同一基准。
@@ -743,45 +957,45 @@ impl ProcessRepository for SqlxRepository {
                 .bind(&task.update_user)
                 .bind(&now)
                 .bind(task.task_id)
-                .execute(&self.pool)
+                .execute(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn find_doing_tasks(&self, instance_id: i64, task_names: &[String]) -> JeeflowResult<Vec<ProcessTask>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let rows = sqlx::query(
                 "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ? AND task_state = 10"
             )
             .bind(instance_id)
-            .fetch_all(&self.pool)
+            .fetch_all(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
-            let tasks = tasks_from_rows(&self.pool, rows).await?;
+            let tasks = tasks_from_rows(exec.reborrow(), rows).await?;
             Ok(if task_names.is_empty() { tasks } else { tasks.into_iter().filter(|t| task_names.contains(&t.task_name)).collect() })
-        })
+        }))
     }
 
     fn find_done_tasks(&self, instance_id: i64, task_names: &[String]) -> JeeflowResult<Vec<ProcessTask>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let rows = sqlx::query(
                 "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ? AND task_state = 20"
             )
             .bind(instance_id)
-            .fetch_all(&self.pool)
+            .fetch_all(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
-            let tasks = tasks_from_rows(&self.pool, rows).await?;
+            let tasks = tasks_from_rows(exec.reborrow(), rows).await?;
             Ok(if task_names.is_empty() { tasks } else { tasks.into_iter().filter(|t| task_names.contains(&t.task_name)).collect() })
-        })
+        }))
     }
 
     fn find_history_tasks(&self, instance_id: i64) -> JeeflowResult<Vec<ProcessTask>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let rows = sqlx::query(
                 // issues/154①（spec/06 §4.6 approvalRecord 口径①）：**必须** `ORDER BY id ASC`——
                 // 雪花 id 单调，同秒并发插入时它比 `create_time`/`update_time` 确定；此前整条没有
@@ -790,21 +1004,21 @@ impl ProcessRepository for SqlxRepository {
                 "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, task_parent_id, variable, create_time, create_user, update_time, update_user FROM wf_process_task WHERE process_instance_id = ? ORDER BY id ASC"
             )
             .bind(instance_id)
-            .fetch_all(&self.pool)
+            .fetch_all(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             // 对齐 Java findInstanceById→findTasksByInstanceId→mapTasks（setActorIds + 解析 variable）
-            tasks_from_rows(&self.pool, rows).await
-        })
+            tasks_from_rows(exec.reborrow(), rows).await
+        }))
     }
 
     fn find_task_actors(&self, task_id: i64) -> JeeflowResult<Vec<String>> {
-        self.block_on(async { select_task_actor_ids(&self.pool, task_id).await })
+        self.with_exec(|mut exec| self.block_on(async { select_task_actor_ids(exec.reborrow(), task_id).await }))
     }
 
     fn add_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             // issues/142 B 批 · spec 06-facade.md §2.11 的**写侧兜底层**，与内存仓
             // `MemoryRepository::add_task_actor` 同一条判据（判据本体＝
             // `jeeflow_core::model::normalize_actors`，与抄送侧 §2.10 同一枚单点）：
@@ -816,7 +1030,7 @@ impl ProcessRepository for SqlxRepository {
             let normalized = jeeflow_core::model::normalize_actors(actors);
             // 判重的读侧放在写侧这一层（与 create_cc_instance 同姿势）：先取快照再插，
             // 已有同一人的行 ⇒ 幂等空操作；同一次调用内重复也给同一个人也只落一行。
-            let mut existing = select_task_actor_ids(&self.pool, task_id).await?;
+            let mut existing = select_task_actor_ids(exec.reborrow(), task_id).await?;
             for actor in &normalized {
                 if existing.iter().any(|a| a == actor) {
                     continue;
@@ -830,12 +1044,12 @@ impl ProcessRepository for SqlxRepository {
                     .bind(task_id)
                     .bind(actor)
                     .bind(&current_time_str())
-                    .execute(&self.pool)
+                    .execute(exec.reborrow())
                     .await
                     .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             }
             Ok(())
-        })
+        }))
     }
 
     fn remove_task_actor(&self, task_id: i64, actors: &[String]) -> JeeflowResult<()> {
@@ -851,21 +1065,21 @@ impl ProcessRepository for SqlxRepository {
         // 展开在 `block_on` 之前完成（同步 SPI，不引入持锁跨 await），库内逐元素绑定删除。
         let forms = jeeflow_core::model::actor_delete_forms(actors);
         if forms.is_empty() { return Ok(()); }
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             for actor in &forms {
                 sqlx::query("DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id = ?")
                     .bind(task_id)
                     .bind(actor)
-                    .execute(&self.pool)
+                    .execute(exec.reborrow())
                     .await
                     .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             }
             Ok(())
-        })
+        }))
     }
 
     fn create_cc_instance(&self, instance_id: i64, creator: &str, actor_ids: &[String]) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             // issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与内存仓 `create_cc_instance`
             // 同一条判据：同一 `(实例, 被抄送人)` 已有 cc 行 ⇒ 直接跳过——①不新增行、
             // ②不重置未读（state 保持原值）、③不更新原行时间（连 UPDATE 都不发，
@@ -876,7 +1090,7 @@ impl ProcessRepository for SqlxRepository {
             // 也才与下面的判重咬合）。绕过引擎漏斗与门面直连仓储的调用方同样建不出 actor_id='' 的行
             // （那正是 issues/129 那族"空 operator 读全库"的病根）。
             let actors = jeeflow_core::model::normalize_cc_actors(actor_ids);
-            let mut existing: Vec<String> = select_cc_actor_ids(&self.pool, instance_id).await?;
+            let mut existing: Vec<String> = select_cc_actor_ids(exec.reborrow(), instance_id).await?;
             for actor in &actors {
                 if existing.iter().any(|a| a == actor) {
                     continue;
@@ -891,18 +1105,18 @@ impl ProcessRepository for SqlxRepository {
                     .bind(actor)
                     .bind(&current_time_str())
                     .bind(creator)
-                    .execute(&self.pool)
+                    .execute(exec.reborrow())
                     .await
                     .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             }
             Ok(())
-        })
+        }))
     }
 
     /// issues/141 G2 写侧判重的读侧（覆写 trait default）：逐行返回，**不加 DISTINCT**
     /// ——判重只看"这个人在这条实例上有没有行"，存量重复行原样留着。
     fn find_cc_actor_ids(&self, instance_id: i64) -> JeeflowResult<Vec<String>> {
-        self.block_on(async { select_cc_actor_ids(&self.pool, instance_id).await })
+        self.with_exec(|mut exec| self.block_on(async { select_cc_actor_ids(exec.reborrow(), instance_id).await }))
     }
 
     fn update_cc_status(&self, instance_id: i64, actor_id: &str) -> JeeflowResult<()> {
@@ -916,20 +1130,20 @@ impl ProcessRepository for SqlxRepository {
             Some(a) => a,
             None => return Ok(()),
         };
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             sqlx::query("UPDATE wf_process_cc_instance SET state=1 WHERE process_instance_id=? AND actor_id=?")
                 .bind(instance_id)
                 .bind(&actor)
-                .execute(&self.pool)
+                .execute(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
 
     fn page_todo_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             // issues/129：空 operator → 空页，且不再下推 `(? IS NULL OR …)` 旁路。
             // 只补门面兜底不够：自定义 SPI 仓储/直连仓储传空时，旁路仍会把全库摊出去。
@@ -951,7 +1165,7 @@ impl ProcessRepository for SqlxRepository {
             let mut count_q = sqlx::query(&count_sql).bind(op.clone());
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
-                .fetch_one(&self.pool)
+                .fetch_one(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
@@ -977,16 +1191,16 @@ impl ProcessRepository for SqlxRepository {
             let rows = rows_q
                 .bind(page_size)
                 .bind(offset)
-                .fetch_all(&self.pool)
+                .fetch_all(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_task_row).collect()))
-        })
+        }))
     }
 
     fn page_done_tasks(&self, query: &PageQuery) -> JeeflowResult<PageResult<TaskRow>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             // 「我已办」三处判据（issues/117，owner 2026-09-21 拍板；内存仓
             // `jeeflow-core/src/memory.rs::page_done_tasks` 同判据，不得"换仓储就换答案"）：
@@ -1017,7 +1231,7 @@ impl ProcessRepository for SqlxRepository {
             let mut count_q = sqlx::query(&count_sql).bind(op);
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
-                .fetch_one(&self.pool)
+                .fetch_one(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
@@ -1042,16 +1256,16 @@ impl ProcessRepository for SqlxRepository {
             let rows = rows_q
                 .bind(page_size)
                 .bind(offset)
-                .fetch_all(&self.pool)
+                .fetch_all(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_task_row).collect()))
-        })
+        }))
     }
 
     fn page_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             // issues/129：空 operator → 空页，且不再下推 `(? IS NULL OR …)` 旁路。
             // 只补门面兜底不够：自定义 SPI 仓储/直连仓储传空时，旁路仍会把全库摊出去。
@@ -1071,7 +1285,7 @@ impl ProcessRepository for SqlxRepository {
             let mut count_q = sqlx::query(&count_sql).bind(op.clone());
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
-                .fetch_one(&self.pool)
+                .fetch_one(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
@@ -1091,12 +1305,12 @@ impl ProcessRepository for SqlxRepository {
             let rows = rows_q
                 .bind(page_size)
                 .bind(offset)
-                .fetch_all(&self.pool)
+                .fetch_all(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_instance_row).collect()))
-        })
+        }))
     }
 
     /// 我的抄送（`processInstance/ccList` 取数腿）。
@@ -1111,7 +1325,7 @@ impl ProcessRepository for SqlxRepository {
     /// issues/129（空 operator 不得折叠成"看全部"）那一档由同一条判据接住：
     /// 空 operator 且没有别的归属条件 ⇒ 空页，且不再下推 `(? IS NULL OR …)` 旁路。
     fn page_cc_instances(&self, query: &PageQuery) -> JeeflowResult<PageResult<InstanceRow>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             if !jeeflow_core::model::has_effective_cc_ownership(query) {
                 return Ok(PageResult::new(page_num, page_size, 0, Vec::new()));
@@ -1147,7 +1361,7 @@ impl ProcessRepository for SqlxRepository {
             let mut count_q = sqlx::query(&count_sql);
             for v in &vals { count_q = count_q.bind(v); }
             let count_row = count_q
-                .fetch_one(&self.pool)
+                .fetch_one(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
@@ -1168,16 +1382,16 @@ impl ProcessRepository for SqlxRepository {
             let rows = rows_q
                 .bind(page_size)
                 .bind(offset)
-                .fetch_all(&self.pool)
+                .fetch_all(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_instance_row).collect()))
-        })
+        }))
     }
 
     fn page_defines(&self, query: &PageQuery) -> JeeflowResult<PageResult<DefineRow>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             // m_ 过滤下推（issues/106）：表无别名裸列名；有过滤插 WHERE（不前置 AND），无过滤保持原样
             let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_bare_col(DEFINE_COLS));
@@ -1186,7 +1400,7 @@ impl ProcessRepository for SqlxRepository {
             let mut count_q = sqlx::query(&count_sql);
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
-                .fetch_one(&self.pool)
+                .fetch_one(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
@@ -1201,36 +1415,36 @@ impl ProcessRepository for SqlxRepository {
             let rows = rows_q
                 .bind(page_size)
                 .bind(offset)
-                .fetch_all(&self.pool)
+                .fetch_all(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_define_row).collect()))
-        })
+        }))
     }
 
 
     fn count_todo_tasks(&self, user_id: &str) -> JeeflowResult<i64> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let row = sqlx::query(
                 "SELECT COUNT(DISTINCT t.id) as cnt FROM wf_process_task t INNER JOIN wf_process_task_actor ta ON t.id = ta.process_task_id WHERE ta.actor_id = ? AND t.task_state = 10"
             )
             .bind(user_id)
-            .fetch_one(&self.pool)
+            .fetch_one(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(row.get::<i64, _>("cnt"))
-        })
+        }))
     }
 
     fn get_all_instances(&self) -> JeeflowResult<Vec<ProcessInstance>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let rows = sqlx::query(
                 "SELECT id, parent_id, process_define_id, state, parent_node_name, business_no, \
                         operator, expire_time, variable, create_time, create_user, update_time, update_user \
                  FROM wf_process_instance"
             )
-            .fetch_all(&self.pool)
+            .fetch_all(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
@@ -1251,44 +1465,44 @@ impl ProcessRepository for SqlxRepository {
                 update_user: r.get("update_user"),
                 define: None,
             }).collect())
-        })
+        }))
     }
 
     fn get_all_tasks(&self) -> JeeflowResult<Vec<ProcessTask>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let rows = sqlx::query(
                 "SELECT id, process_instance_id, task_name, display_name, task_type, perform_type, \
                         task_state, operator, finish_time, expire_time, form_key, task_parent_id, \
                         variable, create_time, create_user, update_time, update_user \
                  FROM wf_process_task"
             )
-            .fetch_all(&self.pool)
+            .fetch_all(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
-            tasks_from_rows(&self.pool, rows).await
-        })
+            tasks_from_rows(exec.reborrow(), rows).await
+        }))
     }
 }
 
 impl ProcessExtRepository for SqlxRepository {
     fn find_design_by_id(&self, design_id: i64) -> JeeflowResult<Option<ProcessDesign>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let row = sqlx::query(
                 "SELECT id, name, display_name, type, icon, is_deployed, remark, \
                         create_time, create_user, update_time, update_user \
                  FROM wf_process_design WHERE id = ?"
             )
             .bind(design_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(row.map(|r| map_design(&r)))
-        })
+        }))
     }
 
     fn save_design(&self, design: &mut ProcessDesign) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if design.id == 0 {
                 design.id = self.next_id();
@@ -1309,15 +1523,15 @@ impl ProcessExtRepository for SqlxRepository {
             .bind(&design.remark)
             .bind(&design.create_time)
             .bind(&design.create_user)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn update_design(&self, design: &ProcessDesign) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             sqlx::query(
                 "UPDATE wf_process_design SET name=?, display_name=?, type=?, icon=?, \
                  is_deployed=?, remark=?, update_user=? WHERE id=?"
@@ -1330,31 +1544,31 @@ impl ProcessExtRepository for SqlxRepository {
             .bind(&design.remark)
             .bind(&design.update_user)
             .bind(design.id)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn remove_design(&self, design_id: i64) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             sqlx::query("DELETE FROM wf_process_design_his WHERE process_design_id=?")
                 .bind(design_id)
-                .execute(&self.pool)
+                .execute(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             sqlx::query("DELETE FROM wf_process_design WHERE id=?")
                 .bind(design_id)
-                .execute(&self.pool)
+                .execute(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn page_designs(&self, query: &PageQuery) -> JeeflowResult<PageResult<ProcessDesign>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             // m_ 过滤下推（issues/106）：表无别名裸列名；有过滤插 WHERE（不前置 AND），无过滤保持原样
             let (frags, fvals) = jeeflow_core::filter_sql::build_filter_where(&query.filters, resolve_bare_col(DESIGN_COLS));
@@ -1363,7 +1577,7 @@ impl ProcessExtRepository for SqlxRepository {
             let mut count_q = sqlx::query(&count_sql);
             for v in &fvals { count_q = count_q.bind(v); }
             let count_row = count_q
-                .fetch_one(&self.pool)
+                .fetch_one(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
@@ -1377,15 +1591,15 @@ impl ProcessExtRepository for SqlxRepository {
             let rows = rows_q
                 .bind(page_size)
                 .bind(offset)
-                .fetch_all(&self.pool)
+                .fetch_all(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_design).collect()))
-        })
+        }))
     }
 
     fn save_design_his(&self, his: &mut ProcessDesignHis) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let content_str = String::from_utf8_lossy(&his.content).to_string();
             // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if his.id == 0 {
@@ -1402,21 +1616,21 @@ impl ProcessExtRepository for SqlxRepository {
             .bind(&content_str)
             .bind(&his.create_time)
             .bind(&his.create_user)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn list_design_his(&self, design_id: i64) -> JeeflowResult<Vec<ProcessDesignHis>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let rows = sqlx::query(
                 "SELECT id, process_design_id, content, create_time, create_user \
                  FROM wf_process_design_his WHERE process_design_id = ? ORDER BY id DESC"
             )
             .bind(design_id)
-            .fetch_all(&self.pool)
+            .fetch_all(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(rows.into_iter().map(|r| {
@@ -1434,26 +1648,26 @@ impl ProcessExtRepository for SqlxRepository {
                     create_user: get_opt_string(&r, "create_user"),
                 }
             }).collect())
-        })
+        }))
     }
 
     fn find_surrogate_by_id(&self, surrogate_id: i64) -> JeeflowResult<Option<ProcessSurrogate>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let row = sqlx::query(
                 "SELECT id, process_name, operator, surrogate, start_time, end_time, enabled, \
                         create_time, create_user, update_time, update_user \
                  FROM wf_process_surrogate WHERE id = ?"
             )
             .bind(surrogate_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(row.map(|r| map_surrogate(&r)))
-        })
+        }))
     }
 
     fn save_surrogate(&self, surrogate: &mut ProcessSurrogate) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             // 规范表无 AUTO_INCREMENT：未显式指定 id 时由应用层雪花生成
             if surrogate.id == 0 {
                 surrogate.id = self.next_id();
@@ -1474,15 +1688,15 @@ impl ProcessExtRepository for SqlxRepository {
             .bind(surrogate.enabled)
             .bind(&surrogate.create_time)
             .bind(&surrogate.create_user)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn update_surrogate(&self, surrogate: &ProcessSurrogate) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             sqlx::query(
                 "UPDATE wf_process_surrogate SET process_name=?, operator=?, surrogate=?, start_time=?, \
                  end_time=?, enabled=?, update_user=? WHERE id=?"
@@ -1495,26 +1709,26 @@ impl ProcessExtRepository for SqlxRepository {
             .bind(surrogate.enabled)
             .bind(&surrogate.update_user)
             .bind(surrogate.id)
-            .execute(&self.pool)
+            .execute(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn remove_surrogate(&self, surrogate_id: i64) -> JeeflowResult<()> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             sqlx::query("DELETE FROM wf_process_surrogate WHERE id=?")
                 .bind(surrogate_id)
-                .execute(&self.pool)
+                .execute(exec.reborrow())
                 .await
                 .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(())
-        })
+        }))
     }
 
     fn page_surrogates(&self, query: &PageQuery) -> JeeflowResult<PageResult<ProcessSurrogate>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             let (page_num, page_size, offset) = page_bounds(query);
             // issues/152 ②：归属列 operator 空值 ⇒ 空页，不再下推 `(? IS NULL OR operator = ?)` 旁路
             // （形状同 page_instances 的 issues/129 那一句）。原旁路在 `Some("")` 这一档不是"不加条件"，
@@ -1529,7 +1743,7 @@ impl ProcessExtRepository for SqlxRepository {
                 "SELECT COUNT(*) AS cnt FROM wf_process_surrogate WHERE operator = ?"
             )
             .bind(op.clone())
-            .fetch_one(&self.pool)
+            .fetch_one(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             let total: i64 = count_row.get("cnt");
@@ -1543,11 +1757,11 @@ impl ProcessExtRepository for SqlxRepository {
             .bind(op)
             .bind(page_size)
             .bind(offset)
-            .fetch_all(&self.pool)
+            .fetch_all(exec.reborrow())
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(PageResult::new(page_num, page_size, total, rows.iter().map(map_surrogate).collect()))
-        })
+        }))
     }
 
     /// 委托查询（规范 06 §4.5 条款 1.4 + issues/123 的正确判序）：
@@ -1559,9 +1773,9 @@ impl ProcessExtRepository for SqlxRepository {
     /// 不得判否即止（Java 参考实现 `JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet`
     /// 钉的正是"精确已过期 → 兜底全流程委托"）。
     fn get_surrogate(&self, operator: &str, process_name: &str, time: &str) -> JeeflowResult<Option<ProcessSurrogate>> {
-        self.block_on(async {
+        self.with_exec(|mut exec| self.block_on(async {
             if !process_name.is_empty() {
-                if let Some(newest) = self.query_newest_surrogate(operator, process_name).await? {
+                if let Some(newest) = Self::query_newest_surrogate(exec.reborrow(), operator, process_name).await? {
                     if jeeflow_core::surrogate::surrogate_hit(
                         &newest, operator, process_name, false, time,
                     ) {
@@ -1569,7 +1783,7 @@ impl ProcessExtRepository for SqlxRepository {
                     }
                 }
             }
-            let global = match self.query_newest_surrogate(operator, "").await? {
+            let global = match Self::query_newest_surrogate(exec.reborrow(), operator, "").await? {
                 Some(g) => g,
                 None => return Ok(None),
             };
@@ -1578,7 +1792,7 @@ impl ProcessExtRepository for SqlxRepository {
             } else {
                 Ok(None)
             }
-        })
+        }))
     }
 }
 
@@ -4663,5 +4877,568 @@ mod tests {
         ] {
             sqlx::query(sql).execute(&pool).await.unwrap();
         }
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // 事务档 145-5（audit8 R9 · rust 切片）：spec/12 §12.4 三档 + 覆盖面
+    // 六件：① 空转档（提交前独立连接读不到、同连接读得到、回滚后不存在）
+    //      ② 入口原子档（引擎入口中途失败整体回滚）＋无模板红样（修前形态留半完成）
+    //      ③ 复合动作档（门面 startAndExecute 办理相中途失败 ⇒ 三表全回滚）＋无模板红样
+    //      ④ 归属档（跨线程互不并入＋同线程嵌套 join 随外层回滚连坐）
+    //      ⑤ ext 三表（设计/历史/委托）随主仓事务回滚（共用同一枚 thread-local 槽）
+    //      ⑥ 写腿同源 with_thread_tx_exec（C99 ⑥ rust 腿）＋裸池逃逸红样
+    // 真库 = 160（JEFFLOW_DB_* 默认与既有用例同口径，库 jeeflow）；
+    // id 段本组独占且**逐档分段**（a=930004/5、b=930014、c=930024、d=93004x、e=93005x、f=93006x），
+    // ext/探针行按各档专属前缀清场（txtier-e-/txtier-f-）——默认并行跑不得互删
+    //（曾五档共用 930004＋全局 'txtier-%' 清场 ⇒ 并行假红）。
+    // ═══════════════════════════════════════════════════════
+
+    /// 复合动作档注错点：门面 startAndExecute 的**办理相**（`exec.process_task` 由
+    /// execute_task_sync 步骤 9 置入后才 fire）后置拦截器报错 ⇒ 中途失败；发起相全放行，
+    /// 保证失败点落在"实例/任务/参与者都已写"之后（③ 的绿/红对照才吃得到多拍写面）。
+    struct TxtFailInExecute;
+    impl FlowInterceptor for TxtFailInExecute {
+        fn intercept(&self, exec: &mut jeeflow_core::engine::Execution) -> JeeflowResult<()> {
+            if exec.process_task.is_some() {
+                return Err(JeeflowError::Business("injected: tx-tier composite boom".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// 同步上下文里驱动一次库往返（与仓储 `block_on` 同口径；调用点都发生在
+    /// `mysql_rt().block_on` 之内 ⇒ `block_in_place` 合法）。
+    fn txt_rt_block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+    }
+
+    /// 可执行的最小审批流：start → apply(applicant) → task1(leader) → end。
+    fn txt_runnable_define(id: i64, name: &str) -> ProcessDefine {
+        ProcessDefine {
+            id,
+            name: name.into(),
+            display_name: "txtier".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: format!(
+                r#"{{"name":"{}","displayName":"txtier","type":"approval",
+                    "nodes":[{{"id":"start","type":"snaker:start","text":{{"value":"s"}}}},
+                             {{"id":"apply","type":"snaker:task","text":{{"value":"申请"}},"properties":{{"assignee":"applicant"}}}},
+                             {{"id":"task1","type":"snaker:task","text":{{"value":"审批"}},"properties":{{"assignee":"leader"}}}},
+                             {{"id":"end","type":"snaker:end","text":{{"value":"e"}}}}],
+                    "edges":[{{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"}},
+                             {{"id":"e2","sourceNodeId":"apply","targetNodeId":"task1"}},
+                             {{"id":"e3","sourceNodeId":"task1","targetNodeId":"end"}}]}}"#,
+                name
+            )
+            .into_bytes(),
+            version: 1,
+            create_time: None,
+            create_user: Some("txtier".into()),
+            update_time: None,
+            update_user: None,
+        }
+    }
+
+    /// 空壳定义（不执行，只当"事务里的一笔真写"用；①④⑤ 的探针载体）。
+    fn txt_plain_define(id: i64, name: &str) -> ProcessDefine {
+        ProcessDefine {
+            id,
+            name: name.into(),
+            display_name: "txtier".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: b"{}".to_vec(),
+            version: 1,
+            create_time: None,
+            create_user: Some("txtier".into()),
+            update_time: None,
+            update_user: None,
+        }
+    }
+
+    /// 引擎 ctx 工厂：`with_tx` 决定是否注册事务模板（红样/绿样共用同一装置）。
+    fn txt_ctx(
+        repo: Arc<SqlxRepository>,
+        pool: &MySqlPool,
+        with_tx: bool,
+    ) -> jeeflow_core::context::ServiceContext {
+        let mut ctx = jeeflow_core::context::ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_id_generator(Arc::new(jeeflow_core::id_gen::DefaultIdGenerator::new(1)));
+        if with_tx {
+            ctx = ctx.with_transaction_template(Arc::new(SqlxTransactionTemplate::new(pool.clone())));
+        }
+        ctx
+    }
+
+    async fn txt_count(pool: &MySqlPool, sql: &str, id: i64) -> i64 {
+        sqlx::query_scalar::<_, i64>(sql).bind(id).fetch_one(pool).await.unwrap()
+    }
+
+    async fn txt_scalar(pool: &MySqlPool, sql: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await.unwrap()
+    }
+
+    const TXT_INST: &str = "SELECT COUNT(*) FROM wf_process_instance WHERE process_define_id = ?";
+    const TXT_TASK: &str = "SELECT COUNT(*) FROM wf_process_task WHERE process_instance_id IN \
+                            (SELECT id FROM wf_process_instance WHERE process_define_id = ?)";
+    const TXT_ACT: &str = "SELECT COUNT(*) FROM wf_process_task_actor WHERE process_task_id IN \
+                           (SELECT id FROM wf_process_task WHERE process_instance_id IN \
+                            (SELECT id FROM wf_process_instance WHERE process_define_id = ?))";
+
+    /// ext 三表按**本档专属前缀**清场（各档前缀互不匹配 ⇒ 默认并行安全；
+    /// 按 'txtier-%' 全局清会互删他档在飞行）。biz_tx_probe 仅 ⑥ 使用，归它自管。
+    async fn txt_clean_ext(pool: &MySqlPool, prefix: &str) {
+        let like = format!("{prefix}%");
+        sqlx::query("DELETE FROM wf_process_design_his WHERE process_design_id IN \
+                     (SELECT id FROM wf_process_design WHERE name LIKE ?)")
+            .bind(like.as_str()).execute(pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_design WHERE name LIKE ?")
+            .bind(like.as_str()).execute(pool).await.unwrap();
+        sqlx::query("DELETE FROM wf_process_surrogate WHERE operator LIKE ?")
+            .bind(like.as_str()).execute(pool).await.unwrap();
+    }
+
+    /// ① 空转档：事务内的写真在事务连接上——提交前独立连接读不到、同连接读得到；
+    /// 回滚后不存在；同装置显式提交 ⇒ 提交后两处可见（阳性对照）。
+    #[test]
+    fn test_mysql_tx_tier_145_a_idle_same_source() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            let pool2 = connect_pool().await; // 独立取证池：与事务无关的第二条连接
+            setup_schema(&pool).await;
+            clean_by_define(&pool, 930004).await;
+
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            let tmpl = SqlxTransactionTemplate::new(pool.clone());
+
+            let repo_in = repo.clone();
+            let pool2_in = pool2.clone();
+            let mut def = txt_plain_define(930004, "txtier-idle");
+            let def_id = def.id;
+            let r = tmpl.execute_in_tx(Box::new(move || {
+                repo_in.save_define(&mut def)?;
+                // 提交前独立连接必须读不到——读到 ⇒ 仓储绕过了事务连接＝空转
+                let outside = txt_rt_block(async {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM wf_process_define WHERE id = ?",
+                    )
+                    .bind(def_id)
+                    .fetch_one(&pool2_in)
+                    .await
+                })
+                .unwrap();
+                assert_eq!(outside, 0, "提交前独立连接必须读不到（读到即空转）");
+                // 同连接读得到（连接绑定生效）
+                assert!(
+                    repo_in.find_define_by_id(def_id)?.is_some(),
+                    "事务内可读（连接绑定生效）"
+                );
+                Err(JeeflowError::Business("idle boom".into()))
+            }));
+            assert!(r.is_err(), "回滚臂");
+            let after = txt_count(
+                &pool2,
+                "SELECT COUNT(*) FROM wf_process_define WHERE id = ?",
+                930004,
+            )
+            .await;
+            assert_eq!(after, 0, "回滚后不存在");
+
+            // 阳性对照（提交路径）：同一装置显式提交 ⇒ 提交后独立连接可见
+            let repo_ok = repo.clone();
+            let r2 = tmpl.execute_in_tx(Box::new(move || {
+                repo_ok.save_define(&mut txt_plain_define(930005, "txtier-idle-ok"))?;
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            }));
+            assert!(r2.is_ok(), "提交臂应成功");
+            let committed = txt_count(
+                &pool2,
+                "SELECT COUNT(*) FROM wf_process_define WHERE id = ?",
+                930005,
+            )
+            .await;
+            assert_eq!(committed, 1, "提交后独立连接可见");
+
+            clean_by_define(&pool, 930004).await;
+            clean_by_define(&pool, 930005).await;
+        });
+    }
+
+    /// ② 入口原子档：引擎入口内中途失败（血缘退回在 `update_task` 之后必然报错）⇒ 整体回滚；
+    /// 无模板红样（修前形态）同路径留下"已完成"半完成，钉住入口包裹修的是什么。
+    #[test]
+    fn test_mysql_tx_tier_145_b_entry_atomic() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            let pool2 = connect_pool().await;
+            setup_schema(&pool).await;
+            clean_by_define(&pool, 930014).await;
+
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            repo.save_define(&mut txt_runnable_define(930014, "txtier-b-atomic")).unwrap();
+
+            // 建单（无模板引擎：建单本笔不测事务）
+            let engine0 = jeeflow_core::engine::JeeflowEngineImpl::new(txt_ctx(repo.clone(), &pool, false));
+            let inst = engine0
+                .start_sync(930014, "applicant", &jeeflow_core::json::FlowData::new())
+                .unwrap();
+            let apply = repo
+                .find_doing_tasks(inst.instance_id, &[])
+                .unwrap()
+                .into_iter()
+                .find(|t| t.task_name == "apply")
+                .expect("应有 apply 任务");
+            let state_sql = "SELECT task_state FROM wf_process_task WHERE id = ?";
+
+            // ① 带模板：血缘退回（parent 为空）必报错的**中途失败**——update_task 已写 ⇒ 整体回滚
+            let engine1 = jeeflow_core::engine::JeeflowEngineImpl::new(txt_ctx(repo.clone(), &pool, true));
+            let r = engine1.in_tx(|| {
+                engine1.execute_and_jump_sync(
+                    apply.task_id,
+                    "applicant",
+                    &jeeflow_core::json::FlowData::new(),
+                    None,
+                )
+            });
+            assert!(r.is_err(), "无血缘退回必须报错（上一步任务ID为空）");
+            assert_eq!(
+                txt_count(&pool2, state_sql, apply.task_id).await,
+                10,
+                "入口级包裹必须把 update_task 回滚（任务仍 DOING=10）"
+            );
+
+            // ② 红样（无模板＝修前形态）：同一路径错误后，任务行留下"已完成"的半完成
+            let r0 = engine0.in_tx(|| {
+                engine0.execute_and_jump_sync(
+                    apply.task_id,
+                    "applicant",
+                    &jeeflow_core::json::FlowData::new(),
+                    None,
+                )
+            });
+            assert!(r0.is_err());
+            assert_eq!(
+                txt_count(&pool2, state_sql, apply.task_id).await,
+                20,
+                "无模板时半完成留存＝修前形态（钉住入口包裹修的是什么）"
+            );
+
+            clean_by_define(&pool, 930014).await;
+        });
+    }
+
+    /// ③ 复合动作档：门面 startAndExecute 多拍动作中途失败 ⇒ 实例/任务/参与者全回滚
+    /// （门面 flow() 动作级 in_tx）；无模板红样留半完成（多拍各自提交的修前形态）。
+    #[test]
+    fn test_mysql_tx_tier_145_c_composite_facade() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            let pool2 = connect_pool().await;
+            setup_schema(&pool).await;
+            clean_by_define(&pool, 930024).await;
+
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            repo.save_define(&mut txt_runnable_define(930024, "txtier-c-composite")).unwrap();
+
+            let mut args = std::collections::HashMap::new();
+            args.insert(
+                "processDefineId".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(930024)),
+            );
+            args.insert(
+                "operator".to_string(),
+                serde_json::Value::String("applicant".into()),
+            );
+
+            // ① 带模板：办理相中途失败 ⇒ 三表全回滚
+            {
+                let mut ctx = txt_ctx(repo.clone(), &pool, true);
+                ctx.register_interceptor(Arc::new(TxtFailInExecute));
+                let facade = jeeflow_facade::JeeflowFacade::new(ctx);
+                let res = facade.flow("processInstance/startAndExecute", &args).await;
+                assert_eq!(
+                    res.get("code").and_then(|v| v.as_i64()),
+                    Some(99999999),
+                    "复合动作必须以失败信封收场"
+                );
+                assert_eq!(txt_count(&pool2, TXT_INST, 930024).await, 0, "实例行必须整体回滚");
+                assert_eq!(txt_count(&pool2, TXT_TASK, 930024).await, 0, "任务行必须整体回滚（逐拍提交会留行）");
+                assert_eq!(txt_count(&pool2, TXT_ACT, 930024).await, 0, "参与者行必须整体回滚");
+            }
+            // ② 红样（无模板＝修前形态）：同一注错 ⇒ 中途失败留半完成
+            {
+                let mut ctx = txt_ctx(repo.clone(), &pool, false);
+                ctx.register_interceptor(Arc::new(TxtFailInExecute));
+                let facade = jeeflow_facade::JeeflowFacade::new(ctx);
+                let res = facade.flow("processInstance/startAndExecute", &args).await;
+                assert_eq!(res.get("code").and_then(|v| v.as_i64()), Some(99999999));
+                assert_eq!(
+                    txt_count(&pool2, TXT_INST, 930024).await,
+                    1,
+                    "无模板时实例行留存＝修前形态（门面动作档包裹对症的就是这里）"
+                );
+                assert!(
+                    txt_count(&pool2, TXT_TASK, 930024).await >= 1,
+                    "无模板时任务行留存（半完成）"
+                );
+            }
+
+            clean_by_define(&pool, 930024).await;
+        });
+    }
+
+    /// ④ 归属档：A 线程事务未提交期间，B 线程经同一模板的写走 B 自己的事务连接（thread-local）
+    /// 独立提交；A 回滚不连坐 B；同线程嵌套 join 随外层回滚连坐（不重开 BEGIN）。
+    #[test]
+    fn test_mysql_tx_tier_145_d_attribution() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            let pool2 = connect_pool().await;
+            setup_schema(&pool).await;
+
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            let tmpl = Arc::new(SqlxTransactionTemplate::new(pool.clone()));
+            let def_sql = "SELECT COUNT(*) FROM wf_process_define WHERE id = ?";
+            for id in [930041i64, 930042, 930043, 930044] {
+                sqlx::query("DELETE FROM wf_process_define WHERE id = ?")
+                    .bind(id).execute(&pool).await.unwrap();
+            }
+
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+            let tmpl_a = tmpl.clone();
+            let repo_a = repo.clone();
+            let a = tokio::task::spawn_blocking(move || {
+                let repo_in = repo_a.clone();
+                let tmpl_in = tmpl_a.clone();
+                tmpl_a.execute_in_tx(Box::new(move || {
+                    repo_in.save_define(&mut txt_plain_define(930041, "txtier-a1"))?;
+                    go_tx.send(()).unwrap(); // A 已开事务并写第一笔
+                    done_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .expect("B 未完成");
+                    repo_in.save_define(&mut txt_plain_define(930042, "txtier-a2"))?;
+                    // 同线程嵌套：join 外层（不重开 BEGIN、内层自报成功，仍随外层回滚连坐）
+                    let repo_n = repo_in.clone();
+                    let inner = tmpl_in.execute_in_tx(Box::new(move || {
+                        repo_n.save_define(&mut txt_plain_define(930043, "txtier-an"))?;
+                        Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+                    }));
+                    assert!(inner.is_ok(), "嵌套 join 内层应直接并入外层执行");
+                    Err(JeeflowError::Business("a boom".into()))
+                }))
+            });
+            let tmpl_b = tmpl.clone();
+            let repo_b = repo.clone();
+            let b = tokio::task::spawn_blocking(move || {
+                go_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("A 未就绪");
+                let r = tmpl_b.execute_in_tx(Box::new(move || {
+                    repo_b.save_define(&mut txt_plain_define(930044, "txtier-b1"))?;
+                    Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+                }));
+                let _ = done_tx.send(());
+                r
+            });
+
+            let ra = a.await.unwrap();
+            let rb = b.await.unwrap();
+            assert!(ra.is_err(), "A 全程失败收场");
+            assert!(rb.is_ok(), "B 独立提交成功");
+
+            for id in [930041i64, 930042, 930043] {
+                assert_eq!(
+                    txt_count(&pool2, def_sql, id).await,
+                    0,
+                    "A 写 {id} 必须随 A 回滚（嵌套内层同样连坐）"
+                );
+            }
+            assert_eq!(
+                txt_count(&pool2, def_sql, 930044).await,
+                1,
+                "B 写必须独立提交留存（并进 A 的事务＝归属档红）"
+            );
+
+            for id in [930041i64, 930042, 930043, 930044] {
+                sqlx::query("DELETE FROM wf_process_define WHERE id = ?")
+                    .bind(id).execute(&pool).await.unwrap();
+            }
+        });
+    }
+
+    /// ⑤ ext 三表（设计/历史/委托）随主仓事务回滚——ext 腿与主仓共用同一枚 thread-local 槽。
+    #[test]
+    fn test_mysql_tx_tier_145_e_ext_tables_follow() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            let pool2 = connect_pool().await;
+            setup_schema(&pool).await;
+            txt_clean_ext(&pool, "txtier-e-").await;
+
+            let repo = Arc::new(SqlxRepository::new(pool.clone()));
+            let ext: Arc<dyn ProcessExtRepository> = repo.clone();
+            let tmpl = SqlxTransactionTemplate::new(pool.clone());
+
+            let design_sql = "SELECT COUNT(*) FROM wf_process_design WHERE name LIKE 'txtier-e-design%'";
+            let his_sql = "SELECT COUNT(*) FROM wf_process_design_his WHERE process_design_id IN \
+                           (SELECT id FROM wf_process_design WHERE name LIKE 'txtier-e-design%')";
+            let sur_sql = "SELECT COUNT(*) FROM wf_process_surrogate WHERE operator = 'txtier-e-op'";
+
+            fn tx_ext_seed(ext: &Arc<dyn ProcessExtRepository>) -> JeeflowResult<()> {
+                let mut design = ProcessDesign {
+                    id: 930051,
+                    name: "txtier-e-design".into(),
+                    display_name: "事务设计".into(),
+                    design_type: "approval".into(),
+                    icon: None,
+                    is_deployed: 0,
+                    remark: None,
+                    create_time: None,
+                    create_user: Some("txtier".into()),
+                    update_time: None,
+                    update_user: None,
+                };
+                ext.save_design(&mut design)?;
+                let mut his = ProcessDesignHis {
+                    id: 930052,
+                    process_design_id: design.id,
+                    content: b"{\"v\":1}".to_vec(),
+                    create_time: None,
+                    create_user: Some("txtier".into()),
+                };
+                ext.save_design_his(&mut his)?;
+                let mut s = ProcessSurrogate {
+                    id: 930053,
+                    process_name: String::new(),
+                    operator: "txtier-e-op".into(),
+                    surrogate: "txtier-e-agent".into(),
+                    start_time: None,
+                    end_time: None,
+                    enabled: 1,
+                    create_time: None,
+                    create_user: Some("txtier".into()),
+                    update_time: None,
+                    update_user: None,
+                };
+                ext.save_surrogate(&mut s)?;
+                Ok(())
+            }
+
+            let ext_c = ext.clone();
+            let r = tmpl.execute_in_tx(Box::new(move || {
+                tx_ext_seed(&ext_c)?;
+                Err(JeeflowError::Business("tx-ext boom".into()))
+            }));
+            assert!(r.is_err());
+            assert_eq!(txt_scalar(&pool2, design_sql).await, 0, "设计表随主仓事务回滚");
+            assert_eq!(txt_scalar(&pool2, his_sql).await, 0, "设计历史表随回滚");
+            assert_eq!(txt_scalar(&pool2, sur_sql).await, 0, "委托表随回滚");
+
+            // 阳性对照：同三笔正常提交 ⇒ 三表都在（防"路径本身写不进去"的假绿）
+            let ext_c2 = ext.clone();
+            let r2 = tmpl.execute_in_tx(Box::new(move || {
+                tx_ext_seed(&ext_c2)?;
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            }));
+            assert!(r2.is_ok());
+            assert_eq!(txt_scalar(&pool2, design_sql).await, 1, "正常提交时设计在");
+            assert_eq!(txt_scalar(&pool2, sur_sql).await, 1, "正常提交时委托在");
+
+            txt_clean_ext(&pool, "txtier-e-").await;
+        });
+    }
+
+    /// ⑥ 写腿同源（C99 ⑥ rust 腿）：事务内经 `with_thread_tx_exec`（集成侧 SqlxDynamicTableWriter /
+    /// SqlxBizDataReader 同型接线）的写随整笔回滚消失；同一位置**裸池**写＝逃逸留存（红样）；
+    /// 同装置正常提交 ⇒ 行在（阳性对照）。
+    #[test]
+    fn test_mysql_tx_tier_145_f_writer_leg() {
+        if skip_mysql() { return; }
+        mysql_rt().block_on(async {
+            let pool = connect_pool().await;
+            let pool2 = connect_pool().await;
+            setup_schema(&pool).await;
+            sqlx::query(
+                "CREATE TABLE IF NOT EXISTS biz_tx_probe (id BIGINT PRIMARY KEY, tag VARCHAR(64))",
+            )
+            .execute(&pool).await.unwrap();
+            // 本档专属清场：按本档 id 段 + 专属前缀（biz_tx_probe 仅本档使用）
+            sqlx::query("DELETE FROM biz_tx_probe WHERE (id BETWEEN 930060 AND 930069) OR tag LIKE 'txtier-f-%'")
+                .execute(&pool).await.unwrap();
+
+            let tmpl = SqlxTransactionTemplate::new(pool.clone());
+            let tag_sql = "SELECT COUNT(*) FROM biz_tx_probe WHERE tag = ?";
+
+            // 6a joined：事务内经路由写探针行 ⇒ 随整笔回滚消失
+            let pool_c = pool.clone();
+            let r = tmpl.execute_in_tx(Box::new(move || {
+                with_thread_tx_exec(&pool_c, |mut exec| {
+                    txt_rt_block(async {
+                        sqlx::query("INSERT INTO biz_tx_probe (id, tag) VALUES (?, ?)")
+                            .bind(930061i64)
+                            .bind("txtier-f-joined")
+                            .execute(exec.reborrow())
+                            .await
+                    })
+                    .unwrap();
+                });
+                Err(JeeflowError::Business("writer boom".into()))
+            }));
+            assert!(r.is_err());
+            let joined: i64 = sqlx::query_scalar(tag_sql)
+                .bind("txtier-f-joined").fetch_one(&pool2).await.unwrap();
+            assert_eq!(joined, 0, "经路由的写必须随事务回滚");
+
+            // 6b escape 红样：同一位置用**裸池**（不经路由）⇒ 自连接自动提交，回滚影响不到它
+            let pool_e = pool.clone();
+            let r2 = tmpl.execute_in_tx(Box::new(move || {
+                txt_rt_block(async {
+                    sqlx::query("INSERT INTO biz_tx_probe (id, tag) VALUES (?, ?)")
+                        .bind(930062i64)
+                        .bind("txtier-f-escape")
+                        .execute(&pool_e)
+                        .await
+                })
+                .unwrap();
+                Err(JeeflowError::Business("writer boom 2".into()))
+            }));
+            assert!(r2.is_err());
+            let escaped: i64 = sqlx::query_scalar(tag_sql)
+                .bind("txtier-f-escape").fetch_one(&pool2).await.unwrap();
+            assert_eq!(escaped, 1, "裸池红样：逃逸留存＝修前形态（钉住路由修的是什么）");
+
+            // 6c 阳性对照：同装置正常提交 ⇒ 行在（防"路径本身写不进去"的假绿）
+            let pool_ok = pool.clone();
+            let r3 = tmpl.execute_in_tx(Box::new(move || {
+                with_thread_tx_exec(&pool_ok, |mut exec| {
+                    txt_rt_block(async {
+                        sqlx::query("INSERT INTO biz_tx_probe (id, tag) VALUES (?, ?)")
+                            .bind(930063i64)
+                            .bind("txtier-f-committed")
+                            .execute(exec.reborrow())
+                            .await
+                    })
+                    .unwrap();
+                });
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            }));
+            assert!(r3.is_ok());
+            let committed: i64 = sqlx::query_scalar(tag_sql)
+                .bind("txtier-f-committed").fetch_one(&pool2).await.unwrap();
+            assert_eq!(committed, 1, "正常提交时写入在");
+
+            sqlx::query("DELETE FROM biz_tx_probe WHERE (id BETWEEN 930060 AND 930069) OR tag LIKE 'txtier-f-%'")
+                .execute(&pool).await.unwrap();
+        });
     }
 }

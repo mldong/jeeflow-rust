@@ -823,11 +823,15 @@ impl JeeflowFacade {
 
     /// Main entry point: dispatch to 42 actions (async to avoid nested runtime panic).
     pub async fn flow(&self, action: &str, args: &HashMap<String, Json>) -> Json {
-        let result = match action {
+        // R9/145-5 动作级包裹（对齐 java2 门面 flow()）：整次 dispatch 收进引擎 in_tx——
+        // 复合动作（startAndExecute 多拍）一笔原子；读类动作事务内跑完即提交。
+        // 宿主未注册模板时 in_tx 裸跑，行为与修前逐字一致（spec/12 §12.1 原则 4）。
+        // 信封在事务**外**生成：失败先整体回滚、离开 in_tx 后再转失败信封。
+        let result = self.engine.in_tx(|| match action {
             // ═══ processDefine (8) ═══
             "processDefine/page" => self.process_define_page(args),
             "processDefine/detail" => self.process_define_detail(args),
-            "processDefine/startAndExecute" => self.process_define_start_and_execute(args).await,
+            "processDefine/startAndExecute" => self.process_define_start_and_execute(args),
             "processDefine/deploy" => self.process_define_deploy(args),
             "processDefine/redeploy" => self.process_define_redeploy(args),
             "processDefine/remove" => self.process_define_remove(args),
@@ -837,7 +841,7 @@ impl JeeflowFacade {
             // ═══ processInstance (14) ═══
             "processInstance/page" => self.process_instance_page(args),
             "processInstance/detail" => self.process_instance_detail(args),
-            "processInstance/startAndExecute" => self.process_instance_start_and_execute(args).await,
+            "processInstance/startAndExecute" => self.process_instance_start_and_execute(args),
             "processInstance/withdraw" => self.process_instance_withdraw(args),
             "processInstance/highLight" => self.process_instance_high_light(args),
             "processInstance/approvalRecord" => self.process_instance_approval_record(args),
@@ -853,7 +857,7 @@ impl JeeflowFacade {
             // ═══ processTask (10) ═══
             "processTask/todoList" => self.process_task_todo_list(args),
             "processTask/doneList" => self.process_task_done_list(args),
-            "processTask/execute" => self.process_task_execute(args).await,
+            "processTask/execute" => self.process_task_execute(args),
             "processTask/detail" => self.process_task_detail(args),
             "processTask/jumpAbleTaskNameList" => self.process_task_jump_able_task_name_list(args),
             "processTask/candidatePage" => self.process_task_candidate_page(args),
@@ -883,7 +887,7 @@ impl JeeflowFacade {
 
             // ═══ Unknown action ═══
             _ => Err(JeeflowError::UnknownAction(action.to_string())),
-        };
+        });
 
         match result {
             Ok(data) => success_response(transform_output(data)),
@@ -984,7 +988,7 @@ impl JeeflowFacade {
         }))
     }
 
-    async fn process_define_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+    fn process_define_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         // 对齐 Java：优先 processDefineId / id；兼容 name
         let define_id = if let Some(id) = arg_i64(args, "processDefineId")?.or(arg_i64(args, "id")?) {
             id
@@ -1003,8 +1007,8 @@ impl JeeflowFacade {
         let operator = arg_str_or(args, "operator", "user1");
         let mut flow_data = args_to_flow_data(args);
 
-        // Start instance
-        let instance = self.engine.start_async(define_id, &operator, &flow_data).await?;
+        // Start instance（同步内核：本动作已在 flow() 的动作级 in_tx 内）
+        let instance = self.engine.start_sync(define_id, &operator, &flow_data)?;
 
         // 对齐 Java/boot2：自动完成申请节点（assignee=applicant → 发起人）
         let tasks = self.repo.find_doing_tasks(instance.instance_id, &[])?;
@@ -1021,8 +1025,7 @@ impl JeeflowFacade {
             }
             let _ = self
                 .engine
-                .execute_task_async(task.task_id, &operator, &flow_data)
-                .await?;
+                .execute_task_sync(task.task_id, &operator, &flow_data)?;
         }
 
         Ok(json!({ "process_instance_id": instance.instance_id }))
@@ -1189,8 +1192,8 @@ impl JeeflowFacade {
         }))
     }
 
-    async fn process_instance_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        self.process_define_start_and_execute(args).await
+    fn process_instance_start_and_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        self.process_define_start_and_execute(args)
     }
 
     fn process_instance_withdraw(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -1522,7 +1525,7 @@ impl JeeflowFacade {
         Ok(serde_json::to_value(page_to_json(&result)).unwrap())
     }
 
-    async fn process_task_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+    fn process_task_execute(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         // 对齐 UI/Java：processTaskId 优先，兼容 id
         let task_id = arg_i64(args, "processTaskId")?
             .or(arg_i64(args, "id")?)
@@ -1537,42 +1540,36 @@ impl JeeflowFacade {
             2 => {
                 // REJECT → 跳到结束
                 self.engine
-                    .execute_and_jump_to_end_async(task_id, &operator, &flow_data)
-                    .await?;
+                    .execute_and_jump_to_end_sync(task_id, &operator, &flow_data)?;
                 vec![]
             }
             3 => {
                 // ROLLBACK → 退回上一步（target=None）
                 self.engine
-                    .execute_and_jump_async(task_id, &operator, &flow_data, None)
-                    .await?
+                    .execute_and_jump_sync(task_id, &operator, &flow_data, None)?
             }
             4 => {
                 // JUMP → 跳转指定节点
                 let task_name = arg_str(args, "taskName");
                 self.engine
-                    .execute_and_jump_async(task_id, &operator, &flow_data, task_name.as_deref())
-                    .await?
+                    .execute_and_jump_sync(task_id, &operator, &flow_data, task_name.as_deref())?
             }
             6 => {
                 // ROLLBACK_TO_OPERATOR → 退回发起人
                 self.engine
-                    .execute_and_jump_to_first_async(task_id, &operator, &flow_data)
-                    .await?;
+                    .execute_and_jump_to_first_sync(task_id, &operator, &flow_data)?;
                 vec![]
             }
             20 => {
                 // COUNTERSIGN_DISAGREE
                 flow_data.insert_i64("countersignDisagreeFlag", 1);
                 self.engine
-                    .execute_task_async(task_id, &operator, &flow_data)
-                    .await?
+                    .execute_task_sync(task_id, &operator, &flow_data)?
             }
             _ => {
                 // 0 APPLY / 1 AGREE / 5 重新提交
                 self.engine
-                    .execute_task_async(task_id, &operator, &flow_data)
-                    .await?
+                    .execute_task_sync(task_id, &operator, &flow_data)?
             }
         };
         let task_ids: Vec<i64> = new_tasks.iter().map(|t| t.task_id).collect();

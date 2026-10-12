@@ -71,6 +71,9 @@ impl Execution {
 // JeeflowEngine trait
 // ═══════════════════════════════════════════════════════
 
+/// 同步引擎面（㉔ 修复：宿主可注入/装饰的抽象层——R9 前夜普查时本 trait 6 法全为
+/// `Err("Use async variant")` 死桩且全仓 `dyn JeeflowEngine` 零命中）。实现必须与 async
+/// 入口**同语义**：经 `ctx.transaction_template` 出事务包裹（有则用、无则裸跑，spec/12 §12.1）。
 pub trait JeeflowEngine: Send + Sync {
     fn start_process_instance(&self, define_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<ProcessInstance>;
@@ -837,44 +840,89 @@ impl JeeflowEngineImpl {
 }
 
 impl JeeflowEngine for JeeflowEngineImpl {
-    fn start_process_instance(&self, _define_id: i64, _operator: &str, _args: &FlowData)
+    /// ㉔ 修复（audit8 R9 前夜普查）：本 trait 此前 6 法全 `Err("Use async variant")` 死桩、
+    /// 且全仓 `dyn JeeflowEngine` 零命中 ⇒ 无可注入/可装饰抽象层、spec/05 §234「事务包装由
+    /// 仓储提供」无落点。现修成**真实现**：逐法委托同步内核，并经 [`Self::in_tx`] 包裹
+    /// （与 async 入口同一语义：宿主注册了模板就走模板、没注册裸跑——spec/12 §12.1 原则 4）。
+    fn start_process_instance(&self, define_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<ProcessInstance> {
-        // Synchronous wrapper — in practice the engine is called via async facade
-        Err(JeeflowError::Internal("Use async start_process_instance_async".into()))
+        self.in_tx(|| self.start_sync(define_id, operator, args))
     }
 
-    fn start_process_instance_with_parent(&self, _define_id: i64, _operator: &str, _args: &FlowData,
-                                           _parent_id: i64, _parent_node_name: &str)
+    fn start_process_instance_with_parent(&self, define_id: i64, operator: &str, args: &FlowData,
+                                           parent_id: i64, parent_node_name: &str)
         -> JeeflowResult<ProcessInstance> {
-        Err(JeeflowError::Internal("Use async variant".into()))
+        self.in_tx(|| self.start_with_parent_sync(define_id, operator, args, parent_id, parent_node_name))
     }
 
-    fn execute_process_task(&self, _task_id: i64, _operator: &str, _args: &FlowData)
+    fn execute_process_task(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
-        Err(JeeflowError::Internal("Use async variant".into()))
+        self.in_tx(|| self.execute_task_sync(task_id, operator, args))
     }
 
-    fn execute_and_jump_task(&self, _task_id: i64, _operator: &str, _args: &FlowData,
-                              _target_task_name: Option<&str>)
+    fn execute_and_jump_task(&self, task_id: i64, operator: &str, args: &FlowData,
+                              target_task_name: Option<&str>)
         -> JeeflowResult<Vec<ProcessTask>> {
-        Err(JeeflowError::Internal("Use async variant".into()))
+        self.in_tx(|| self.execute_and_jump_sync(task_id, operator, args, target_task_name))
     }
 
-    fn execute_and_jump_to_end(&self, _task_id: i64, _operator: &str, _args: &FlowData)
+    fn execute_and_jump_to_end(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
-        Err(JeeflowError::Internal("Use async variant".into()))
+        self.in_tx(|| self.execute_and_jump_to_end_sync(task_id, operator, args))
     }
 
-    fn execute_and_jump_to_first_task_node(&self, _task_id: i64, _operator: &str, _args: &FlowData)
+    fn execute_and_jump_to_first_task_node(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
-        Err(JeeflowError::Internal("Use async variant".into()))
+        self.in_tx(|| self.execute_and_jump_to_first_sync(task_id, operator, args))
     }
 }
 
 impl JeeflowEngineImpl {
-    /// Async start process instance.
+    /// 事务包裹辅助（R9/145-5）：`ctx.transaction_template` **有则用、无则裸跑**
+    /// （spec/12 §12.1 原则 4——引擎只经 [`TransactionTemplate`] 出抽象口，不感知任何
+    /// 具体连接机制；宿主未注册模板时行为与修前逐字一致）。join 语义在模板实现侧
+    /// （同线程嵌套调用并入外层事务，不重开 BEGIN），故门面动作级包裹与入口级包裹
+    /// 嵌套免费。泛型 `T` 经 `Box<dyn Any + Send>` 往返；`T: Send + 'static` 由返回值
+    /// （ProcessInstance / Vec<ProcessTask> / Json）满足。
+    pub fn in_tx<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> JeeflowResult<T> + Send,
+    ) -> JeeflowResult<T> {
+        match &self.ctx.transaction_template {
+            Some(tpl) => {
+                let action: Box<
+                    dyn FnOnce() -> JeeflowResult<Box<dyn std::any::Any + Send>> + Send + '_,
+                > = Box::new(move || f().map(|v| Box::new(v) as Box<dyn std::any::Any + Send>));
+                let out = tpl.execute_in_tx(action)?;
+                out.downcast::<T>().map(|b| *b).map_err(|_| {
+                    JeeflowError::Internal("transaction result downcast failed".to_string())
+                })
+            }
+            None => f(),
+        }
+    }
+
+    /// Async start process instance（签名保留：门面/壳既有 await 调用点不动）。
     pub async fn start_async(&self, define_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<ProcessInstance> {
+        self.in_tx(|| self.start_sync(define_id, operator, args))
+    }
+
+    /// 同步内核（不自行包裹）：供门面复合动作在**动作级 in_tx** 内直调（嵌套 join 免费）。
+    pub fn start_sync(&self, define_id: i64, operator: &str, args: &FlowData)
+        -> JeeflowResult<ProcessInstance> {
+        self.start_common(define_id, operator, args, None)
+    }
+
+    /// 带父实例的同步内核（㉔：`JeeflowEngine` trait sync 面的真实现落点；子流程发起用）。
+    pub fn start_with_parent_sync(&self, define_id: i64, operator: &str, args: &FlowData,
+                                  parent_id: i64, parent_node_name: &str)
+        -> JeeflowResult<ProcessInstance> {
+        self.start_common(define_id, operator, args, Some((parent_id, parent_node_name)))
+    }
+
+    fn start_common(&self, define_id: i64, operator: &str, args: &FlowData,
+                    parent: Option<(i64, &str)>) -> JeeflowResult<ProcessInstance> {
         // 1. Load define (sync)
         let define = self.repo().find_define_by_id(define_id)?
             .ok_or(JeeflowError::DefineNotFound(define_id))?;
@@ -891,8 +939,11 @@ impl JeeflowEngineImpl {
         let title = Self::gen_auto_title(&full_args, &define.display_name);
         full_args.insert_str("autoGenTitle", &title);
 
-        // 4. Create instance
-        let mut instance = ProcessInstance::create(&define, operator, &full_args);
+        // 4. Create instance（parent 形态：子流程发起经 `create_with_parent` 落 parent_id/parent_node_name）
+        let mut instance = match parent {
+            Some((pid, pnn)) => ProcessInstance::create_with_parent(&define, operator, &full_args, pid, pnn),
+            None => ProcessInstance::create(&define, operator, &full_args),
+        };
 
         // 5. Set expire time —— issues/137 A（owner 2026-10-01 拍 **A 案**：实例级 `expire_time`
         //    ＝「定义级表达式的**求值结果**」）：
@@ -971,8 +1022,14 @@ impl JeeflowEngineImpl {
         Ok(exec.process_instance)
     }
 
-    /// Async execute process task.
+    /// Async execute process task（签名保留）。
     pub async fn execute_task_async(&self, task_id: i64, operator: &str, args: &FlowData)
+        -> JeeflowResult<Vec<ProcessTask>> {
+        self.in_tx(|| self.execute_task_sync(task_id, operator, args))
+    }
+
+    /// 同步内核（不自行包裹）。
+    pub fn execute_task_sync(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
         // 1. Load task (sync)
         let task = self.repo().find_task_by_id(task_id)?
@@ -1218,20 +1275,27 @@ impl JeeflowEngineImpl {
         Ok(exec.new_tasks)
     }
 
-    /// Async execute and jump to specific task node.
+    /// Async execute and jump to specific task node（签名保留）。
     pub async fn execute_and_jump_async(&self, task_id: i64, operator: &str,
                                           args: &FlowData, target_name: Option<&str>)
         -> JeeflowResult<Vec<ProcessTask>> {
+        self.in_tx(|| self.execute_and_jump_sync(task_id, operator, args, target_name))
+    }
+
+    /// 同步内核（不自行包裹）：`Some` ⇒ 跳指定节点（submitType=4）；`None` ⇒ 血缘回退（3）。
+    pub fn execute_and_jump_sync(&self, task_id: i64, operator: &str,
+                                 args: &FlowData, target_name: Option<&str>)
+        -> JeeflowResult<Vec<ProcessTask>> {
         match target_name {
-            Some(name) => self.execute_jump_inner(task_id, operator, args, JumpTarget::Node(name)).await,
+            Some(name) => self.execute_jump_inner(task_id, operator, args, JumpTarget::Node(name)),
             // issues/121 P2：target 为空＝血缘版「退回上一步」（submitType=3）。
             // 此前这条分支与「退回发起人」（6）共用 get_first_task_node()，两语义塌成同值（issues/119）。
-            None => self.execute_jump_inner(task_id, operator, args, JumpTarget::RollbackLineage).await,
+            None => self.execute_jump_inner(task_id, operator, args, JumpTarget::RollbackLineage),
         }
     }
 
-    async fn execute_jump_inner(&self, task_id: i64, operator: &str, args: &FlowData,
-                                mode: JumpTarget<'_>) -> JeeflowResult<Vec<ProcessTask>> {
+    fn execute_jump_inner(&self, task_id: i64, operator: &str, args: &FlowData,
+                          mode: JumpTarget<'_>) -> JeeflowResult<Vec<ProcessTask>> {
         // Similar to execute_task_async but jumps to target node
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
@@ -1318,8 +1382,14 @@ impl JeeflowEngineImpl {
         Ok(exec.new_tasks)
     }
 
-    /// Async execute and jump to end (reject).
+    /// Async execute and jump to end (reject)（签名保留）。
     pub async fn execute_and_jump_to_end_async(&self, task_id: i64, operator: &str, args: &FlowData)
+        -> JeeflowResult<Vec<ProcessTask>> {
+        self.in_tx(|| self.execute_and_jump_to_end_sync(task_id, operator, args))
+    }
+
+    /// 同步内核（不自行包裹）。
+    pub fn execute_and_jump_to_end_sync(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
@@ -1392,11 +1462,17 @@ impl JeeflowEngineImpl {
         Ok(Vec::new())
     }
 
-    /// Async execute and jump to first task node (return to initiator).
+    /// Async execute and jump to first task node (return to initiator)（签名保留）。
     pub async fn execute_and_jump_to_first_async(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
+        self.in_tx(|| self.execute_and_jump_to_first_sync(task_id, operator, args))
+    }
+
+    /// 同步内核（不自行包裹）。
+    pub fn execute_and_jump_to_first_sync(&self, task_id: i64, operator: &str, args: &FlowData)
+        -> JeeflowResult<Vec<ProcessTask>> {
         // issues/121 P2：不再借道 execute_and_jump_async(None)——那条现在是血缘回退（3）
-        self.execute_jump_inner(task_id, operator, args, JumpTarget::FirstTaskNode).await
+        self.execute_jump_inner(task_id, operator, args, JumpTarget::FirstTaskNode)
     }
 
     /// 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的 parent_task_id，
