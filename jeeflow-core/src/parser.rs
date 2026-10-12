@@ -286,14 +286,31 @@ impl NodeModel {
         self.prop_str("form")
     }
 
+    /// 顶层优先、`field` 子对象兜底取串（issues/177 R11：候选人双源，形状同 countersign 腿）。
+    fn prop_str_dual(&self, key: &str) -> Option<String> {
+        if let Some(v) = self.prop_str(key) {
+            return Some(v);
+        }
+        if let Some(field_val) = self.properties.get("field") {
+            if let Some(field_obj) = field_val.as_object() {
+                for (k, v) in field_obj {
+                    if k == key {
+                        return v.as_str().map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Candidate users (comma-separated).
     pub fn candidate_users(&self) -> Option<String> {
-        self.prop_str("candidateUsers")
+        self.prop_str_dual("candidateUsers")
     }
 
     /// Candidate groups (comma-separated).
     pub fn candidate_groups(&self) -> Option<String> {
-        self.prop_str("candidateGroups")
+        self.prop_str_dual("candidateGroups")
     }
 
     /// Field permissions (PERMISSION_f_xxx → 1/2/3).
@@ -537,6 +554,46 @@ mod tests {
         let cs = model.get_node("cs").unwrap();
         assert!(cs.is_countersign());
         assert_eq!(cs.countersign_type(), "PARALLEL");
+    }
+
+    #[test]
+    fn test_i177_candidate_keys_dual_source() {
+        // 仅 field 子对象携带两键（旧设计器写入位置）⇒ 修复后能读到
+        let json = r#"{
+            "name": "i177-flow", "displayName": "I177", "type": "approval",
+            "nodes": [
+                {"id": "start", "type": "snaker:start", "text": {"value": "S"}},
+                {"id": "pick", "type": "snaker:task", "text": {"value": "P"},
+                 "properties": {"field": {"candidateUsers": "u1,u2", "candidateGroups": "g1"}}},
+                {"id": "end", "type": "snaker:end", "text": {"value": "E"}}
+            ],
+            "edges": [
+                {"id": "e1", "sourceNodeId": "start", "targetNodeId": "pick"},
+                {"id": "e2", "sourceNodeId": "pick", "targetNodeId": "end"}
+            ]
+        }"#;
+        let model = ModelParser::parse(json).unwrap();
+        let pick = model.get_node("pick").unwrap();
+        assert_eq!(pick.candidate_users(), Some("u1,u2".to_string()));
+        assert_eq!(pick.candidate_groups(), Some("g1".to_string()));
+
+        // 顶层与 field 并存 ⇒ 顶层优先（形状对齐 issues/163）
+        let json2 = r#"{
+            "name": "i177-flow2", "displayName": "I177b", "type": "approval",
+            "nodes": [
+                {"id": "start", "type": "snaker:start", "text": {"value": "S"}},
+                {"id": "pick", "type": "snaker:task", "text": {"value": "P"},
+                 "properties": {"candidateUsers": "top1", "field": {"candidateUsers": "nested1"}}},
+                {"id": "end", "type": "snaker:end", "text": {"value": "E"}}
+            ],
+            "edges": [
+                {"id": "e1", "sourceNodeId": "start", "targetNodeId": "pick"},
+                {"id": "e2", "sourceNodeId": "pick", "targetNodeId": "end"}
+            ]
+        }"#;
+        let model2 = ModelParser::parse(json2).unwrap();
+        let pick2 = model2.get_node("pick").unwrap();
+        assert_eq!(pick2.candidate_users(), Some("top1".to_string()));
     }
 
     #[test]
