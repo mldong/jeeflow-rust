@@ -1023,9 +1023,11 @@ impl JeeflowFacade {
             if let Some(next_op) = flow_data.get("f_nextNodeOperator").cloned() {
                 flow_data.insert("tf_nextNodeOperator".to_string(), next_op);
             }
+            // issues/176：spec 04:60-62——apply 节点由 flow.auto 代执行（operator 列=flow.auto，
+            // 不进发起人已办）；u_* 由发起腿留下、引擎对 flow.auto 跳过注入（对齐 boot2 :317）
             let _ = self
                 .engine
-                .execute_task_sync(task.task_id, &operator, &flow_data)?;
+                .execute_task_sync(task.task_id, "flow.auto", &flow_data)?;
         }
 
         Ok(json!({ "process_instance_id": instance.instance_id }))
@@ -6757,11 +6759,12 @@ mod tests {
         assert_eq!(doing[0].task_name, "task2");
         assert!(doing[0].actor_ids.contains(&"leader".to_string()),
             "task2（发起人审批）参与者应含 leader: {:?}", doing[0].actor_ids);
-        // 已办列表：task1 operator=leader（自办留痕）
+        // 已办列表：task1 留痕主体=flow.auto（R10 · issues/176：门面自动办理腿以 flow.auto
+        // 执行首任务，spec 04:60-62；u_* 仍=发起人 ⇒ 上面 task2 的发起人参与者解析不受影响）
         let done = facade.repo().find_done_tasks(inst_id, &[]).unwrap();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].task_name, "task1");
-        assert_eq!(done[0].actor_id.as_deref(), Some("leader"));
+        assert_eq!(done[0].actor_id.as_deref(), Some("flow.auto"));
     }
 
     // ─── transfer：正向留痕 + 挪待办 ───
@@ -7249,15 +7252,20 @@ mod tests {
     async fn test_i117_done_list_ownership_and_empty_operator() {
         let facade = make_facade();
         let (iid, approve_task) = start_two_step_flow(&facade, "i117-done-flow").await;
-        // 撤回整单：approve 行 Doing→Withdraw(30)，它的 create_user 是发起人 applicant、
-        // operator 空（没被人办过）。旧 `=20` 判据下这行不进集合 → create_user 偏宽被掩盖；
-        // 现 `<>10` 承认经手态，正是它暴露的时刻。
+        // 撤回整单：approve 行 Doing→Withdraw(30)。R10（issues/176）起该行在 AUTO 腿创建 ⇒
+        // create_user=flow.auto；发起人视角的 create_user 诱饵改挂 apply 行（start 腿创建 ⇒
+        // create_user=applicant 而 operator=flow.auto）——"我发起但非我办理"的实证形态。
+        // 旧 `=20` 判据下撤回行不进集合 → create_user 偏宽被掩盖；现 `<>10` 承认经手态。
         let w = args_of(vec![("id", json!(iid.to_string())), ("operator", json!("applicant"))]);
         assert_eq!(facade.flow("processInstance/withdraw", &w).await["code"], 0);
         let withdrawn = facade.repo().find_task_by_id(approve_task).unwrap().unwrap();
         assert_eq!(withdrawn.task_state, 30, "前置核对：撤回行应为 30");
-        assert_eq!(withdrawn.create_user.as_deref(), Some("applicant"),
-            "前置核对：该行创建人是发起人（诱饵成立）");
+        assert_eq!(withdrawn.create_user.as_deref(), Some("flow.auto"),
+            "前置核对：R10 起 AUTO 腿创建的行 create_user=flow.auto");
+        let apply_decoy = facade.repo().find_history_tasks(iid).unwrap()
+            .into_iter().find(|t| t.task_name == "apply").expect("应有 apply 行");
+        assert_eq!(apply_decoy.create_user.as_deref(), Some("applicant"),
+            "前置核对：apply 行创建人是发起人（诱饵成立：create_user=applicant 而 operator=flow.auto）");
 
         // ① operator 为空 → 空页（不得返回全库已办）
         assert!(done_list_ids(&facade, None).await.is_empty(),
@@ -7265,17 +7273,20 @@ mod tests {
         assert!(done_list_ids(&facade, Some("   ")).await.is_empty(),
             "operator 全空白同空值");
 
-        // ② 发起人不得因 create_user 沾上他从没办过的 approve 行
+        // ② 发起人不得因 create_user 沾上他从没办过的行（过滤列是 operator，不是 create_user）
         let applicant_rows = done_list_ids(&facade, Some("applicant")).await;
         assert!(!applicant_rows.contains(&approve_task.to_string()),
             "「我发起但非我办理」不得进我的已办（契约 §2.5 点名禁止 create_user 偏宽）：{:?}",
             applicant_rows);
+        assert!(!applicant_rows.contains(&apply_decoy.task_id.to_string()),
+            "R10 起 apply 行 operator=flow.auto，即便 create_user=发起人也不得冒入其已办：{:?}",
+            applicant_rows);
 
-        // ③ 正向对照：applicant 真正办结的 apply 行必须在他的已办里（防恒空假绿）
-        let apply_task = facade.repo().find_history_tasks(iid).unwrap()
-            .into_iter().find(|t| t.task_name == "apply").expect("应有 apply 行");
-        assert!(applicant_rows.contains(&apply_task.task_id.to_string()),
-            "已办结的 apply 行应在 applicant 已办里：{:?}", applicant_rows);
+        // ③ 对照（R10 · issues/176 改锚）：apply 行改由 flow.auto 代执行（spec 04:60-62）
+        // ⇒ 不进发起人已办；"数据真的在"改由 flow.auto 档证明（否则两侧都空是自等假绿）
+        let auto_rows = done_list_ids(&facade, Some("flow.auto")).await;
+        assert!(auto_rows.contains(&apply_decoy.task_id.to_string()),
+            "apply 留痕应挂 flow.auto 档可查（行仍在，非没建行）：{:?}", auto_rows);
     }
 
     /// issues/120：门面 `NOW()` 占位符与写库审计列必须是**同一个时钟出口**。
