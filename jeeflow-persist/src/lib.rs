@@ -220,14 +220,24 @@ pub trait DynamicTableWriter: Send + Sync {
     }
 
     /// Fill system fields (create_time, update_time, create_user, etc.)
+    ///
+    /// issues/176 二轮：用户列对齐 Java/Go（issues/19 语义）——**优先取行内已注入的
+    /// `apply_user_id`**（＝实例发起人，由 `fill_context` 注入，先于本方法调用），否则回落传参
+    /// `operator`。salvo L2-07 实锤：自动办理腿传 `"flow.auto"` 直写用户列，`bigint` 列报
+    /// `1366 Incorrect integer value: 'flow.auto'`（Java `JdbcDynamicTableWriter:228-232`、
+    /// Go `resolveDefaultUser` 同判）。
     fn fill_system_fields(&self, data: &mut HashMap<String, JsonValue>, operator: &str, is_insert: bool) {
+        let user_value = data
+            .get("apply_user_id")
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Str(operator.to_string()));
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         if is_insert {
             data.insert("create_time".to_string(), JsonValue::Str(now.clone()));
-            data.insert("create_user".to_string(), JsonValue::Str(operator.to_string()));
+            data.insert("create_user".to_string(), user_value.clone());
         }
         data.insert("update_time".to_string(), JsonValue::Str(now));
-        data.insert("update_user".to_string(), JsonValue::Str(operator.to_string()));
+        data.insert("update_user".to_string(), user_value);
     }
 }
 
@@ -946,7 +956,11 @@ mod tests {
         assert_eq!(row.get("contact_name").and_then(|v| v.as_str()), Some("NewBob"));
         assert_eq!(row.get("comment").and_then(|v| v.as_str()), Some("同意"));
         assert_eq!(row.get("create_user").and_then(|v| v.as_str()), Some("user1"), "update 只填 update 组");
-        assert_eq!(row.get("update_user").and_then(|v| v.as_str()), Some("user2"));
+        // issues/19（R10 二轮再核）：用户列**两腿都偏好 apply_user_id**（＝实例发起人），
+        // 不落执行腿操作人——java `JdbcDynamicTableWriter:211-234` resolveDefaultUser 两处均用；
+        // go `writer.go:409-444` 同形（其 TestFillSystemFields 以 apply_user_id=123 断言两列均取 123）；
+        // node `persist.ts:201-204` 同形。exec=user2 只是"create 组不被 update 重写"的对照面。
+        assert_eq!(row.get("update_user").and_then(|v| v.as_str()), Some("user1"));
     }
 
     /// P3：ARCHIVE 仅「结束节点 + FINISHED(20) + submitType=1(同意)」落库一次；
@@ -1148,6 +1162,31 @@ mod tests {
         assert!(data.contains_key("update_time"));
         assert!(data.contains_key("update_user"));
         assert_eq!(data.get("update_user").and_then(|v| v.as_str()), Some("user2"));
+    }
+
+    /// issues/176 二轮：用户列优先取行内 `apply_user_id`（＝实例发起人），缺键回落传参 operator。
+    #[test]
+    fn test_fill_system_fields_prefers_apply_user_id_176() {
+        let writer = InMemoryTableWriter::new();
+
+        // 自动办理腿形状：operator="flow.auto" + 行内 apply_user_id=真实发起人
+        let mut data = HashMap::new();
+        data.insert("apply_user_id".to_string(), JsonValue::Str("10086".to_string()));
+        writer.fill_system_fields(&mut data, "flow.auto", true);
+        assert_eq!(data.get("create_user").and_then(|v| v.as_str()), Some("10086"));
+        assert_eq!(data.get("update_user").and_then(|v| v.as_str()), Some("10086"));
+
+        // update 腿同判
+        let mut data2 = HashMap::new();
+        data2.insert("apply_user_id".to_string(), JsonValue::Str("10086".to_string()));
+        writer.fill_system_fields(&mut data2, "flow.auto", false);
+        assert_eq!(data2.get("update_user").and_then(|v| v.as_str()), Some("10086"));
+
+        // 行内缺键档：回落 operator 原语义
+        let mut data3 = HashMap::new();
+        writer.fill_system_fields(&mut data3, "user7", true);
+        assert_eq!(data3.get("create_user").and_then(|v| v.as_str()), Some("user7"));
+        assert_eq!(data3.get("update_user").and_then(|v| v.as_str()), Some("user7"));
     }
 
     // ─── IDynamicMetaProvider tests ───

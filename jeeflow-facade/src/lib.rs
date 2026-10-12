@@ -1010,6 +1010,16 @@ impl JeeflowFacade {
         // Start instance（同步内核：本动作已在 flow() 的动作级 in_tx 内）
         let instance = self.engine.start_sync(define_id, &operator, &flow_data)?;
 
+        // issues/176 二轮：boot2 `ProcessInstanceServiceImpl:153` `FlowUtil.addUserInfoToArgs`
+        // **原地改**发起 args、`:317` 自动腿**复用同一份 args** ⇒ apply 行变量带 u_*（L2-43 锚①）。
+        // 本栈引擎按复制语义注入（`start_common` 里 `full_args.merge(args)` 后注入，不动调用方），
+        // 此处把引擎注入的七键并回，让自动腿 payload 与 boot2 那份 args 同形。
+        for key in ["u_userId", "u_realName", "u_deptId", "u_deptName", "u_postId", "u_postName", "autoGenTitle"] {
+            if let Some(v) = instance.variables.get(key) {
+                flow_data.insert(key.to_string(), v.clone());
+            }
+        }
+
         // 对齐 Java/boot2：自动完成申请节点（assignee=applicant → 发起人）
         let tasks = self.repo.find_doing_tasks(instance.instance_id, &[])?;
         for task in &tasks {
@@ -6765,6 +6775,65 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].task_name, "task1");
         assert_eq!(done[0].actor_id.as_deref(), Some("flow.auto"));
+    }
+
+    // ─── issues/176 二轮：自动办理腿 payload 带 u_*（对齐 boot2 原地注入后复用）───
+
+    /// boot2 `ProcessInstanceServiceImpl:153` `FlowUtil.addUserInfoToArgs` **原地改**发起 args、
+    /// `:317` 自动腿**复用同一份 args** ⇒ apply 行变量带 u_userId/u_realName/…（L2-43 锚①）。
+    /// 本栈引擎按复制语义注入（`start_common` 里 `full_args.merge(args)` 后注入，不动调用方），
+    /// 门面在自动腿之前把引擎注入的七键并回 flow_data。
+    /// 变异对照：去掉并回循环 ⇒ `u_userId=None` 本测试红（L2-43 红样即此形状）。
+    #[tokio::test]
+    async fn test_i176b_auto_leg_keeps_initiator_u_vars_on_apply_row() {
+        let facade = make_facade_with_user_provider();
+        let mut a1 = HashMap::new();
+        a1.insert("name".to_string(), json!("i176b-uvar-flow"));
+        a1.insert("displayName".to_string(), json!("i176b-uvar-flow"));
+        let r1 = facade.flow("processDesign/save", &a1).await;
+        assert_eq!(r1["code"], 0, "save failed: {:?}", r1);
+        let design_id = r1["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        let content = r#"{
+            "name":"i176b-uvar-flow","displayName":"i176b-uvar-flow","type":"approval",
+            "nodes":[
+                {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                {"id":"apply","type":"snaker:task","text":{"value":"Apply"},"properties":{"assignee":"applicant"}},
+                {"id":"approve","type":"snaker:task","text":{"value":"Approve"},"properties":{"assignee":"user2"}},
+                {"id":"end","type":"snaker:end","text":{"value":"End"}}
+            ],
+            "edges":[
+                {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                {"id":"e2","sourceNodeId":"apply","targetNodeId":"approve"},
+                {"id":"e3","sourceNodeId":"approve","targetNodeId":"end"}
+            ]
+        }"#;
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(design_id));
+        a2.insert("content".to_string(), json!(content));
+        assert_eq!(facade.flow("processDesign/updateDefine", &a2).await["code"], 0);
+        let mut a3 = HashMap::new();
+        a3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &a3).await["code"], 0);
+
+        let mut a4 = HashMap::new();
+        a4.insert("name".to_string(), json!("i176b-uvar-flow"));
+        a4.insert("operator".to_string(), json!("applicant"));
+        let r4 = facade.flow("processDefine/startAndExecute", &a4).await;
+        assert_eq!(r4["code"], 0, "start failed: {:?}", r4);
+        let inst_id: i64 = r4["data"]["processInstanceId"].as_str().unwrap().parse().unwrap();
+
+        let done = facade.repo().find_done_tasks(inst_id, &[]).unwrap();
+        let apply = done.iter().find(|t| t.task_name == "apply")
+            .expect("apply done task missing");
+        // 办理主体＝flow.auto（R10 本体）；变量里 u_*＝真实发起人（本卡二轮修复）
+        assert_eq!(apply.actor_id.as_deref(), Some("flow.auto"));
+        assert_eq!(apply.variables.get_str("u_userId"), Some("applicant"),
+            "apply 行变量应带发起人 u_userId（boot2 原地注入复用语义）; vars={:?}", apply.variables);
+        assert_eq!(apply.variables.get_str("u_realName"), Some("applicant"),
+            "apply 行变量应带 u_realName; vars={:?}", apply.variables);
+        assert!(apply.variables.get("autoGenTitle").is_some(),
+            "autoGenTitle 应随并回; vars={:?}", apply.variables);
     }
 
     // ─── transfer：正向留痕 + 挪待办 ───
