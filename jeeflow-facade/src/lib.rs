@@ -649,10 +649,27 @@ fn design_his_to_json(h: &ProcessDesignHis) -> Json {
 }
 
 fn candidate_row(actor_id: &str, real_name: &str, extra: Option<&Json>) -> Json {
-    let mut row = json!({
-        "id": actor_id,
-        "realName": if real_name.is_empty() { actor_id } else { real_name },
-    });
+    // issues/178 R12（spec 06:722）：id 三级回落 src.id → src.userId（user_id）→ actorId，
+    // 一律字符串化；realName 缺省回落 id。修前 id 恒 actor_id ⇒ provider 行真主键被丢，
+    // 前端 valueField='id' 落到候选配置字面量而非用户主键（C6-L3 乙-2／L2-丙-1 终局＝两栈）。
+    let mut id = actor_id.to_string();
+    if let Some(Json::Object(src)) = extra {
+        if let Some(v) = src
+            .get("id")
+            .or_else(|| src.get("userId"))
+            .or_else(|| src.get("user_id"))
+        {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    id = s.to_string();
+                }
+            } else if let Some(n) = v.as_i64() {
+                id = n.to_string();
+            }
+        }
+    }
+    let rn = if real_name.is_empty() { id.clone() } else { real_name.to_string() };
+    let mut row = json!({ "id": id, "realName": rn });
     if let Some(Json::Object(src)) = extra {
         if let Some(obj) = row.as_object_mut() {
             if let Some(v) = src.get("userId").or_else(|| src.get("user_id")) {
@@ -1751,6 +1768,9 @@ impl JeeflowFacade {
         };
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = arg_str(args, "operator");
+        // issues/178 R12（spec 06:729「query 透传 m_* 条件」）：搜索腿此前只带
+        // pageNum/pageSize/operator，m_* 条件整批丢（C99 未记、R12 现读新发现并入）。
+        query.filters = parse_m_params(args);
         let page = usp.page(&query)?;
         let rows: Vec<Json> = page
             .rows
@@ -4601,6 +4621,123 @@ mod tests {
         );
         let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
         assert!(ids.contains(&"user2") && ids.len() > 1, "应含 assignee 之外的候选: {:?}", ids);
+    }
+
+    // ─── issues/178 R12：candidate_row id 三级回落（spec 06:722）＋搜索腿 m_* 透传 ───
+    #[test]
+    fn test_i178_candidate_row_id_fallback() {
+        // 档①：extra.src.id 存在 ⇒ id 取 src.id（修前恒 actor_id，provider 真主键被丢）
+        let src = json!({"id": "u9", "realName": "张三"});
+        let row = candidate_row("18001", "张三", Some(&src));
+        assert_eq!(row["id"], "u9", "id 应取 src.id（修前恒 actor_id）: {:?}", row);
+        // 档②：无 id 有 userId ⇒ 回落 userId
+        let src2 = json!({"userId": "18002", "realName": "李四"});
+        let row2 = candidate_row("18001", "李四", Some(&src2));
+        assert_eq!(row2["id"], "18002", "id 应回落 src.userId: {:?}", row2);
+        // 档③：双无 ⇒ actorId；realName 缺省回落归一后 id
+        let row3 = candidate_row("18001", "", None);
+        assert_eq!(row3["id"], "18001");
+        assert_eq!(row3["realName"], "18001", "realName 缺省回落归一后 id");
+        // 数字主键字符串化（spec「字符串化」档）
+        let src4 = json!({"id": 18003});
+        let row4 = candidate_row("18001", "x", Some(&src4));
+        assert_eq!(row4["id"], "18003");
+    }
+
+    struct CaptureSearchProvider {
+        got: std::sync::Mutex<Option<(i64, i64, usize, String)>>,
+    }
+
+    impl UserSearchProvider for CaptureSearchProvider {
+        fn page(&self, query: &PageQuery) -> JeeflowResult<PageResult<HashMap<String, JsonValue>>> {
+            let first = query
+                .filters
+                .first()
+                .map(|f| format!("{}|{}|{}", f.alias, f.column, f.value))
+                .unwrap_or_default();
+            *self.got.lock().unwrap() =
+                Some((query.page_num, query.page_size, query.filters.len(), first));
+            Ok(PageResult::new(query.page_num, query.page_size, 0, Vec::new()))
+        }
+        fn find_by_id(&self, _user_id: &str) -> JeeflowResult<Option<HashMap<String, JsonValue>>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_i178_search_leg_passes_page_and_m_filters() {
+        // 搜索腿透传：pageNum/pageSize/m_* 全到达 provider（修前 filters 整批丢——C99 未记、
+        // R12 现读新发现；spec 06:729「query 透传 m_* 条件」）
+        let cap = Arc::new(CaptureSearchProvider { got: std::sync::Mutex::new(None) });
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_ext_repository(repo.clone() as Arc<dyn ProcessExtRepository>)
+            .with_user_provider(Arc::new(TestUserProvider))
+            .with_user_search_provider(cap.clone() as Arc<dyn UserSearchProvider>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(100000)));
+        let facade = JeeflowFacade::new(ctx);
+
+        let mut args = HashMap::new();
+        args.insert("name".to_string(), json!("i178-flow"));
+        args.insert("displayName".to_string(), json!("I178 Flow"));
+        let resp = facade.flow("processDesign/save", &args).await;
+        assert_eq!(resp["code"], 0, "save failed: {:?}", resp);
+        let design_id = resp["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        // t2 仅 assignee 无 candidateUsers ⇒ candidatePage(t1) 落搜索腿（同 4534 s15 夹具）
+        let flow_json = r#"{
+            "name":"i178-flow","displayName":"I178 Flow","type":"approval",
+            "nodes":[
+                {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                {"id":"apply","type":"snaker:task","text":{"value":"Apply"},
+                 "properties":{"assignee":"applicant"}},
+                {"id":"t1","type":"snaker:task","text":{"value":"T1"},
+                 "properties":{"assignee":"user1"}},
+                {"id":"t2","type":"snaker:task","text":{"value":"T2"},
+                 "properties":{"assignee":"user2"}},
+                {"id":"end","type":"snaker:end","text":{"value":"End"}}
+            ],
+            "edges":[
+                {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                {"id":"e2","sourceNodeId":"apply","targetNodeId":"t1"},
+                {"id":"e3","sourceNodeId":"t1","targetNodeId":"t2"},
+                {"id":"e4","sourceNodeId":"t2","targetNodeId":"end"}
+            ]
+        }"#;
+        let mut args2 = HashMap::new();
+        args2.insert("id".to_string(), json!(design_id));
+        args2.insert("content".to_string(), json!(flow_json));
+        assert_eq!(facade.flow("processDesign/updateDefine", &args2).await["code"], 0);
+        let mut args3 = HashMap::new();
+        args3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &args3).await["code"], 0);
+
+        let mut args4 = HashMap::new();
+        args4.insert("name".to_string(), json!("i178-flow"));
+        args4.insert("operator".to_string(), json!("applicant"));
+        assert_eq!(facade.flow("processDefine/startAndExecute", &args4).await["code"], 0);
+
+        let mut args5 = HashMap::new();
+        args5.insert("operator".to_string(), json!("user1"));
+        let resp5 = facade.flow("processTask/todoList", &args5).await;
+        let rows5 = resp5["data"]["rows"].as_array().unwrap();
+        assert_eq!(rows5.len(), 1, "user1 待办应为 t1: {:?}", rows5);
+        let task_id: i64 = rows5[0]["id"].as_str().unwrap().parse().unwrap();
+
+        let mut args6 = HashMap::new();
+        args6.insert("processTaskId".to_string(), json!(task_id));
+        args6.insert("pageNum".to_string(), json!(2));
+        args6.insert("pageSize".to_string(), json!(5));
+        args6.insert("m_LIKE_realName".to_string(), json!("user"));
+        let resp6 = facade.flow("processTask/candidatePage", &args6).await;
+        assert_eq!(resp6["code"], 0, "candidatePage failed: {:?}", resp6);
+
+        let got = cap.got.lock().unwrap().clone().expect("搜索腿未到达 provider");
+        assert_eq!(got.0, 2, "pageNum 应透传: {:?}", got);
+        assert_eq!(got.1, 5, "pageSize 应透传: {:?}", got);
+        assert_eq!(got.2, 1, "m_ 过滤条数应=1（修前 0）: {:?}", got);
+        assert_eq!(got.3, "t|real_name|user", "m_ 条件应解析为 t/real_name/user: {:?}", got);
     }
 
     // ─── s15 回归②：tf_nextNodeOperator 数组形态必须生效（对齐 Python _resolve_actors）───
