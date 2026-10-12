@@ -261,13 +261,13 @@ impl ProcessInstance {
         Ok(())
     }
 
-    /// Abandon a single task.
+    /// Abandon a single task (task-level only; instance state untouched —
+    /// issues/180, aligned with spec 04 and go/py/node).
     pub fn abandon_task(&mut self, task_id: i64, _operator: &str) -> Result<(), String> {
         let task = self.tasks.iter_mut()
             .find(|t| t.task_id == task_id)
             .ok_or_else(|| format!("Task {} not found", task_id))?;
         task.abandon()?;
-        self.state = InstanceState::Abandon.code();
         Ok(())
     }
 
@@ -1713,5 +1713,40 @@ mod tests {
             if one.is_empty() { continue; }
             assert_eq!(got, v(&[one]), "{not_blank:?} 不该被判成空值");
         }
+    }
+
+    // ═══ issues/180：abandon_task 仅废任务，不连带实例 state ═══
+
+    /// 正向：任务落 99、实例 state 仍 10（改前被连带置 99——对齐 spec 04 与 go/py/node）。
+    #[test]
+    fn test_i180_abandon_task_keeps_instance_state() {
+        let mut inst = wd134_doing_instance();
+        inst.tasks[0].task_id = 9527;
+        inst.abandon_task(9527, "user9").unwrap();
+        assert_eq!(inst.tasks[0].task_state, TaskState::Abandon.code(), "任务应落 99");
+        assert_eq!(inst.state, InstanceState::Doing.code(),
+            "实例 state 不得被连带置 99（issues/180：对齐 spec 04 与 go/py/node）");
+    }
+
+    /// 负向：任务不在聚合内照旧 Err（既有形状不变），实例态不动。
+    #[test]
+    fn test_i180_abandon_missing_task_errs_without_touching_state() {
+        let mut inst = wd134_doing_instance();
+        assert!(inst.abandon_task(88888, "user9").is_err(), "任务不在聚合内应报错");
+        assert_eq!(inst.state, InstanceState::Doing.code());
+    }
+
+    /// 回归：只废目标任务，其余行不动。
+    #[test]
+    fn test_i180_abandon_leaves_other_rows_untouched() {
+        let mut inst = wd134_doing_instance();
+        inst.tasks[0].task_id = 1;
+        inst.create_task("task2", "审批2", &["leader".to_string()], "zhangsan",
+                         TaskType::Major, PerformType::Normal, None, None);
+        inst.tasks[1].task_id = 2;
+        inst.abandon_task(1, "user9").unwrap();
+        assert_eq!(inst.tasks[0].task_state, TaskState::Abandon.code());
+        assert_eq!(inst.tasks[1].task_state, TaskState::Doing.code(), "其余任务行不得被波及");
+        assert_eq!(inst.state, InstanceState::Doing.code());
     }
 }
