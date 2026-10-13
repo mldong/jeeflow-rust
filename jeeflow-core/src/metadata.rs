@@ -190,8 +190,8 @@ impl HandlerRegistry {
         // Default ActionPermissionProvider
         self.handlers.push(HandlerMeta {
             handler_type: "ActionPermissionProvider".into(),
-            class_name: "com.mldong.jeeflow.spi.impl.DefaultActionPermissionProvider".into(),
-            display_name: "默认权限码提供者".into(),
+            class_name: "com.mldong.jeeflow.spi.DefaultActionPermissionProvider".into(),
+            display_name: "action 权限码默认映射（boot3 注解语义归纳）".into(),
             order: 0,
             group: "built-in".into(),
         });
@@ -308,6 +308,17 @@ mod tests {
         let types = reg.list_handler_types();
         assert!(types.contains(&"AssignmentHandler".to_string()));
         assert!(types.contains(&"ActionPermissionProvider".to_string()));
+    }
+
+    #[test]
+    fn test_i184_action_permission_entry_matches_reference() {
+        let reg = HandlerRegistry::new();
+        let handlers = reg.list_handlers("ActionPermissionProvider");
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].class_name, "com.mldong.jeeflow.spi.DefaultActionPermissionProvider");
+        assert!(!handlers[0].class_name.contains(".impl."));
+        assert_eq!(handlers[0].display_name, "action 权限码默认映射（boot3 注解语义归纳）");
+        assert_eq!(handlers[0].order, 0);
     }
 
     #[test]
