@@ -313,13 +313,22 @@ impl NodeModel {
         self.prop_str_dual("candidateGroups")
     }
 
-    /// Field permissions (PERMISSION_f_xxx → 1/2/3).
+    /// Field permissions (`properties.field` 的 `PERMISSION_*` → 1/2/3；issues/183).
+    ///
+    /// 原料位置＝`properties.field` 子对象——与 persist 写侧 `resolve_field_permission`
+    /// （jeeflow-persist/src/lib.rs:466）、java TaskParser（`properties.field` 灌 `TaskModel.ext`，
+    /// TaskParser.java:52-56）与 moon `node_field_permissions` 同一处 JSON 位置。
+    /// 旧读法读的是顶层 `properties`（且零调用）——真实样本 `flows/01-simple.json` 的
+    /// `PERMISSION_*` 全在 field 子对象 ⇒ 读了也是空 map、过滤空转。
+    /// 值语义对齐 java `FlowUtil.toInt`：数字/数字串取整，解析不出＝-1（"其他"档，放行）。
     pub fn field_permissions(&self) -> HashMap<String, i32> {
         let mut perms = HashMap::new();
-        for (k, v) in &self.properties {
-            if k.starts_with("PERMISSION_") {
-                if let Some(val) = v.as_i64() {
-                    perms.insert(k.clone(), val as i32);
+        if let Some(field_val) = self.properties.get("field") {
+            if let Some(field_obj) = field_val.as_object() {
+                for (k, v) in field_obj {
+                    if k.starts_with("PERMISSION_") {
+                        perms.insert(k.clone(), v.as_i64().unwrap_or(-1) as i32);
+                    }
                 }
             }
         }
@@ -471,6 +480,33 @@ impl ModelParser {
 mod tests {
     use super::*;
     use std::error::Error as _;
+
+    /// issues/183（audit8 R17）：字段权限原料在 `properties.field` 子对象（真实样本
+    /// flows/01-simple.json 形状；persist `resolve_field_permission` 同款读法）——顶层
+    /// `PERMISSION_*` 不认（java TaskParser 只把 field 子对象灌进 `TaskModel.ext`）；
+    /// 值语义对齐 java `toInt`：数字/数字串取整、解析不出＝-1（"其他"档放行）。
+    #[test]
+    fn test_i183_field_permissions_reads_properties_field() {
+        let mut props: HashMap<String, JsonValue> = HashMap::new();
+        // 顶层 PERMISSION_ 键：不得收（对 java TaskModel.ext 形状——只灌 properties.field）
+        props.insert("PERMISSION_top".to_string(), JsonValue::Number(1.0));
+        props.insert("field".to_string(), JsonValue::Object(vec![
+            ("PERMISSION_f_a".to_string(), JsonValue::Number(1.0)),
+            ("PERMISSION_b".to_string(), JsonValue::Str("2".to_string())),
+            ("PERMISSION_c".to_string(), JsonValue::Str("junk".to_string())),
+            ("OTHER_key".to_string(), JsonValue::Number(1.0)),
+        ]));
+        let node = NodeModel {
+            id: "n1".into(), node_type: NodeType::Task,
+            display_name: "N1".into(), properties: props,
+        };
+        let perms = node.field_permissions();
+        assert_eq!(perms.len(), 3, "只收 field 子对象的 PERMISSION_* 键");
+        assert_eq!(perms.get("PERMISSION_f_a"), Some(&1));   // 数字
+        assert_eq!(perms.get("PERMISSION_b"), Some(&2));     // 数字串（java toInt 语义）
+        assert_eq!(perms.get("PERMISSION_c"), Some(&-1));    // 解析不出＝-1（放行档）
+        assert!(perms.get("PERMISSION_top").is_none(), "顶层键不认（java 只灌 properties.field）");
+    }
 
     #[test]
     fn test_parse_simple_flow() {

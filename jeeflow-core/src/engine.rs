@@ -1054,8 +1054,12 @@ impl JeeflowEngineImpl {
         // resume 语义对齐 Go mergeVars(args, inst.Variables)：以实例已持久化变量为底、
         // 本次提交覆盖。否则发起时的 f_* 表单字段（如指定审批人 f_approver）在 resume 后
         // 丢失，FormFieldAssigneeHandler 等下游读 exec.args 拿不到（L3 S11-B）。
+        // issues/183（audit8 R17）：本次提交先过**入口**字段权限过滤再入变量——只读/隐藏
+        // f_ 字段被剔除后既进不了实例变量（complete_task 的 f_ 合并）也进不了 exec.args，
+        // 下游未声明该字段权限的节点无从把它写进业务表（java 同位 JeeflowEngineImpl.java:264）。
+        let task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
         let mut full_args = instance.variables.clone();
-        full_args.merge(args);
+        full_args.merge(&task_args);
         self.add_user_info(&mut full_args, operator);
 
         // 5. Permission check
@@ -1073,9 +1077,9 @@ impl JeeflowEngineImpl {
         }
 
         // 6. Complete task in aggregate.
-        // 传本次提交原始 args（非合并后的 full_args）：契约 spec/06 §4.3 第 5 条要求
+        // 传本次提交 args（已过入口过滤；非合并后的 full_args）：契约 spec/06 §4.3 第 5 条要求
         // 任务变量按「既有变量 ← args」合并，args 最高，full_args 含实例全量变量会污染任务变量。
-        instance.complete_task(task_id, operator, args).map_err(|e| JeeflowError::Business(e))?;
+        instance.complete_task(task_id, operator, &task_args).map_err(|e| JeeflowError::Business(e))?;
 
         // 6.5. Set countersignDisagreeFlag on the completed task's variables too
         if submit_type == Some(20) {
@@ -1310,8 +1314,10 @@ impl JeeflowEngineImpl {
 
         // resume 语义对齐 Go mergeVars(args, inst.Variables)：实例已持久化变量为底、
         // 本次提交覆盖（详见 execute_task_async 注释，L3 S11-B）。
+        // issues/183（audit8 R17）：同 execute_task_sync 的入口字段权限过滤（java 同位 :264）。
+        let task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
         let mut full_args = instance.variables.clone();
-        full_args.merge(args);
+        full_args.merge(&task_args);
         self.add_user_info(&mut full_args, operator);
 
         if !task.is_allowed(operator) {
@@ -1327,7 +1333,7 @@ impl JeeflowEngineImpl {
             full_args.insert_str("countersignDisagreeFlag", "1");
         }
 
-        instance.complete_task(task_id, operator, args).map_err(|e| JeeflowError::Business(e))?;
+        instance.complete_task(task_id, operator, &task_args).map_err(|e| JeeflowError::Business(e))?;
         // Set flag on completed task's variables
         if submit_type == Some(20) {
             if let Some(t) = instance.tasks.iter_mut().find(|t| t.task_id == task_id) {
@@ -1398,12 +1404,17 @@ impl JeeflowEngineImpl {
             .ok_or(JeeflowError::InstanceNotFound(task.process_instance_id))?;
         instance.tasks = self.repo().find_history_tasks(instance.instance_id)?;
 
-        let _define = self.repo().find_define_by_id(instance.define_id)?
+        let define = self.repo().find_define_by_id(instance.define_id)?
             .ok_or(JeeflowError::DefineNotFound(instance.define_id))?;
+        // issues/183（audit8 R17）：本入口原不解析 model（`let _define` 丢弃）；入口字段权限
+        // 过滤需要当前节点的 `properties.field`，补解析（对齐 java 该入口也走 prepareExecution 的形状）。
+        let model = ModelParser::parse(&define.content_str())?;
 
         // resume 语义对齐 Go mergeVars（同 execute_task_async，三路径保持一致）。
+        // issues/183（audit8 R17）：同 execute_task_sync 的入口字段权限过滤（java 同位 :264）。
+        let task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
         let mut full_args = instance.variables.clone();
-        full_args.merge(args);
+        full_args.merge(&task_args);
         self.add_user_info(&mut full_args, operator);
 
         if !task.is_allowed(operator) {
@@ -1419,7 +1430,7 @@ impl JeeflowEngineImpl {
             full_args.insert_str("countersignDisagreeFlag", "1");
         }
 
-        instance.complete_task(task_id, operator, args).map_err(|e| JeeflowError::Business(e))?;
+        instance.complete_task(task_id, operator, &task_args).map_err(|e| JeeflowError::Business(e))?;
         // Set flag on completed task's variables
         if submit_type == Some(20) {
             if let Some(t) = instance.tasks.iter_mut().find(|t| t.task_id == task_id) {
@@ -4023,6 +4034,136 @@ mod tests {
                 "实例列与任务级共用的那枚求值器相差 {drift}s（期望 ≤2s，只是取整秒的 tick）\
                  ⇒ 差得多＝落库那一路另起了第二把尺子");
         }
+    }
+
+    // ── issues/183 · 入口字段权限过滤（跨节点绕过）──
+
+    /// 夹具：start → apply(applicant) → approve(leader；声明 f_amount 只读／f_note 可编辑)
+    /// → task2(boss；无声明) → end。**三节点流**（两节点夹具恒真——150 §5 口径）。
+    fn i183_flow_json() -> String {
+        r#"{
+            "name": "i183-entry-perm",
+            "displayName": "入口字段权限(183夹具)",
+            "type": "approval",
+            "nodes": [
+                {"id": "start", "type": "snaker:start", "text": {"value": "开始"}},
+                {"id": "apply", "type": "snaker:task", "text": {"value": "发起申请"},
+                 "properties": {"assignee": "applicant", "performType": 0}},
+                {"id": "approve", "type": "snaker:task", "text": {"value": "审批"},
+                 "properties": {"assignee": "leader", "performType": 0,
+                                "field": {"PERMISSION_f_amount": 1, "PERMISSION_f_note": 2}}},
+                {"id": "task2", "type": "snaker:task", "text": {"value": "归档确认"},
+                 "properties": {"assignee": "boss", "performType": 0}},
+                {"id": "end", "type": "snaker:end", "text": {"value": "结束"}}
+            ],
+            "edges": [
+                {"id": "e0", "sourceNodeId": "start", "targetNodeId": "apply"},
+                {"id": "e1", "sourceNodeId": "apply", "targetNodeId": "approve"},
+                {"id": "e2", "sourceNodeId": "approve", "targetNodeId": "task2"},
+                {"id": "e3", "sourceNodeId": "task2", "targetNodeId": "end"}
+            ]
+        }"#.to_string()
+    }
+
+    /// 核心格（issues/183／audit8 R17）：只读字段在声明节点提交的新值**不入实例变量**
+    /// （入口过滤在 complete_task 之前），下游无声明节点推进后仍不回流（跨节点绕过被堵）；
+    /// 可编辑字段照常更新；无声明节点（apply）缺省放行。
+    /// 阳性对照＝摘接线（变异）时 f_amount 变 "999" ⇒ 本格必红。
+    #[tokio::test]
+    async fn test_i183_entry_perm_filter_blocks_cross_node_bypass() {
+        let (engine, repo) = make_engine();
+        let did = save_define(&repo, "i183-entry-perm", &i183_flow_json());
+
+        // 发起 + apply 办理（apply 无声明 ⇒ f_amount/f_note 正常入变量——缺省放行档）
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+        let apply_task = repo.find_doing_tasks(iid, &[]).unwrap()[0].task_id;
+        let mut apply_args = FlowData::new();
+        apply_args.insert_str("f_amount", "100");
+        apply_args.insert_str("f_note", "初始");
+        engine.execute_task_async(apply_task, "applicant", &apply_args).await.unwrap();
+
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.variables.get_str("f_amount"), Some("100"), "无声明节点缺省放行");
+        assert_eq!(inst.variables.get_str("f_note"), Some("初始"));
+
+        // approve 办理：只读 f_amount=999 被入口过滤；可编辑 f_note 更新
+        let approve_task = repo.find_doing_tasks(iid, &[]).unwrap()[0].task_id;
+        let mut approve_args = FlowData::new();
+        approve_args.insert_str("f_amount", "999");
+        approve_args.insert_str("f_note", "改注释");
+        engine.execute_task_async(approve_task, "leader", &approve_args).await.unwrap();
+
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.variables.get_str("f_amount"), Some("100"),
+            "只读字段的新值不得入实例变量（999 被入口过滤拦下）");
+        assert_eq!(inst.variables.get_str("f_note"), Some("改注释"), "可编辑字段照常更新");
+        let approve_row = repo.find_history_tasks(iid).unwrap().into_iter()
+            .find(|t| t.task_name == "approve").unwrap();
+        assert_eq!(approve_row.variables.get_str("f_amount"), None,
+            "只读字段不得进任务行变量（入口过滤在 complete_task 之前）");
+
+        // task2（无声明）推进 ⇒ 跨节点不回流；实例沿 e3 到 end 办结
+        let t2 = repo.find_doing_tasks(iid, &[]).unwrap()[0].task_id;
+        engine.execute_task_async(t2, "boss", &FlowData::new()).await.unwrap();
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.variables.get_str("f_amount"), Some("100"),
+            "下游无声明节点推进后仍旧不得出现 999（跨节点绕过被堵）");
+        assert_eq!(inst.state, 20, "流程应沿 e3→end 正常办结");
+    }
+
+    /// jump 族入口 ②（issues/183）：`execute_and_jump_sync`→`execute_jump_inner` 是第二处接线
+    /// （指定节点跳转与血缘退回共用同一内核；本格走指定节点跳转）。
+    #[tokio::test]
+    async fn test_i183_entry_perm_filter_on_jump_target() {
+        let (engine, repo) = make_engine();
+        let did = save_define(&repo, "i183-jump-target", &i183_flow_json());
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+        let apply_task = repo.find_doing_tasks(iid, &[]).unwrap()[0].task_id;
+        let mut apply_args = FlowData::new();
+        apply_args.insert_str("f_amount", "100");
+        engine.execute_task_async(apply_task, "applicant", &apply_args).await.unwrap();
+
+        // approve 走「跳转到 task2」入口，提交只读 f_amount=999 ⇒ 必须被拦
+        let approve_task = repo.find_doing_tasks(iid, &[]).unwrap()[0].task_id;
+        let mut args = FlowData::new();
+        args.insert_str("f_amount", "999");
+        args.insert_str("f_note", "跳转注释");
+        engine.execute_and_jump_async(approve_task, "leader", &args, Some("task2")).await.unwrap();
+
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.variables.get_str("f_amount"), Some("100"),
+            "jump 入口的只读字段新值同样必须被入口过滤拦下");
+        assert_eq!(inst.variables.get_str("f_note"), Some("跳转注释"), "可编辑字段照常更新");
+        assert_eq!(repo.find_doing_tasks(iid, &[]).unwrap().len(), 1,
+            "跳转后应恰停在 task2 新任务行（approve 行已办结）");
+    }
+
+    /// jump 族入口 ③（issues/183）：`execute_and_jump_to_end_sync` 是第三处接线——该入口原不解析
+    /// model（`let _define` 丢弃），过滤是新增的补解析接线（对齐 java 该入口也走 prepareExecution）。
+    #[tokio::test]
+    async fn test_i183_entry_perm_filter_on_jump_to_end() {
+        let (engine, repo) = make_engine();
+        let did = save_define(&repo, "i183-jump-end", &i183_flow_json());
+
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+        let apply_task = repo.find_doing_tasks(iid, &[]).unwrap()[0].task_id;
+        let mut apply_args = FlowData::new();
+        apply_args.insert_str("f_amount", "100");
+        engine.execute_task_async(apply_task, "applicant", &apply_args).await.unwrap();
+
+        // approve 走「直接终结」入口，提交只读 f_amount=999 ⇒ 必须被拦
+        let approve_task = repo.find_doing_tasks(iid, &[]).unwrap()[0].task_id;
+        let mut args = FlowData::new();
+        args.insert_str("f_amount", "999");
+        engine.execute_and_jump_to_end_async(approve_task, "leader", &args).await.unwrap();
+
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.variables.get_str("f_amount"), Some("100"),
+            "to_end 入口的只读字段新值同样必须被入口过滤拦下");
     }
 }
 

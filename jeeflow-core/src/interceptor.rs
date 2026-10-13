@@ -5,6 +5,7 @@ use crate::context::ServiceContext;
 use crate::engine::Execution;
 use crate::error::JeeflowResult;
 use crate::json::FlowData;
+use crate::parser::{NodeType, ProcessModel};
 use crate::spi::{AssignmentHandler, OrgUserProvider, UserProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -193,6 +194,33 @@ pub fn filter_fields_by_permission(args: &FlowData, permissions: &HashMap<String
     filtered
 }
 
+/// 办理**入口**的字段权限过滤（spec/09 §4.2 1.8.2；issues/183／audit8 R17）。
+///
+/// java 同位＝`JeeflowEngineImpl.java:264`（`prepareExecution` 内、`completeTask` 之前）
+/// `args = FlowUtil.filterFieldByPerm(args, model, task.getTaskName())`；
+/// moon 判例＝issues/150 病灶一修复（`filter_args_by_node_permission` 同形）。
+/// 三处放行与 java 同形：节点缺失 / 非任务节点（java `instanceof TaskModel`；会签也是
+/// `snaker:task` ⇒ `NodeType::Task` 覆盖）/ 无权限声明 ⇒ 原样返回。少了这一层，
+/// 只读/隐藏字段的提交值会经 `complete_task` 留在实例变量里、被下一个没声明该字段权限的
+/// 节点写进业务表（跨节点绕过；写侧 `is_editable` 只挡当次提交）。
+pub fn filter_args_by_node_permission(
+    args: &FlowData,
+    model: &ProcessModel,
+    task_name: &str,
+) -> FlowData {
+    let Some(node) = model.get_node(task_name) else {
+        return args.clone();
+    };
+    if node.node_type != NodeType::Task {
+        return args.clone();
+    }
+    let perms = node.field_permissions();
+    if perms.is_empty() {
+        return args.clone();
+    }
+    filter_fields_by_permission(args, &perms)
+}
+
 /// Register all 7 built-in assignment handlers into a ServiceContext.
 /// 组织维度 handler 在注册时捕获 user/org provider（对齐 Go RegisterBuiltinAssignments：
 /// provider 必须先注册——wf_factory 的 with_user_provider/with_org_user_provider 在本函数之前）。
@@ -308,5 +336,55 @@ mod tests {
         assert!(ctx.find_assignment_handler(
             "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler"
         ).is_some());
+    }
+
+    /// issues/183（audit8 R17）：入口过滤包装函数——三处放行（与 java `FlowUtil.filterFieldByPerm`
+    /// 的"节点缺失 / 非 TaskModel / 无声明"同形）＋带声明档过滤生效＋非 f_ 键透传。
+    #[test]
+    fn test_i183_filter_args_by_node_permission() {
+        use crate::json::JsonValue;
+        let mut model = ProcessModel {
+            name: "i183".into(), display_name: "I183".into(), model_type: "approval".into(),
+            expire_time: None, persist_mode: None, rel_table_name: None,
+            nodes: vec![], edges: vec![],
+        };
+        let mut args = FlowData::new();
+        args.insert_str("f_amount", "999");
+        args.insert_str("f_note", "改注释");
+        args.insert_str("submitType", "1");
+
+        // ① 节点缺失 ⇒ 原样放行
+        let r = filter_args_by_node_permission(&args, &model, "no_such_node");
+        assert_eq!(r.get_str("f_amount"), Some("999"), "节点缺失必须原样放行");
+
+        // ② 非任务节点（decision）⇒ 原样放行（java instanceof TaskModel）
+        model.nodes.push(NodeModel {
+            id: "dec1".into(), node_type: NodeType::Decision,
+            display_name: "D1".into(), properties: HashMap::new(),
+        });
+        let r = filter_args_by_node_permission(&args, &model, "dec1");
+        assert_eq!(r.get_str("f_amount"), Some("999"), "非任务节点必须原样放行");
+
+        // ③ 任务节点但无权限声明 ⇒ 原样放行
+        model.nodes.push(NodeModel {
+            id: "t_free".into(), node_type: NodeType::Task,
+            display_name: "T-free".into(), properties: HashMap::new(),
+        });
+        let r = filter_args_by_node_permission(&args, &model, "t_free");
+        assert_eq!(r.get_str("f_amount"), Some("999"), "无声明节点必须原样放行（缺省可编辑）");
+
+        // ④ 任务节点带声明（properties.field 子对象）⇒ 过滤生效
+        let mut props = HashMap::new();
+        props.insert("field".to_string(), JsonValue::Object(vec![
+            ("PERMISSION_f_amount".to_string(), JsonValue::Number(1.0)),
+        ]));
+        model.nodes.push(NodeModel {
+            id: "t_ro".into(), node_type: NodeType::Task,
+            display_name: "T-ro".into(), properties: props,
+        });
+        let r = filter_args_by_node_permission(&args, &model, "t_ro");
+        assert_eq!(r.get_str("f_amount"), None, "只读字段必须被剔除");
+        assert_eq!(r.get_str("f_note"), Some("改注释"), "无声明字段缺省可编辑（放行）");
+        assert_eq!(r.get_str("submitType"), Some("1"), "非 f_ 键透传（不会被过滤误伤）");
     }
 }
