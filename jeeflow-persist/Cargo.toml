@@ -9,7 +9,6 @@ description = "jeeflow workflow engine persist layer (DynamicTableWriter + Persi
 jeeflow-core = { path = "../jeeflow-core", version = "1.0.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]

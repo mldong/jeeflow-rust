@@ -193,6 +193,41 @@ pub fn is_table_name_safe(name: &str) -> bool {
 }
 
 // ═══════════════════════════════════════════════════════
+// Column-name matching — spec/09「列匹配（1.6.4）」 · issues/195 ④
+// ═══════════════════════════════════════════════════════
+
+/// 列名归一（宽松档尺子）：转小写 + 去下划线 ⇒ `companyName` / `company_name` /
+/// `COMPANY_NAME` 三档等价。逐字照 java `JdbcDynamicTableWriter.normalizeColumn`。
+pub fn normalize_column(name: &str) -> String {
+    name.to_lowercase().replace('_', "")
+}
+
+/// 列名等价判定（java `findColumn` / `findDataKey` 的同一枚尺子，同 moon 151 的
+/// `column_names_equal`）：严格档＝忽略大小写的逐字相等；宽松档（默认）＝归一后相等。
+pub fn column_names_equal(a: &str, b: &str, strict: bool) -> bool {
+    if strict {
+        a.to_lowercase() == b.to_lowercase()
+    } else {
+        normalize_column(a) == normalize_column(b)
+    }
+}
+
+/// 在 data 中找匹配指定表列的 key（java `findDataKey` / moon `find_data_key`）。
+///
+/// ⚠️ **结构层**差异（语义不变）：java 走 `data.keySet()`、moon 走保插入序的 `Map`，
+/// 两家都是"遍历方第一个命中者胜出"；rust 的 `HashMap` 没有插入序，照抄会得出
+/// 逐次运行可能换胜者的不确定行为 ⇒ 本栈钉「**逐字相等优先，其余按字典序首个命中**」。
+/// 优先档保证"键本来就等于列名"这一最常见形状与修前逐字节一致（零行为变化）。
+pub fn find_data_key<'a>(data: &'a HashMap<String, JsonValue>, column: &str, strict: bool) -> Option<&'a String> {
+    if data.contains_key(column) {
+        return data.get_key_value(column).map(|(k, _)| k);
+    }
+    let mut keys: Vec<&String> = data.keys().collect();
+    keys.sort();
+    keys.into_iter().find(|k| column_names_equal(k, column, strict))
+}
+
+// ═══════════════════════════════════════════════════════
 // DynamicTableWriter trait
 // ═══════════════════════════════════════════════════════
 
@@ -226,12 +261,16 @@ pub trait DynamicTableWriter: Send + Sync {
     /// `operator`。salvo L2-07 实锤：自动办理腿传 `"flow.auto"` 直写用户列，`bigint` 列报
     /// `1366 Incorrect integer value: 'flow.auto'`（Java `JdbcDynamicTableWriter:228-232`、
     /// Go `resolveDefaultUser` 同判）。
+    ///
+    /// issues/195 ③：时间串改接 core 的**单源出口** `clock::current_time_str()`（issues/120
+    /// 路 1 的成果），此前本方法自取 `chrono::Local` ⇒ 宿主注入非本地基准时，同一行里引擎写的
+    /// 时刻与 persist 审计列分叉。基准由宿主注入决定：未注入＝UTC（与 core 其余时间列同判据）。
     fn fill_system_fields(&self, data: &mut HashMap<String, JsonValue>, operator: &str, is_insert: bool) {
         let user_value = data
             .get("apply_user_id")
             .cloned()
             .unwrap_or_else(|| JsonValue::Str(operator.to_string()));
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = jeeflow_core::clock::current_time_str();
         if is_insert {
             data.insert("create_time".to_string(), JsonValue::Str(now.clone()));
             data.insert("create_user".to_string(), user_value.clone());
@@ -269,8 +308,12 @@ pub enum PersistMode {
 }
 
 impl PersistMode {
+    /// 模式串 → 档位。**先 trim 再大写查表**（issues/195 ②）：`"ARCHIVE "` 这类首尾空白在设计器
+    /// 与手改流程 JSON 里是常见噪声。java 侧靠"非 SYNC 一律回落 ARCHIVE"的兜底臂意外容下了它
+    /// （`PersistPostInterceptor.java:93`），本栈没有那条兜底臂（⑤：拦截器恒挂，缺省必须 no-op），
+    /// 不 trim 就会整单不落。trim 后仍不认的串才落进未知档（由调用方留 WARN）。
     pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
+        match s.trim().to_uppercase().as_str() {
             "ARCHIVE" => Some(PersistMode::Archive),
             "SYNC" => Some(PersistMode::Sync),
             _ => None,
@@ -304,6 +347,10 @@ impl PersistMode {
 pub struct PersistPostInterceptor {
     meta_provider: std::sync::Arc<dyn IDynamicMetaProvider>,
     table_writer: std::sync::Arc<dyn DynamicTableWriter>,
+    /// 列匹配档位：`false`（缺省）＝宽松归一，`true`＝忽略大小写的逐字相等。
+    /// 对应 java `setStrictColumnMatch` / moon `with_strict_columns`（本栈沿用 moon 的
+    /// builder 命名，rust 侧没有 setter 习惯）。
+    strict_columns: bool,
 }
 
 impl PersistPostInterceptor {
@@ -311,7 +358,13 @@ impl PersistPostInterceptor {
         meta_provider: std::sync::Arc<dyn IDynamicMetaProvider>,
         table_writer: std::sync::Arc<dyn DynamicTableWriter>,
     ) -> Self {
-        PersistPostInterceptor { meta_provider, table_writer }
+        PersistPostInterceptor { meta_provider, table_writer, strict_columns: false }
+    }
+
+    /// 显式开启严格列匹配（spec/09「列匹配（1.6.4）」的逃生门；缺省是宽松归一）。
+    pub fn with_strict_columns(mut self, strict: bool) -> Self {
+        self.strict_columns = strict;
+        self
     }
 
     // ─── ARCHIVE（缺省：结束同意归档，对齐 Java interceptArchive） ───
@@ -341,6 +394,7 @@ impl PersistPostInterceptor {
         let meta = self.meta(table)?;
         let filtered = self.filter_editable(&meta, &data);
         if filtered.is_empty() {
+            eprintln!("{}", empty_persist_row_warning(table, PersistMode::Archive.as_str()));
             return Ok(());
         }
         let mut row_data = filtered;
@@ -392,6 +446,7 @@ impl PersistPostInterceptor {
         let meta = self.meta(table)?;
         let filtered = self.filter_editable(&meta, &data);
         if filtered.is_empty() {
+            eprintln!("{}", empty_persist_row_warning(table, PersistMode::Sync.as_str()));
             return Ok(());
         }
         let mut row_data = filtered;
@@ -425,11 +480,19 @@ impl PersistPostInterceptor {
     }
 
     /// 按列权限过滤出可写字段（对齐 Java writer 列权限过滤；表无列则不写）。
+    ///
+    /// issues/195 ④：列匹配按 spec/09「列匹配（1.6.4）」走**宽松归一**缺省档（驼峰表单键 ↔
+    /// 蛇形表列，命中后**写入用表列原名**，与 java `findDataKey`／moon `filter_editable` 同判据），
+    /// `strict_columns` 显式开严格档。此前只有逐字相等一档 ⇒ 表单驼峰键对蛇形列**静默丢列**
+    /// （该列不落、无报错无日志）。
     fn filter_editable(&self, meta: &TableMeta, data: &HashMap<String, JsonValue>) -> HashMap<String, JsonValue> {
         let mut filtered = HashMap::new();
         for field in &meta.fields {
-            if field.is_editable() {
-                if let Some(val) = data.get(&field.column_name) {
+            if !field.is_editable() {
+                continue;
+            }
+            if let Some(key) = find_data_key(data, &field.column_name, self.strict_columns) {
+                if let Some(val) = data.get(key) {
                     filtered.insert(field.column_name.clone(), val.clone());
                 }
             }
@@ -521,16 +584,46 @@ impl PersistPostInterceptor {
     }
 }
 
+/// 未知 persistMode 的诊断文案（issues/195 ②）。
+///
+/// 拆成**纯函数**＋落点 `eprintln!` 是本栈 issues/162 家族的既有形状（core 零依赖、无可注入
+/// logger 门面，用例只能钉文案本身）；三件齐＝**实得模式串／表名／后果**，缺一项就不可诊断。
+pub fn unknown_persist_mode_warning(raw_mode: &str, table: &str) -> String {
+    format!(
+        "[jeeflow] WARN 流程定义的 persistMode 不在模式表内（ARCHIVE/SYNC），本次业务数据不落库（流程流转不受影响）: persistMode={}, table={}",
+        raw_mode, table
+    )
+}
+
+/// 字段过滤/列匹配后空集的诊断文案（issues/195 ② 第二腿，挂在 ARCHIVE／SYNC 两条落库腿的
+/// `filtered.is_empty()` 支上）。此前"整单静默不落"连一行信号都没有，而它最常见的成因恰是
+/// ④ 那一族（表单键与表列对不上）——④ 补了归一档之后仍然为空，就说明是真配置问题，要留痕。
+pub fn empty_persist_row_warning(table: &str, mode: &str) -> String {
+    format!(
+        "[jeeflow] WARN 字段权限过滤/列匹配后无可写字段，本次业务数据不落库（表元数据与表单键名可能对不上）: table={}, mode={}",
+        table, mode
+    )
+}
+
 impl FlowInterceptor for PersistPostInterceptor {
     fn intercept(&self, execution: &mut Execution) -> JeeflowResult<()> {
         // Determine persist mode from process model
         let persist_mode = execution.process_model.persist_mode.as_deref();
         if persist_mode.is_none() {
-            return Ok(()); // No persist configured
+            return Ok(()); // 未配置持久化＝结构性 no-op（本栈拦截器进程级恒挂，见 issues/195 ⑤：
+                           // 缺省档若落日志，每一条不持久化的流程都会刷一行，无诊断价值）
         }
         let mode = match PersistMode::from_str(persist_mode.unwrap()) {
             Some(m) => m,
-            None => return Ok(()), // 未知模式：静默跳过
+            None => {
+                // issues/195 ②：写了 persistMode 却不认识＝配置错误。此前一声不吭整单不落，
+                // 与 java（非 SYNC 一律回落 ARCHIVE，绝不会整单不落）方向相反 ⇒ 至少留可诊断日志。
+                let table = self
+                    .resolve_table(&execution.process_model)
+                    .unwrap_or_else(|| "<表名未配置>".to_string());
+                eprintln!("{}", unknown_persist_mode_warning(persist_mode.unwrap(), &table));
+                return Ok(()); // 未知模式：不落库，但打断流转不是本条的裁
+            }
         };
         let table = match self.resolve_table(&execution.process_model) {
             Some(t) => t,
