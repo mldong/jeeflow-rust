@@ -595,7 +595,8 @@ impl ProcessTask {
     /// Check if operator is allowed to operate this task.
     /// "flow.auto" / "flow.admin" bypass all checks.
     pub fn is_allowed(&self, operator: &str) -> bool {
-        if operator == "flow.auto" || operator == "flow.admin" {
+        // issues/194：spec 04:55-56「忽略大小写」——与门面 is_privileged_operator 同口径
+        if operator.eq_ignore_ascii_case("flow.auto") || operator.eq_ignore_ascii_case("flow.admin") {
             return true;
         }
         self.is_doing() && self.actor_ids.contains(&operator.to_string())
@@ -1156,6 +1157,25 @@ mod tests {
         assert!(task.is_allowed("flow.admin"));
         assert!(task.is_allowed("user1"));
         assert!(!task.is_allowed("user2"));
+    }
+
+    // issues/194：spec 04:55-56「忽略大小写」——混合大小写哨兵同样放行，前缀相似串与非参与者仍拒
+    #[test]
+    fn test_flow_auto_bypass_case_insensitive_194() {
+        let task = ProcessTask {
+            task_id: 1, process_instance_id: 1,
+            task_name: "t".into(), display_name: "T".into(),
+            task_type: 0, perform_type: 0, task_state: TaskState::Doing.code(),
+            actor_id: None, actor_ids: vec!["user1".into()],
+            finish_time: None, expire_time: None, form_key: None,
+            parent_task_id: None, variables: FlowData::new(),
+            create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        assert!(task.is_allowed("FLOW.AUTO"), "FLOW.AUTO 应放行");
+        assert!(task.is_allowed("Flow.Admin"), "Flow.Admin 应放行");
+        assert!(!task.is_allowed("flow.autox"), "前缀相似串不是哨兵");
+        assert!(!task.is_allowed("user2"), "非参与者仍拒");
     }
 
     #[test]

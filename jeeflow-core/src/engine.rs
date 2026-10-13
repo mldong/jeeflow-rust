@@ -234,7 +234,8 @@ impl JeeflowEngineImpl {
 
     /// Add user info variables (u_userId, u_realName, etc.)
     fn add_user_info(&self, args: &mut FlowData, operator: &str) {
-        if operator == "flow.auto" || operator == "flow.admin" {
+        // issues/194：spec 04:55-56「忽略大小写」——java FlowUtil.addUserInfoToArgs 用 equalsIgnoreCase
+        if operator.eq_ignore_ascii_case("flow.auto") || operator.eq_ignore_ascii_case("flow.admin") {
             return;
         }
         if let Some(up) = &self.ctx.user_provider {
@@ -2145,6 +2146,20 @@ mod tests {
             .with_user_provider(Arc::new(ComplianceUserProvider))
             .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
         (JeeflowEngineImpl::new(ctx), repo)
+    }
+
+    // issues/194：spec 04:55-56「忽略大小写」——java FlowUtil.addUserInfoToArgs 的 equalsIgnoreCase 同口径
+    #[test]
+    fn test_add_user_info_skips_mixed_case_sentinel_194() {
+        let (engine, _repo) = make_compliance_engine();
+        let mut args = FlowData::new();
+        engine.add_user_info(&mut args, "FLOW.AUTO");
+        engine.add_user_info(&mut args, "Flow.Admin");
+        assert!(!args.contains_key("u_userId"), "混合大小写哨兵不得注入 u_*");
+        // 正向对照：前缀相似的真实用户照注入（判据不许靠前缀匹配过度宽松）
+        let mut args2 = FlowData::new();
+        engine.add_user_info(&mut args2, "flow.autox");
+        assert_eq!(args2.get_str("u_userId"), Some("flow.autox"));
     }
 
     fn save_define(repo: &Arc<MemoryRepository>, name: &str, content: &str) -> i64 {
