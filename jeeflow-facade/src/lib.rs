@@ -1650,9 +1650,11 @@ impl JeeflowFacade {
                 if let Ok(model) = jeeflow_core::parser::ModelParser::parse(&def.content_str()) {
                     for node in model.get_nodes_by_type(jeeflow_core::parser::NodeType::Task) {
                         if node.id == task.task_name {
+                            // issues/182（R16）：原读 properties.ext（无生产方写该键 ⇒ 恒 null），
+                            // 基准＝properties.field 原样透传（spec 06:684；对齐 java/go/py/node/php/csharp）
                             let ext_prop = node
                                 .properties
-                                .get("ext")
+                                .get("field")
                                 .map(json_value_to_serde)
                                 .unwrap_or(Json::Null);
                             let tm = json!({
@@ -4368,6 +4370,91 @@ mod tests {
         args.insert("id".to_string(), json!(99999));
         let resp = facade.flow("processTask/detail", &args).await;
         assert_eq!(resp["code"], 99999999);
+    }
+
+    // ─── issues/182（R16）：taskModel.ext 取 properties.field（原错键 ext ⇒ 恒 null） ───
+
+    /// 发起 i182 流（apply 自动办结，t1=leader 待办）；field 与诱饵 ext 两键同投。
+    /// 诱饵设计：无人写的 properties.ext 投 `WRONG_KEY_DECOY`——修前读错键会把它搬进
+    /// taskModel.ext，修后必须只认 field（同一格双锚：读对了 + 没读错）。
+    async fn i182_start(field: Option<serde_json::Value>) -> (JeeflowFacade, i64) {
+        let facade = make_facade();
+        let mut props = json!({"assignee": "leader"});
+        if let Some(f) = field {
+            props["field"] = f;
+        }
+        props["ext"] = json!({"WRONG_KEY_DECOY": true});
+        let content = format!(
+            r#"{{"name":"i182-flow","displayName":"I182","type":"approval","nodes":[{{"id":"start","type":"snaker:start","text":{{"value":"S"}}}},{{"id":"apply","type":"snaker:task","text":{{"value":"A"}},"properties":{{"assignee":"applicant"}}}},{{"id":"t1","type":"snaker:task","text":{{"value":"T1"}},"properties":{}}},{{"id":"end","type":"snaker:end","text":{{"value":"E"}}}}],"edges":[{{"id":"e1","sourceNodeId":"start","targetNodeId":"apply"}},{{"id":"e2","sourceNodeId":"apply","targetNodeId":"t1"}},{{"id":"e3","sourceNodeId":"t1","targetNodeId":"end"}}]}}"#,
+            props
+        );
+        let mut d = HashMap::new();
+        d.insert("content".to_string(), json!(content));
+        let dep = facade.flow("processDefine/deploy", &d).await;
+        assert_eq!(dep["code"], 0, "deploy: {:?}", dep);
+        let mut s = HashMap::new();
+        s.insert("name".to_string(), json!("i182-flow"));
+        s.insert("operator".to_string(), json!("applicant"));
+        let st = facade.flow("processDefine/startAndExecute", &s).await;
+        assert_eq!(st["code"], 0, "start: {:?}", st);
+        let mut q = HashMap::new();
+        q.insert("operator".to_string(), json!("leader"));
+        let todo = facade.flow("processTask/todoList", &q).await;
+        let rows = todo["data"]["rows"].as_array().expect("todo rows");
+        assert_eq!(rows.len(), 1, "leader 待办应为 t1: {:?}", rows);
+        let tid: i64 = rows[0]["id"].as_str().unwrap().parse().unwrap();
+        (facade, tid)
+    }
+
+    async fn i182_detail_ext(facade: &JeeflowFacade, tid: i64) -> serde_json::Value {
+        let mut d = HashMap::new();
+        d.insert("processTaskId".to_string(), json!(tid));
+        d.insert("operator".to_string(), json!("leader"));
+        let det = facade.flow("processTask/detail", &d).await;
+        assert_eq!(det["code"], 0, "detail: {:?}", det);
+        // 出口 camel 化（to_camel_json）：直插 vo 的 task_model → taskModel；ext 子树豁免保留原键
+        assert!(
+            det["data"]["taskModel"].is_object(),
+            "taskModel 必须为对象（负向档 ext 允许 null，但模型本身必须在）：{:?}",
+            det
+        );
+        det["data"]["taskModel"]["ext"].clone()
+    }
+
+    #[tokio::test]
+    async fn test_i182_ext_reads_properties_field_not_ext() {
+        let (facade, tid) = i182_start(Some(json!({"PERMISSION_f_note": 1, "f_tag": "x"}))).await;
+        let ext = i182_detail_ext(&facade, tid).await;
+        assert_eq!(
+            ext["PERMISSION_f_note"], 1,
+            "ext 必须含 field 的 PERMISSION_f_note（修前读错键 ⇒ 恒 null）：{:?}", ext
+        );
+        assert_eq!(ext["f_tag"], "x", "field 内容原样透传：{:?}", ext);
+        assert!(
+            ext.get("WRONG_KEY_DECOY").is_none(),
+            "诱饵 properties.ext 键不得被读取：{:?}", ext
+        );
+    }
+
+    #[tokio::test]
+    async fn test_i182_ext_absent_field_stays_null() {
+        let (facade, tid) = i182_start(None).await;
+        let ext = i182_detail_ext(&facade, tid).await;
+        assert!(ext.is_null(), "无 field ⇒ ext 仍为 null（本栈既有形状，如实钉住）：{:?}", ext);
+    }
+
+    #[tokio::test]
+    async fn test_i182_ext_fix_leaves_model_intact() {
+        let (facade, tid) = i182_start(Some(json!({"f_tag": "x"}))).await;
+        let mut d = HashMap::new();
+        d.insert("processTaskId".to_string(), json!(tid));
+        d.insert("operator".to_string(), json!("leader"));
+        let det = facade.flow("processTask/detail", &d).await;
+        assert_eq!(det["data"]["taskModel"]["name"], "t1");
+        assert_eq!(det["data"]["taskModel"]["displayName"], "T1");
+        assert_eq!(det["data"]["taskModel"]["type"], "task");
+        assert!(det["data"]["taskModel"]["form"].is_null(), "无 formKey ⇒ null 形状保持");
+        assert_eq!(det["data"]["executable"], true);
     }
 
     // ─── processDesign action tests ───
