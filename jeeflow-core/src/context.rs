@@ -35,7 +35,20 @@ pub struct ServiceContext {
     /// 令牌继续流转，**不报错**（spec/02 §6.2 第 2 条）。
     pub custom_handlers: HashMap<String, Arc<dyn CustomNodeHandler>>,
     /// Flow interceptors (sorted by order).
+    ///
+    /// **后置通道**：节点执行体跑完、以及任务完成节点自身办结后触发（`fire_post_interceptors`）。
+    /// persist 的写库拦截器只能挂这里。
     pub interceptors: Vec<Arc<dyn FlowInterceptor>>,
+    /// 前置拦截器（按 order 排序）——**与 [`Self::interceptors`] 分开的独立通道**（issues/196）。
+    ///
+    /// 为什么不复用后置数组：本栈的 `FlowInterceptor` 与 java/php/csharp 一样**只有一个
+    /// `intercept()`**（无 `preHandle`/`postHandle` 两法），两档共用一份数组就等于同一次
+    /// `intercept()` 被调两遍 ⇒ persist 的写库腿会在节点执行前后各落一次（业务表重复写）。
+    /// 姿势与 MoonBit 侧同一判例（`jeeflow-moon` `Ctx::register_pre_interceptor`，issues/116 批次 D）。
+    ///
+    /// 默认空 ⇒ 不注册就零行为变化；挂入后在 Decision / Fork / Join / End 四类节点的执行体
+    /// **之前**触发（引擎调用点见 `engine.rs` 的 `fire_pre_interceptors`）。
+    pub pre_interceptors: Vec<Arc<dyn FlowInterceptor>>,
     /// Event listeners.
     pub event_listeners: Vec<Arc<dyn ProcessEventListener>>,
     /// 委托代理自动生效开关（issues/116 批次 D，**默认开启**）。
@@ -67,6 +80,7 @@ impl ServiceContext {
             decision_handlers: HashMap::new(),
             custom_handlers: HashMap::new(),
             interceptors: Vec::new(),
+            pre_interceptors: Vec::new(),
             event_listeners: Vec::new(),
             // 委托自动生效默认开启（issues/116 批次 D）——集成方零配置即生效，
             // 对齐内置版 mldong-wf `SurrogateInterceptor` 标 @Component 的"白拿"体验。
@@ -171,6 +185,14 @@ impl ServiceContext {
     pub fn register_interceptor(&mut self, interceptor: Arc<dyn FlowInterceptor>) {
         self.interceptors.push(interceptor);
         self.interceptors.sort_by_key(|i| i.order());
+    }
+
+    /// 注册**前置**拦截器（issues/196）——挂在 [`Self::pre_interceptors`] 这条独立通道上，
+    /// 在 Decision / Fork / Join / End 节点执行体之前触发。与 `register_interceptor`（后置）
+    /// 不共用数组：本栈 `FlowInterceptor` 只有一个 `intercept()`，共用会让 persist 写库腿双触发。
+    pub fn register_pre_interceptor(&mut self, interceptor: Arc<dyn FlowInterceptor>) {
+        self.pre_interceptors.push(interceptor);
+        self.pre_interceptors.sort_by_key(|i| i.order());
     }
 
     pub fn register_event_listener(&mut self, listener: Arc<dyn ProcessEventListener>) {

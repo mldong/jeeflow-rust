@@ -17,12 +17,30 @@
 | `TransactionTemplate` | 事务边界 | 无（仓储自带事务时可缺省） |
 | `IdGenerator` | 雪花 ID 生成 | `DefaultIdGenerator` / `AtomicIdGenerator`（测试） |
 | `ActionPermissionProvider` | action 级权限校验（mldong 框架权限码映射点） | 无 |
-| `FlowInterceptor` | 流程事件拦截器（FormFieldAssignee 等节点行为扩展） | 内置基础拦截器 |
+| `FlowInterceptor` | 流程节点拦截器（**前置 / 后置两条独立通道**，见下节） | 后置：persist 写库件（`jeeflow-persist`）；前置：无内置件，宿主自挂 |
 | `BizDataReader` | 业务数据读取（persist 回查） | 无 |
 | `AssignmentHandler` | 参与人处理器（`assignmentHandler` 节点属性路由） | 内置 7 个（Applicant / DeptLeader×main / TaskRoleAssignee 等） |
 | `DecisionHandler` | 决策处理器 | 内置 |
 | `CandidateHandler` | 候选人处理器 | 内置 |
 | `ProcessEventListener` | 流程事件监听（完成 / 拒绝 / 废弃） | 无 |
+
+## 拦截器：前置 / 后置两条通道（1.0.42 起）
+
+`FlowInterceptor` 只有一个 `intercept(&mut Execution)`（与 Java / PHP / C# 同款，**没有** `preHandle`/`postHandle`
+两个方法），所以前置与后置是**两条独立的注册数组**，各挂各的：
+
+| 通道 | 注册方法 | 触发位 |
+|------|----------|--------|
+| 后置 | `ctx.register_interceptor(ic)` | Decision / Fork / Join / End 节点执行体**之后**，外加被完成任务自身（`processTask/execute` 办结腿） |
+| 前置 | `ctx.register_pre_interceptor(ic)` | Decision / Fork / Join / End 节点执行体**之前** |
+
+两档共用一份数组就等于同一次 `intercept()` 被调两遍 ⇒ persist 的写库腿会在节点执行前后各落一次，
+所以写库件只许走 `register_interceptor`（后置）。两条数组都按 `order()` 升序派发，默认皆空 ⇒ 不注册就零行为变化。
+拦截器抛错**不做隔离**（规范 12 §12.2 副作用面）：一支报错即中断整次动作。
+
+> 历史：`1.0.41` 及以前 `fire_pre_interceptors` 是空实现、却有 4 个调用点 ⇒ 前置语义在本栈结构性不存在，
+> 注册进 ctx 的拦截器只在后置位生效（八语言栈里其余七家均为真派发）。`1.0.42` 补齐，形状照 MoonBit 侧
+> `Ctx::register_pre_interceptor`（issues/116 批次 D 的判例）。
 
 ## 最小装配示例
 

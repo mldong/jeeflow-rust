@@ -697,9 +697,20 @@ impl JeeflowEngineImpl {
         crate::default_evaluator::evaluate_builtin(expr, &vars)
     }
 
-    /// Fire pre-interceptors.
-    fn fire_pre_interceptors(&self, _exec: &mut Execution) -> JeeflowResult<()> {
-        // Pre-interceptors reserved; PersistPostInterceptor runs on post only.
+    /// Fire pre-interceptors（issues/196）。
+    ///
+    /// 历史：本函数是 `Ok(())` 空实现，却有 4 个调用点（Decision / Fork / Join / End 节点执行体
+    /// 之前）⇒ pre 语义在本栈结构性不存在，注册进 `ctx` 的拦截器只在后置位生效（audit8 C4-L2 N-5）。
+    /// 现按 order 遍历**独立**的 [`ServiceContext::pre_interceptors`] 通道：本栈
+    /// `FlowInterceptor` 只有一个 `intercept()`，若与后置数组共用，persist 的写库腿会被双触发。
+    /// 与八栈现状对齐（java `NodeModel.execPreInterceptors`／go `firePreInterceptors`／
+    /// py `engine._fire_pre`／node `engine.firePre`／php `NodeModel::execPreInterceptors`／
+    /// csharp `ExecPreInterceptorsAsync`／moon `ctx.pre_interceptors` 七家本是真派发）。
+    /// 拦截器**不做异常隔离**（spec12 §12.2 副作用面）：抛错即中断并可回滚整次动作，故用 `?` 上抛。
+    fn fire_pre_interceptors(&self, exec: &mut Execution) -> JeeflowResult<()> {
+        for interceptor in &self.ctx.pre_interceptors {
+            interceptor.intercept(exec)?;
+        }
         Ok(())
     }
 
@@ -2277,6 +2288,135 @@ mod tests {
             .await.expect_err("缺判定变量也必须同档报错");
         assert!(err.message().contains(I164_NOT_FOUND_NEXT_NODE_MSG),
             "实得: {}", err.message());
+    }
+
+    // ── issues/196 · 前置拦截器通道真派发（audit8 C4-L2 N-5）──
+    // 改前形状：`fire_pre_interceptors` 是 `Ok(())` 空实现、却有 4 个调用点
+    // （Decision / Fork / Join / End 节点执行体之前）⇒ 注册进 ctx 的拦截器只在后置位生效，
+    // pre 语义在本栈结构性不存在（八栈里其余七家都是真派发）。
+    // 修法照 MoonBit 判例（issues/116 批次 D）：**独立**的 `ctx.pre_interceptors` 数组，
+    // 不与后置数组共用——本栈 `FlowInterceptor` 只有一个 `intercept()`，共用等于 persist 的
+    // 写库腿在节点执行前后各跑一遍。夹具复用 i164 的内联决策流程（decision1 + end 两个 pre 位）。
+
+    /// 记录每次派发的「通道标签:当前节点 id」；`fail=true` 时按 spec12 §12.2
+    /// 「拦截器不隔离、抛错即中断」上抛。
+    struct TraceInterceptor {
+        label: String,
+        order: i32,
+        fail: bool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TraceInterceptor {
+        fn new(label: &str, order: i32) -> Arc<Self> {
+            Arc::new(TraceInterceptor {
+                label: label.into(), order, fail: false,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn failing(label: &str) -> Arc<Self> {
+            Arc::new(TraceInterceptor {
+                label: label.into(), order: 0, fail: true,
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn trace(&self) -> Vec<String> { self.calls.lock().unwrap().clone() }
+    }
+
+    impl FlowInterceptor for TraceInterceptor {
+        fn intercept(&self, exec: &mut Execution) -> JeeflowResult<()> {
+            let node = exec.current_node.as_ref().map(|n| n.id.clone()).unwrap_or_else(|| "-".into());
+            self.calls.lock().unwrap().push(format!("{}:{}", self.label, node));
+            if self.fail {
+                return Err(JeeflowError::Business("前置拦截器拒绝本次动作".to_string()));
+            }
+            Ok(())
+        }
+        fn order(&self) -> i32 { self.order }
+    }
+
+    fn i196_engine(
+        repo: &Arc<MemoryRepository>,
+    ) -> (JeeflowEngineImpl, Arc<TraceInterceptor>, Arc<TraceInterceptor>, Arc<TraceInterceptor>) {
+        let p1 = TraceInterceptor::new("p1", 1);
+        let p5 = TraceInterceptor::new("p5", 5);
+        let q = TraceInterceptor::new("q", 0);
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_user_provider(Arc::new(ComplianceUserProvider))
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        // 先注册 order 大的、再注册 order 小的：排序必须与后置通道同款（register 内 sort_by_key）
+        ctx.register_pre_interceptor(p5.clone());
+        ctx.register_pre_interceptor(p1.clone());
+        ctx.register_interceptor(q.clone());
+        (JeeflowEngineImpl::new(ctx), p1, p5, q)
+    }
+
+    /// ① 正向（audit8 C4-L2 N-5 的修法判据）：前置通道在节点执行体**之前**按 order 派发，
+    /// 且后置数组**不**被前置位复用（`q` 只出现在后置位）。改前此格红：p1/p5 恒零调用。
+    #[tokio::test]
+    async fn test_i196_pre_channel_fires_before_post_channel() {
+        let repo = Arc::new(MemoryRepository::new());
+        let (engine, p1, p5, q) = i196_engine(&repo);
+        let did = save_define(&repo, "i196-pre-order", &i164_flow_json());
+        let iid = start_and_apply(&engine, &repo, did).await;
+
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        let mut args = FlowData::new();
+        args.insert_i64("amount", 5000);
+        engine.execute_task_async(tasks[0].task_id, "leader", &args).await.unwrap();
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        engine.execute_task_async(doing[0].task_id, "manager", &FlowData::new()).await.unwrap();
+
+        assert_eq!(p1.trace(), vec!["p1:decision1", "p1:end"],
+            "前置通道必须在 decision1 / end 两个 pre 位各派发一次");
+        assert_eq!(p5.trace(), vec!["p5:decision1", "p5:end"], "同上（order 5 那一路）");
+        // 同一次派发里 order 1 在 order 5 之前（排序按 order 升序，与后置通道同款）
+        assert_eq!(q.trace(), vec!["q:apply", "q:task1", "q:decision1", "q:task2", "q:end"],
+            "后置数组只许在 5 个后置位被调用；前置位复用后置数组（＝persist 双写形状）会在这里多出行");
+    }
+
+    /// ② 负向（spec12 §12.2「拦截器不隔离」）：前置拦截器抛错 ⇒ 整次动作中断、令牌不前进。
+    /// 改前此格红：pre 从不派发，抛错无从发生，流程照常建出 task2。
+    #[tokio::test]
+    async fn test_i196_pre_interceptor_error_aborts_action() {
+        let repo = Arc::new(MemoryRepository::new());
+        let p = TraceInterceptor::failing("boom");
+        let mut ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_user_provider(Arc::new(ComplianceUserProvider))
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        ctx.register_pre_interceptor(p.clone());
+        let engine = JeeflowEngineImpl::new(ctx);
+        let did = save_define(&repo, "i196-pre-abort", &i164_flow_json());
+        let iid = start_and_apply(&engine, &repo, did).await;
+
+        let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
+        let mut args = FlowData::new();
+        args.insert_i64("amount", 5000);
+        let err = engine.execute_task_async(tasks[0].task_id, "leader", &args)
+            .await.expect_err("前置拦截器抛错必须中断本次动作（改前此格红：pre 不派发）");
+        assert!(err.message().contains("前置拦截器拒绝本次动作"), "实得: {}", err.message());
+        assert_eq!(p.trace(), vec!["boom:decision1"], "派发点应在 decision1 执行体之前");
+
+        let inst = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(inst.state, 10, "中断后实例应仍停在 DOING");
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert!(doing.iter().all(|t| t.task_name != "task2"),
+            "前置抛错后不得建出下游待办（决策边未被执行）");
+    }
+
+    /// ③ 回归（现生产零行为变化的判据本体）：两个通道默认都是空数组——不注册就没人被打扰，
+    /// salvo 壳只注册后置 persist 拦截器，行为与 v1.0.41 逐字一致。
+    #[test]
+    fn test_i196_pre_channel_defaults_empty() {
+        let ctx = ServiceContext::new();
+        assert!(ctx.pre_interceptors.is_empty(), "未注册即空＝默认零派发");
+        assert!(ctx.interceptors.is_empty());
+        let mut ctx2 = ServiceContext::new();
+        ctx2.register_interceptor(TraceInterceptor::new("only-post", 0));
+        assert!(ctx2.pre_interceptors.is_empty(),
+            "register_interceptor（后置）不得写进前置数组——两通道分家");
     }
 
     // ── v1.0 core scenarios (1-10) ──
