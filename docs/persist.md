@@ -39,3 +39,16 @@ mldong-salvo 集成仓的 `src/modules/wf/core/wf_persist.rs` 是这两模式在
 - `InMemoryMetaProvider`：启动时 `register(TableMeta)`（演示 / 测试）。
 - 生产集成：mldong 框架的表结构元数据服务（`/dev/schema/getByTableName`）经适配层桥接为
   `IDynamicMetaProvider`——见 [mldong-salvo 集成](./salvo.md)。
+
+## 列匹配档位（spec/09「列匹配（1.6.4）」）
+
+- **缺省宽松档**：表单键与表列按「转小写 + 去下划线」归一后相等即命中 ⇒ 驼峰表单键
+  （`companyName`）能落到蛇形表列（`company_name`），**写入用表列原名**。尺子＝
+  `normalize_column` / `column_names_equal` / `find_data_key`（与 java `findDataKey` 同一枚）。
+- **严格档**：`PersistPostInterceptor::new(provider, writer).with_strict_columns(true)` ⇒
+  只认忽略大小写的逐字相等（对应 java `setStrictColumnMatch(true)`）。
+- 两个键归一到同一列时，胜者规则＝**逐字相等优先，其余按字典序首个命中**（rust 的 `HashMap`
+  没有插入序，java／MoonBit 的「遍历即停」在这里不可复现，故本栈钉一条确定性的）。
+- 未命中的两条静默面现在都留日志（`[jeeflow] WARN …`）：写了 `persistMode` 但不认识
+  （`"ARCHVIE"` 这类拼错；首尾空白会先 trim，`"ARCHIVE "` 属正常档）、字段权限过滤／列匹配后
+  **空集**（整单不落）。两者都不打断流程流转。
