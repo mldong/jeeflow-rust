@@ -1354,6 +1354,8 @@ impl JeeflowFacade {
                             inst.variables.inner(),
                             &history_tasks,
                             ctx.expression_evaluator_or_default(),
+                            id,
+                            inst.define_id,
                         );
                     }
                 }
@@ -2487,6 +2489,8 @@ fn collect_high_light_path(
     instance_vars: &HashMap<String, JsonValue>,
     history_tasks: &[ProcessTask],
     evaluator: &dyn ExpressionEvaluator,
+    instance_id: i64,
+    define_id: i64,
 ) {
     if visited.contains(node_id) {
         return;
@@ -2510,6 +2514,8 @@ fn collect_high_light_path(
                         instance_vars,
                         history_tasks,
                         evaluator,
+                        instance_id,
+                        define_id,
                     )
                 {
                     continue;
@@ -2539,6 +2545,8 @@ fn collect_high_light_path(
             instance_vars,
             history_tasks,
             evaluator,
+            instance_id,
+            define_id,
         );
     }
 }
@@ -2559,6 +2567,7 @@ fn collect_high_light_path(
 /// `Boolean.TRUE.equals(...)`／go `b, _ := result.(bool)`／csharp `result is true`），求值报错、
 /// 返回数字或字符串一律判 false（不套用引擎运行时 `evaluate_expression` 的数字/字符串宽松折算——
 /// 那两条腿不同档，本条只钉门面）。
+#[allow(clippy::too_many_arguments)]
 fn eval_decision_expr(
     model: &jeeflow_core::parser::ProcessModel,
     decision_id: &str,
@@ -2566,6 +2575,8 @@ fn eval_decision_expr(
     instance_vars: &HashMap<String, JsonValue>,
     history_tasks: &[ProcessTask],
     evaluator: &dyn ExpressionEvaluator,
+    instance_id: i64,
+    define_id: i64,
 ) -> bool {
     let mut args: HashMap<String, JsonValue> = instance_vars.clone();
     if let Some(input) = model.get_input_edges(decision_id).first() {
@@ -2580,7 +2591,33 @@ fn eval_decision_expr(
             }
         }
     }
-    matches!(evaluator.eval(expr, &args), Ok(JsonValue::Bool(true)))
+    // issues/201（audit8 R79 拍 C＝只统一「求值器自身抛异常必须落可诊断日志」，遍历宽度不钉）：
+    // 旧形状 `matches!(…, Ok(Bool(true)))` 把 Err 与「求值为假」压成同一个 false ⇒ 表达式坏／
+    // SPI 抛错在对外读数上与"这条分支没走"完全同形、零线索（本栈 162 腿已给解码失败那条落了
+    // WARN，这条是同一族里的第二条静默腿）。宽度维持折 false（该边不收、其余边继续遍历）。
+    match evaluator.eval(expr, &args) {
+        Ok(JsonValue::Bool(true)) => true,
+        Ok(_) => false,
+        Err(e) => {
+            eprintln!("{}", eval_failure_warning(instance_id, define_id, decision_id, expr, &e.detail()));
+            false
+        }
+    }
+}
+
+/// issues/201 的日志文案单点（与 162 的 [`highlight_degrade_warning`] 同法：文本只写一遍，
+/// eprintln! 与测试断言共用这一枚，不许两处各写一遍）。
+fn eval_failure_warning(
+    instance_id: i64,
+    define_id: i64,
+    decision_id: &str,
+    expr: &str,
+    err: &str,
+) -> String {
+    format!(
+        "[jeeflow] WARN highLight 决策边表达式求值失败，该边按 false 处理（分支不收、其余边继续遍历）: instanceId={}, defineId={}, nodeId={}, expr={}, err={}",
+        instance_id, define_id, decision_id, expr, err
+    )
 }
 
 /// 对齐 Java/Go buildNodeProgress（会签成员进度；动态参与人无成员则跳过）
