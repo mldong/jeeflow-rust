@@ -2802,10 +2802,27 @@ fn stats_filter_finished_tasks(
 /// 此前这两处各取一次 `chrono::Local::now()`，而任务/实例的时间列走
 /// `jeeflow_core::clock::current_time_str()`：宿主注入非本地钟（或没注入、引擎回落 UTC）时，
 /// "最近 30 天"的范围与"今日新增"的当日边界会跟数据基准错开一个时区 —— 表现就是
-/// 统计图/今日新增漏掉凌晨或深夜的单。解析失败才回落 Local，保证不因此 panic。
+/// 统计图/今日新增漏掉凌晨或深夜的单。解析失败才回落 Local，保证不因此 panic；
+/// 回落前先落一条带原因 WARN（issues/216）——注入串不合 `%Y-%m-%d %H:%M:%S` 时，
+/// 数据基准（写库列＝注入串原样）与统计口径静默分家，stats 族又无 runner 格，
+/// 不留痕就与"注入钟生效"完全同形。
 fn stats_now() -> chrono::NaiveDateTime {
-    chrono::NaiveDateTime::parse_from_str(&jeeflow_core::clock::current_time_str(), "%Y-%m-%d %H:%M:%S")
-        .unwrap_or_else(|_| chrono::Local::now().naive_local())
+    let raw = current_time_str();
+    match chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("{}", stats_clock_fallback_warning(&raw));
+            chrono::Local::now().naive_local()
+        }
+    }
+}
+
+/// issues/216 的日志文案单点（与 162/201 同法：文本只写一遍，`eprintln!` 与测试断言共用这一枚，
+/// 不许两处各写一遍）。
+fn stats_clock_fallback_warning(raw: &str) -> String {
+    format!(
+        "[jeeflow] WARN stats 取钟串解析失败，已回落 chrono::Local（统计窗/今日新增与数据基准可能错开）: raw={raw:?}, expect=\"%Y-%m-%d %H:%M:%S\""
+    )
 }
 
 fn stats_enumerate_buckets(
