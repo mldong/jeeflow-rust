@@ -980,7 +980,7 @@ impl JeeflowFacade {
 
     fn process_define_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
-        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let page_size = arg_i64_or(args, "pageSize", 10)?;
         let mut query = PageQuery::new(page_num, page_size);
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = self.repo.page_defines(&query)?;
@@ -1155,7 +1155,7 @@ impl JeeflowFacade {
 
     fn process_instance_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
-        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let page_size = arg_i64_or(args, "pageSize", 10)?;
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = Some(operator_arg(args, &["operator"]));
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
@@ -1513,9 +1513,10 @@ impl JeeflowFacade {
     }
 
     fn process_instance_cc_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
-        // issues/154④（spec/06 §4.6 ccList 参数表）：分页默认值统一 `pageNum=1 / pageSize=10`，
-        // 与其它分页 action 同口径——rust 旧默认 20 已判分叉。只改这一条 action，
-        // 其余 action 的 20 不在本轮立法范围内。
+        // issues/154④（spec/06 §4.6 ccList 参数表）：分页默认值 `pageNum=1 / pageSize=10`。
+        // issues/212（audit8 R44；spec 06 §2.2 全局档）：本栈其余六枚分页 action 旧默认 20
+        // 已随本轮全族统一为 10（全仓分页缺省值 20 的字样应零命中），本注释旧句
+        // 「只改这一条 action」已过期——全族一个口径。
         let page_num = arg_i64_or(args, "pageNum", 1)?;
         let page_size = arg_i64_or(args, "pageSize", 10)?;
         let mut query = PageQuery::new(page_num, page_size);
@@ -1533,7 +1534,7 @@ impl JeeflowFacade {
 
     fn process_task_todo_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
-        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let page_size = arg_i64_or(args, "pageSize", 10)?;
         let mut query = PageQuery::new(page_num, page_size);
         // UI 注入 operator；兼容 userId（curl/旧客户端）
         query.operator = Some(operator_arg(args, &["operator", "userId"]));
@@ -1546,7 +1547,7 @@ impl JeeflowFacade {
 
     fn process_task_done_list(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let page_num = arg_i64_or(args, "pageNum", 1)?;
-        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let page_size = arg_i64_or(args, "pageSize", 10)?;
         let mut query = PageQuery::new(page_num, page_size);
         query.operator = Some(operator_arg(args, &["operator"]));
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
@@ -2026,7 +2027,7 @@ impl JeeflowFacade {
     fn process_design_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
         let page_num = arg_i64_or(args, "pageNum", 1)?;
-        let page_size = arg_i64_or(args, "pageSize", 20)?;
+        let page_size = arg_i64_or(args, "pageSize", 10)?;
         let mut query = PageQuery::new(page_num, page_size);
         query.filters = parse_m_params(args); // m_ 过滤下推仓储（issues/106）
         let page = ext.page_designs(&query)?;
@@ -2346,7 +2347,7 @@ impl JeeflowFacade {
 
     fn process_surrogate_page(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
         let ext = self.ext_repo.as_ref().ok_or(JeeflowError::Internal("ExtRepository not registered".into()))?;
-        let mut query = PageQuery::new(arg_i64_or(args, "pageNum", 1)?, arg_i64_or(args, "pageSize", 20)?);
+        let mut query = PageQuery::new(arg_i64_or(args, "pageNum", 1)?, arg_i64_or(args, "pageSize", 10)?);
         // issues/152 ②：`operator` 在本栈是「我的委托」的归属通道（与 process_instance_page :1128 逐字同形），
         // 走 §2.5 归一（缺键／空串／全空白 ⇒ user1）。修前这里既不注入也不下推 ⇒ "只看自己授出的委托"
         // 全靠集成壳注入 operator，换宿主／直调 SPI 就退化成全库台账（spec 06 §2.5 表 + §4.5 归属不变式）。
@@ -5521,6 +5522,34 @@ mod tests {
         args.insert("pageSize".to_string(), json!(20));
         let resp2 = facade.flow("processInstance/ccList", &args).await;
         assert_eq!(resp2["data"]["pageSize"], json!(20), "显式 pageSize 必须照传值走，实得 {resp2:?}");
+    }
+
+    /// 分页默认值全族档（spec/06 §2.2 全局档／issues/212 audit8 R44）：六枚分页 action
+    /// 不传 pageNum/pageSize ⇒ 信封必须回 1/10（修前 rust 这六枚旧默认 20，154④ 只收了 ccList）。
+    #[tokio::test]
+    async fn test_i212_page_defaults_family() {
+        let facade = make_facade();
+        for action in [
+            "processDefine/page",
+            "processInstance/page",
+            "processTask/todoList",
+            "processTask/doneList",
+            "processDesign/page",
+            "processSurrogate/page",
+        ] {
+            let resp = facade.flow(action, &HashMap::new()).await;
+            assert_eq!(resp["code"], 0, "{action} 失败: {resp:?}");
+            assert_eq!(resp["data"]["pageNum"], json!(1), "{action} 不传 pageNum 时默认是 1，实得 {resp:?}");
+            assert_eq!(resp["data"]["pageSize"], json!(10), "{action} 不传 pageSize 时默认必须是 10，实得 {resp:?}");
+        }
+        // 阳性对照：显式传值不受默认档影响（防把"改默认"写成"改强制"）
+        let mut args = HashMap::new();
+        args.insert("pageNum".to_string(), json!(2));
+        args.insert("pageSize".to_string(), json!(7));
+        let resp = facade.flow("processDefine/page", &args).await;
+        assert_eq!(resp["code"], 0, "{resp:?}");
+        assert_eq!(resp["data"]["pageNum"], json!(2), "显式 pageNum 必须照传值走");
+        assert_eq!(resp["data"]["pageSize"], json!(7), "显式 pageSize 必须照传值走，实得 {resp:?}");
     }
 
     #[tokio::test]
