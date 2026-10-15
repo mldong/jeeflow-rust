@@ -2385,7 +2385,10 @@ impl JeeflowFacade {
         let sg = ext.find_surrogate_by_id(id)?
             .ok_or(JeeflowError::Business(format!("委托不存在: {}", id)))?;
         let updated = ProcessSurrogate {
-            surrogate: arg_str(args, "surrogate").unwrap_or(sg.surrogate),
+            // issues/236（audit8 R68①）四腿缺键＝清空（基准＝java `applySurrogateFields` 无条件覆盖；
+            // 旧形状 `unwrap_or(原值)`／`.or(原值)`＋`..sg` 兜 process_name＝全保留，八栈唯一第二形）。
+            process_name: arg_str(args, "processName").unwrap_or_default(),
+            surrogate: arg_str(args, "surrogate").unwrap_or_default(),
             // issues/152 ③ 的 update 腿（对齐 java `applySurrogateFields`）：授权人只有**非空显式值**才覆盖，
             // 缺键／空串／全空白一律保留原授权人——空白档若覆写进去同样造出「死行」（§2.5 空串＝缺键同档）。
             operator: match arg_str(args, "operator") {
@@ -2395,15 +2398,11 @@ impl JeeflowFacade {
                 }
                 None => sg.operator.clone(),
             },
-            start_time: arg_str(args, "startTime").or(sg.start_time),
-            end_time: arg_str(args, "endTime").or(sg.end_time),
-            // enabled：未传保持原值，传了走写侧归一（脏值 → 0 停用，见 parse_surrogate_enabled）。
-            // 原先用 arg_i64，脏值（"abc"）会被判成「非法id: abc」整条 update 报错。
-            enabled: if args.contains_key("enabled") {
-                parse_surrogate_enabled(args)
-            } else {
-                sg.enabled
-            },
+            start_time: arg_str(args, "startTime"),
+            end_time: arg_str(args, "endTime"),
+            // enabled：缺键走 parse 的「无键⇒1」复位档（java `enabledArg==null⇒1` 同形）；
+            // 传了走写侧归一（脏值 → 0 停用，见 parse_surrogate_enabled）。
+            enabled: parse_surrogate_enabled(args),
             update_user: arg_str(args, "updateUser"),
             ..sg
         };
@@ -7545,6 +7544,53 @@ mod tests {
             assert_eq!(detail["data"]["surrogate"].as_str(), Some("dep152b"),
                 "{label}档回归：其余字段照常更新");
         }
+    }
+
+    /// issues/236（audit8 R68①）：委托 update 的**四腿缺键＝清空**（spec06 §4.5 缺键档；基准＝java
+    /// `applySurrogateFields` 无条件覆盖）。旧形状此处 `unwrap_or(原值)`／`.or(原值)`＋`..sg` ＝四腿全保留，
+    /// 是八栈里唯一的第二形。`operator` 是唯一专例（缺省保留），`enabled` 缺键复位 1。
+    #[tokio::test]
+    async fn test_i236_surrogate_update_missing_keys_clear() {
+        let facade = make_facade();
+        let id = save_surrogate_via_facade(&facade, Some("op236"), "dep236", "i236-clear-flow").await;
+
+        // 预置：四腿都有值且 enabled=0（带全键，新旧语义下都成立）
+        let preset = facade.flow("processSurrogate/update", &args_of(vec![
+            ("id", json!(id.clone())),
+            ("processName", json!("i236-clear-flow")),
+            ("surrogate", json!("dep236b")),
+            ("startTime", json!("2026-08-01 00:00:00")),
+            ("endTime", json!("2026-08-31 23:59:59")),
+            ("enabled", json!(0)),
+        ])).await;
+        assert_eq!(preset["code"], 0, "预置四腿应有值: {}", preset);
+
+        // 只带 id 的 update ⇒ 四腿清空、enabled 复位 1、operator 保留
+        let upd = facade
+            .flow("processSurrogate/update", &args_of(vec![("id", json!(id.clone()))]))
+            .await;
+        assert_eq!(upd["code"], 0, "只带 id 的 update 应成功: {}", upd);
+        let detail = facade
+            .flow("processSurrogate/detail", &args_of(vec![("id", json!(id))])).await;
+        let blank = |k: &str| -> bool {
+            let v = &detail["data"][k];
+            v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
+        };
+        assert!(blank("process_name"), "缺 processName ⇒ 应清空，实得 {:?}", detail["data"]["process_name"]);
+        assert!(blank("surrogate"), "缺 surrogate ⇒ 应清空，实得 {:?}", detail["data"]["surrogate"]);
+        assert!(blank("start_time"), "缺 startTime ⇒ 应清空，实得 {:?}", detail["data"]["start_time"]);
+        assert!(blank("end_time"), "缺 endTime ⇒ 应清空，实得 {:?}", detail["data"]["end_time"]);
+        assert_eq!(detail["data"]["enabled"], json!(1),
+            "缺 enabled ⇒ 复位 1（java `enabledArg==null⇒1` 同形），实得 {:?}", detail["data"]["enabled"]);
+        assert_eq!(detail["data"]["operator"].as_str(), Some("op236"),
+            "operator 专例：缺省必须保留原授权人（覆写＝造死行，issues/152 档 4）");
+
+        // 布尔折算回归腿（rust 一直合规）：true→1 / false→0
+        let on = facade.flow("processSurrogate/update",
+            &args_of(vec![("id", json!(id.clone())), ("enabled", json!(true))])).await;
+        assert_eq!(on["code"], 0, "布尔 enabled=true 应接受: {}", on);
+        let detail = facade.flow("processSurrogate/detail", &args_of(vec![("id", json!(id))])).await;
+        assert_eq!(detail["data"]["enabled"], json!(1), "布尔 true ⇒ 1");
     }
 
     /// 档 5（② 门面层）：`processSurrogate/page` 归属——带 operator 只见自己；
