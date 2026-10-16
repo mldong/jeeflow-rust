@@ -1357,11 +1357,15 @@ impl JeeflowEngineImpl {
     pub fn execute_and_jump_sync(&self, task_id: i64, operator: &str,
                                  args: &FlowData, target_name: Option<&str>)
         -> JeeflowResult<Vec<ProcessTask>> {
-        match target_name {
-            Some(name) => self.execute_jump_inner(task_id, operator, args, JumpTarget::Node(name)),
-            // issues/121 P2：target 为空＝血缘版「退回上一步」（submitType=3）。
-            // 此前这条分支与「退回发起人」（6）共用 get_first_task_node()，两语义塌成同值（issues/119）。
-            None => self.execute_jump_inner(task_id, operator, args, JumpTarget::RollbackLineage),
+        // audit8 R86：空串与"没带"同档＝血缘回退。基准＝java `JeeflowEngineImpl:184
+        // StringUtils.isEmpty(nodeName)`（php/csharp/go/py/node 五栈同判据，都在**引擎内**分这一档）。
+        // 本栈此前只分 Option::None ⇒ 门面把"taskName 传了空串"喂成 `Some("")`，
+        // 与六栈给出不同答案（那六栈回退、本栈静默 no-op）。
+        let blank = target_name.map(str::is_empty).unwrap_or(true);
+        if blank {
+            self.execute_jump_inner(task_id, operator, args, JumpTarget::RollbackLineage)
+        } else {
+            self.execute_jump_inner(task_id, operator, args, JumpTarget::Node(target_name.unwrap_or_default()))
         }
     }
 
@@ -1378,6 +1382,18 @@ impl JeeflowEngineImpl {
         let define = self.repo().find_define_by_id(instance.define_id)?
             .ok_or(JeeflowError::DefineNotFound(instance.define_id))?;
         let model = ModelParser::parse(&define.content_str())?;
+
+        // audit8 R86（issues/209 §3.2）：跳转目标节点名**在任何状态变更前**校验。
+        // 六栈（java/go/py/node/php/csharp）的报错点在 prepare 之后，靠外层事务回滚兜住
+        // "任务未被动"这一腿；本栈宿主没注册 `TransactionTemplate` 时是**裸跑**
+        // （见 `in_tx` 的 None 分支），把校验放在 dispatch 处 ⇒ 报红的同时任务已 DONE、
+        // 事件已 fire＝实例原地失联还留下半截事实。文案与六栈逐字一致（HTTP 出口 99999999）。
+        if let JumpTarget::Node(name) = mode {
+            if model.get_node(name).is_none() {
+                return Err(JeeflowError::Business(
+                    format!("根据节点名称[{}]无法找到节点模型", name)));
+            }
+        }
 
         // resume 语义对齐 Go mergeVars(args, inst.Variables)：实例已持久化变量为底、
         // 本次提交覆盖（详见 execute_task_async 注释，L3 S11-B）。
@@ -1435,9 +1451,13 @@ impl JeeflowEngineImpl {
 
         match mode {
             JumpTarget::Node(name) => {
-                if let Some(node) = exec.process_model.get_node(name).cloned() {
-                    self.execute_node(&mut exec, &node)?;
-                }
+                // R86：契约性报错在上面的**前置校验**那一处（唯一出口，文案逐字对齐六栈）；
+                // 走到这里查不到属"校验后模型变了"的不可能形状，只留一条 Internal 兜底，
+                // 不再像旧实现那样静默 no-op（那条 no-op 就是本案的病灶）。
+                let node = exec.process_model.get_node(name).cloned().ok_or_else(|| {
+                    JeeflowError::Internal(format!("跳转目标节点在入口校验后消失: {}", name))
+                })?;
+                self.execute_node(&mut exec, &node)?;
             }
             // submitType=6 退回发起人：跳 start 直接后继那条节点（形状与原实现一致，已与 3 彻底分开）
             JumpTarget::FirstTaskNode => {
@@ -2010,6 +2030,75 @@ mod tests {
         let tasks = repo.find_doing_tasks(inst, &[]).unwrap();
         assert!(!tasks.is_empty(), "应有在办任务");
         tasks[0].task_id
+    }
+
+    /// audit8 R86 负向一（issues/209 §3.2）：`submitType=4` 跳**模型里不存在**的节点名 ⇒
+    /// 显式报错，且文案与六栈逐字一致；校验排在任何写之前——任务仍 DOING、实例仍 10、
+    /// 行数不变、零办结/退回事件。
+    /// 修前形状＝静默 no-op（对外 code=0＋任务被办掉＋无后继＝实例原地失联，还留下半截事实）；
+    /// 摘掉前置校验（改 `if false`）本用例照红，因为报错会退到 dispatch 处的 Internal 兜底文案。
+    #[test]
+    fn test_r86_jump_missing_node_raises_without_touching_state() {
+        let (engine, repo, capture, define_id) = outcome_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+        let tid = doing_task(&repo, instance.instance_id);
+        capture.rows.lock().unwrap().clear();
+
+        let err = engine.execute_and_jump_sync(tid, "user1", &exp_submit(4), Some("nope"))
+            .expect_err("跳转目标节点不存在必须报错（修前＝静默 no-op，对外 code 落 0）");
+        let msg = err.to_string();
+        assert!(msg.contains("根据节点名称[nope]无法找到节点模型"),
+            "文案要与六栈逐字一致，实得：{}", msg);
+
+        let row = repo.find_task_by_id(tid).unwrap().expect("任务行应还在");
+        assert_eq!(row.task_state, TaskState::Doing.code(),
+            "校验必须排在任何状态变更之前：任务行不得被办掉");
+        let inst_row = repo.find_instance_by_id(instance.instance_id).unwrap().expect("实例行");
+        assert_eq!(inst_row.state, InstanceState::Doing.code(), "实例不得进入终态");
+        assert_eq!(repo.find_doing_tasks(instance.instance_id, &[]).unwrap().len(), 1,
+            "既不得新建行，也不得让原有行消失");
+        let mine: Vec<String> = capture.rows.lock().unwrap().iter()
+            .filter(|(_, s)| *s == tid)
+            .map(|(t, _)| t.spec_name().to_string())
+            .collect();
+        assert!(mine.is_empty(), "报错这一腿不得留下办结/退回事件，实得 {:?}", mine);
+    }
+
+    /// audit8 R86 正向对照：合法目标名照旧跳得过去（本夹具只有 apply／end 两个可跳点，
+    /// 取 `end` ⇒ 实例办结）。专治"把前置校验写成逢 jump 必报错"那一形——那种实现下
+    /// 上面两条负向档都绿，本档会红。
+    #[test]
+    fn test_r86_jump_ok_positive_control() {
+        let (engine, repo, _capture, define_id) = outcome_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+        let tid = doing_task(&repo, instance.instance_id);
+
+        let _ = engine.execute_and_jump_sync(tid, "user1", &exp_submit(4), Some("end"))
+            .expect("合法目标名不该报错（前置校验写成逢 jump 必报错＝本用例红）");
+        let inst_row = repo.find_instance_by_id(instance.instance_id).unwrap().expect("实例行");
+        assert_eq!(inst_row.state, InstanceState::Finished.code(), "跳到 end 应办结实例");
+    }
+
+    /// audit8 R86 负向二（空串档）：`Some("")` 与 `None` 同档＝血缘回退。
+    /// 基准＝java `JeeflowEngineImpl:184 StringUtils.isEmpty(nodeName)`——六栈都在**引擎内**
+    /// 分这一档，本栈此前只分 `Option::None` ⇒ 门面把 "taskName 传了空串" 喂成 `Some("")` 时
+    /// 两栈给出不同答案。夹具里 apply 是首任务节点（parent 为空）⇒ 回退档的文案是
+    /// 「上一步任务ID为空…」，与「无法找到节点模型」分得开，才算真走了回退那一支。
+    #[test]
+    fn test_r86_jump_blank_target_name_takes_lineage_rollback() {
+        let (engine, repo, _capture, define_id) = outcome_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
+        let tid = doing_task(&repo, instance.instance_id);
+
+        let err = engine.execute_and_jump_sync(tid, "user1", &exp_submit(4), Some(""))
+            .expect_err("空串走回退档，本夹具无血缘 ⇒ 应显式报错而不是静默");
+        let msg = err.to_string();
+        assert!(msg.contains("上一步任务ID为空"), "空串应落进血缘回退那一档，实得：{}", msg);
+        assert!(!msg.contains("无法找到节点模型"),
+            "空串不得被当成\"节点名不存在\"，那会把六栈的回退语义翻成报错语义：{}", msg);
     }
 
     /// 正向（issues/168 主判据）：submitType=20（会签软拒绝）经 `execute_task_async`
