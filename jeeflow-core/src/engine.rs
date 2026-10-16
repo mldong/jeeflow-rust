@@ -895,8 +895,8 @@ impl JeeflowEngineImpl {
 
 impl JeeflowEngine for JeeflowEngineImpl {
     /// ㉔ 修复（audit8 R9 前夜普查）：本 trait 此前 6 法全 `Err("Use async variant")` 死桩、
-    /// 且全仓 `dyn JeeflowEngine` 零命中 ⇒ 无可注入/可装饰抽象层、spec/05 §234「事务包装由
-    /// 仓储提供」无落点。现修成**真实现**：逐法委托同步内核，并经 [`Self::in_tx`] 包裹
+    /// 且全仓 `dyn JeeflowEngine` 零命中 ⇒ 无可注入/可装饰抽象层、规范 05「事务约定」
+    /// 那条的原话「事务包装由仓储提供」无落点。现修成**真实现**：逐法委托同步内核，并经 [`Self::in_tx`] 包裹
     /// （与 async 入口同一语义：宿主注册了模板就走模板、没注册裸跑——spec/12 §12.1 原则 4）。
     fn start_process_instance(&self, define_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<ProcessInstance> {

@@ -185,7 +185,7 @@ fn block_on_any<F: std::future::Future>(f: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
 
-/// SQLx 事务模板（`ITransactionTemplate` 的 rust 实现；spec/05 §234「事务包装由仓储提供」）。
+/// SQLx 事务模板（`ITransactionTemplate` 的 rust 实现；规范 05「事务约定」的原话「事务包装由仓储提供」）。
 ///
 /// 语义（spec/12 §12.4 三档判据的真库测试见 `tx-tier-145` 测试件）：
 /// - 原子档：`action` 返回 `Err`（或闭包内 `?` 传播）⇒ 整笔 ROLLBACK；
