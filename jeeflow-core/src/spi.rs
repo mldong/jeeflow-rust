@@ -260,6 +260,16 @@ pub trait TransactionTemplate: Send + Sync {
         &self,
         action: Box<dyn FnOnce() -> JeeflowResult<Box<dyn std::any::Any + Send>> + Send + 'a>,
     ) -> JeeflowResult<Box<dyn std::any::Any + Send>>;
+
+    /// 提交后腿通道（audit8 R77 读法一，spec/12 §12.3.1／issues/234 §4.3）：
+    /// 语义＝"确保这条腿在**本次事务提交之后**执行；当前线程没有活动事务就立即执行"。
+    /// 回滚 ⇒ 整批丢弃。默认实现直接调用回调＝本实现没有这条通道 ⇒ 行为与上一版逐字不变
+    /// （＝ C# 的 DIM 等价物，既有实现方零改动）。
+    /// 契约下限＝"监听器看到的世界＝已提交"由**监听器侧**承担，不要求 fire 点搬家
+    /// （参考实现 java＝事务内 fire＋监听器自取 afterCommit；php 已由 R25 收口同形）。
+    fn after_commit(&self, cb: Box<dyn FnOnce() + Send>) {
+        cb();
+    }
 }
 
 // ═══════════════════════════════════════════════════════

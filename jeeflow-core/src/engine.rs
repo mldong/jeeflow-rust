@@ -920,6 +920,19 @@ impl JeeflowEngineImpl {
         self.in_tx(|| self.start_sync(define_id, operator, args))
     }
 
+    /// 提交后腿通道（audit8 R77 读法一，spec/12 §12.3.1／issues/234 §4.3）：
+    /// 监听器/集成层用它把"必须看到已提交世界"的那一腿（反查、外发通知、二次写）挪到 COMMIT 之后，
+    /// 回滚则整批丢弃；当前线程不在活动事务里 ⇒ 立即执行（＝"落库后"与"提交后"等价，行为逐字不变）。
+    /// 门面级没接模板（`transaction_template == None`）⇒ 也立即执行。
+    /// ⚠ 引擎自身的 fire 不经此处：派发点与"监听器在动作事务内被调"由 145-3 钉住，
+    /// 契约下限由监听器侧承担（java 形状＝事务内 fire＋监听器自取 afterCommit）。
+    pub fn run_after_commit(&self, f: Box<dyn FnOnce() + Send>) {
+        match &self.ctx.transaction_template {
+            Some(tpl) => tpl.after_commit(f),
+            None => f(),
+        }
+    }
+
     /// 同步内核（不自行包裹）：供门面复合动作在**动作级 in_tx** 内直调（嵌套 join 免费）。
     pub fn start_sync(&self, define_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<ProcessInstance> {
@@ -5828,5 +5841,189 @@ mod actor_i142_tests {
         // 反向哨兵
         assert_eq!(parse_actor_ids(Some(&JsonValue::Array(vec![JsonValue::Str("0".into())]))),
             vec!["0".to_string()], "哨兵：'0' 不得被当成空值丢掉");
+    }
+
+}
+
+/// audit8 R77 读法一（issues/234 §4.3／spec12 §12.3.1）：提交后腿通道的判据组。
+#[cfg(test)]
+mod after_commit_r77_tests {
+    use crate::context::ServiceContext;
+    use crate::engine::JeeflowEngineImpl;
+    use crate::error::{JeeflowError, JeeflowResult};
+    use crate::id_gen::AtomicIdGenerator;
+    use crate::memory::MemoryRepository;
+    use crate::spi::{ProcessRepository, TransactionTemplate};
+    use std::sync::Arc;
+
+    // ═══ audit8 R77 读法一（issues/234 §4.3／spec12 §12.3.1）：提交后腿通道 ═══
+    //
+    // 契约下限＝"监听器看到的世界＝已提交"由**监听器侧**承担；fire 的派发点不动（145-3 形状），
+    // 要提交后语义就经 `run_after_commit` 自己声明。真库一侧（sqlx 模板的 TX_AFTER_COMMIT 槽）
+    // 在 jeeflow-repository-sqlx 的 mysql 腿里跑；本组只量引擎与 trait 这条接缝。
+
+    use std::any::Any;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// 脚本化模板：与 sqlx 实现同一套语义（活动事务里登记、提交后整批跑、回滚丢弃），不碰数据库。
+    #[derive(Default)]
+    struct StubTx {
+        active: AtomicBool,
+        pending: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+        nested_opens: AtomicUsize,
+        join_branch: AtomicUsize,
+    }
+
+    impl TransactionTemplate for StubTx {
+        fn execute_in_tx<'a>(
+            &self,
+            action: Box<dyn FnOnce() -> JeeflowResult<Box<dyn Any + Send>> + Send + 'a>,
+        ) -> JeeflowResult<Box<dyn Any + Send>> {
+            if self.active.swap(true, Ordering::SeqCst) {
+                self.join_branch.fetch_add(1, Ordering::SeqCst);
+                return action(); // join：登记归最外层那张表
+            }
+            self.nested_opens.fetch_add(1, Ordering::SeqCst);
+            let r = action();
+            self.active.store(false, Ordering::SeqCst);
+            match r {
+                Ok(v) => {
+                    let cbs = std::mem::take(&mut *self.pending.lock().unwrap());
+                    for cb in cbs { cb(); }
+                    Ok(v)
+                }
+                Err(e) => { self.pending.lock().unwrap().clear(); Err(e) }
+            }
+        }
+
+        fn after_commit(&self, cb: Box<dyn FnOnce() + Send>) {
+            if self.active.load(Ordering::SeqCst) {
+                self.pending.lock().unwrap().push(cb);
+            } else {
+                cb(); // 不在事务中 ⇒ 立即执行
+            }
+        }
+    }
+
+    /// 只实现 execute_in_tx 的旧形状模板 ⇒ `after_commit` 走 trait 默认实现＝立即调用
+    /// （⇒ 既有实现方零改动、未接通道的行为逐字不变）。
+    #[derive(Default)]
+    struct NoChannelTx;
+
+    impl TransactionTemplate for NoChannelTx {
+        fn execute_in_tx<'a>(
+            &self,
+            action: Box<dyn FnOnce() -> JeeflowResult<Box<dyn Any + Send>> + Send + 'a>,
+        ) -> JeeflowResult<Box<dyn Any + Send>> {
+            action()
+        }
+    }
+
+    fn engine_with_tx(tx: Arc<dyn TransactionTemplate>) -> JeeflowEngineImpl {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)))
+            .with_transaction_template(tx);
+        JeeflowEngineImpl::new(ctx)
+    }
+
+    /// 门面级没接模板的那一档（本块所在的是嵌套测试模块，够不着外层 `make_engine` ⇒ 就地造）。
+    fn engine_without_tx() -> JeeflowEngineImpl {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)));
+        JeeflowEngineImpl::new(ctx)
+    }
+
+    #[test]
+    fn r7701_leg_deferred_until_commit() {
+        let stub = Arc::new(StubTx::default());
+        let engine = engine_with_tx(stub.clone());
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let l1 = log.clone();
+        let l2 = log.clone();
+        let l3 = log.clone();
+        engine
+            .in_tx(|| {
+                engine.run_after_commit(Box::new(move || l2.lock().unwrap().push("leg")));
+                assert!(l1.lock().unwrap().is_empty(), "登记了就不该在提交前跑");
+                l3.lock().unwrap().push("body");
+                Ok(Box::new(1u8) as Box<dyn Any + Send>)
+            })
+            .unwrap();
+
+        assert_eq!(vec!["body", "leg"], *log.lock().unwrap(), "腿须在 COMMIT 之后恰好一次");
+    }
+
+    #[test]
+    fn r7702_rollback_discards_all_legs() {
+        let stub = Arc::new(StubTx::default());
+        let engine = engine_with_tx(stub.clone());
+        let ran = Arc::new(AtomicUsize::new(0));
+
+        let r1 = ran.clone();
+        let r2 = ran.clone();
+        let e = &engine; // 借引用而非 move 引擎（in_tx 自身也要 &self）
+        let res: JeeflowResult<Box<dyn Any + Send>> = e.in_tx(move || {
+            e.run_after_commit(Box::new(move || { r1.fetch_add(1, Ordering::SeqCst); }));
+            e.run_after_commit(Box::new(move || { r2.fetch_add(1, Ordering::SeqCst); }));
+            Err(JeeflowError::Internal("injected: R77 回滚探针".into()))
+        });
+        assert!(res.is_err(), "前置失效：注入的回滚错误没传出来");
+        assert_eq!(0, ran.load(Ordering::SeqCst), "回滚场景提交后腿一条都不该执行（修前无通道＝这两条腿已在事务内跑过）");
+    }
+
+    #[test]
+    fn r7703_template_without_channel_runs_immediately() {
+        let engine = engine_with_tx(Arc::new(NoChannelTx));
+        let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(vec![]));
+        let inner = log.clone();
+        let outer = log.clone();
+        engine
+            .in_tx(|| {
+                engine.run_after_commit(Box::new(move || inner.lock().unwrap().push("leg")));
+                outer.lock().unwrap().push("body");
+                Ok(Box::new(1u8) as Box<dyn Any + Send>)
+            })
+            .unwrap();
+        // 默认实现＝立即调用 ⇒ 腿在事务内就跑＝上一版行为
+        assert_eq!(vec!["leg", "body"], *log.lock().unwrap());
+    }
+
+    #[test]
+    fn r7704_no_template_and_nested_join() {
+        // ① 门面级没接模板 ⇒ 等价"落库后"⇒ 立即执行
+        let engine = engine_without_tx();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        engine.run_after_commit(Box::new(move || { r.fetch_add(1, Ordering::SeqCst); }));
+        assert_eq!(1, ran.load(Ordering::SeqCst));
+
+        // ② 嵌套：内层 execute_in_tx 走 join 支 ⇒ 登记归最外层那张表，内层退出不触发
+        let stub = Arc::new(StubTx::default());
+        let engine = engine_with_tx(stub.clone());
+        let legs: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(vec![]));
+        let lg = legs.clone();
+        let lg2 = legs.clone();
+        engine
+            .in_tx(|| {
+                engine
+                    .in_tx(|| {
+                        let l = lg.clone();
+                        engine.run_after_commit(Box::new(move || l.lock().unwrap().push("inner")));
+                        Ok(Box::new(1u8) as Box<dyn Any + Send>)
+                    })
+                    .unwrap();
+                assert!(lg2.lock().unwrap().is_empty(), "内层退出不得触发提交后腿");
+                Ok(Box::new(1u8) as Box<dyn Any + Send>)
+            })
+            .unwrap();
+        assert_eq!(vec!["inner"], *legs.lock().unwrap());
+        assert_eq!(1, stub.nested_opens.load(Ordering::SeqCst), "最外层只该开一次");
+        assert_eq!(1, stub.join_branch.load(Ordering::SeqCst), "内层必须走 join 支");
     }
 }

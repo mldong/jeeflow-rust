@@ -156,11 +156,29 @@ pub fn with_thread_tx_exec<R>(pool: &MySqlPool, f: impl FnOnce(SqlxExec<'_>) -> 
 
 /// 槽清理守卫：任何离场路径（含 panic 展开）清空槽；panic 路径上未提交的事务
 /// 由 sqlx `Transaction::drop` 排队回滚，连接随 `PoolConnection` 归还池。
+/// audit8 R77：提交后腿登记表与事务槽同生命周期 ⇒ 同一路径上一起丢弃（回滚/panic 都不许留下腿）。
 struct TxSlotGuard;
 impl Drop for TxSlotGuard {
     fn drop(&mut self) {
         let _ = TX_SLOT.with(|s| s.borrow_mut().take());
+        TX_AFTER_COMMIT.with(|c| c.borrow_mut().clear());
     }
+}
+
+// 提交后腿登记表（audit8 R77 读法一，spec/12 §12.3.1）：与 `TX_SLOT` 同生命周期的线程局部表。
+// 最外层事务装载，join 支不动 ⇒ 内层登记自然归最外层那张表；
+// `commit` 成功后整批执行（执行前先取空，避免腿里再自登记造成递归），回滚/panic 整批丢弃。
+// （注：`thread_local!` 是宏调用，文档注释挂不上 ⇒ 这里用普通注释，避免新增 unused_doc_comments 警告）
+thread_local! {
+    static TX_AFTER_COMMIT: RefCell<Vec<Box<dyn FnOnce() + Send>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn take_after_commit_callbacks() -> Vec<Box<dyn FnOnce() + Send>> {
+    TX_AFTER_COMMIT.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+fn push_after_commit_callback(cb: Box<dyn FnOnce() + Send>) {
+    TX_AFTER_COMMIT.with(|c| c.borrow_mut().push(cb));
 }
 
 fn block_on_any<F: std::future::Future>(f: F) -> F::Output {
@@ -202,8 +220,15 @@ impl TransactionTemplate for SqlxTransactionTemplate {
         match result {
             Ok(v) => {
                 if let Some(tx) = tx {
-                    block_on_any(tx.commit())
-                        .map_err(|e| JeeflowError::Internal(format!("tx commit: {e}")))?;
+                    if let Err(e) = block_on_any(tx.commit()) {
+                        // 提交失败 ⇒ 与回滚同档：腿整批丢弃（guard 的 Drop 负责清表）
+                        return Err(JeeflowError::Internal(format!("tx commit: {e}")));
+                    }
+                }
+                // audit8 R77：先取空再逐条跑（腿里再自登记不会递归）；
+                // 此刻 TX_SLOT 已 take ⇒ 腿里的反查走池连接，不踩在刚提交的连接上。
+                for cb in take_after_commit_callbacks() {
+                    cb();
                 }
                 Ok(v)
             }
@@ -211,8 +236,18 @@ impl TransactionTemplate for SqlxTransactionTemplate {
                 if let Some(tx) = tx {
                     let _ = block_on_any(tx.rollback());
                 }
+                TX_AFTER_COMMIT.with(|c| c.borrow_mut().clear()); // 回滚 ⇒ 整批丢弃
                 Err(e)
             }
+        }
+    }
+
+    /// 活动事务里登记提交后腿；不在事务中 ⇒ 立即执行（行为与上一版一致）。
+    fn after_commit(&self, cb: Box<dyn FnOnce() + Send>) {
+        if in_thread_tx() {
+            push_after_commit_callback(cb);
+        } else {
+            cb();
         }
     }
 }
