@@ -347,9 +347,10 @@ impl PersistMode {
 pub struct PersistPostInterceptor {
     meta_provider: std::sync::Arc<dyn IDynamicMetaProvider>,
     table_writer: std::sync::Arc<dyn DynamicTableWriter>,
-    /// 列匹配档位：`false`（缺省）＝宽松归一，`true`＝忽略大小写的逐字相等。
-    /// 对应 java `setStrictColumnMatch` / moon `with_strict_columns`（本栈沿用 moon 的
-    /// builder 命名，rust 侧没有 setter 习惯）。
+    /// **audit8 R78 甲-1（2026-10-16 owner 拍）后本字段不再参与任何判定**，仅为已发布 API 的形状保留。
+    /// 原档＝java `setStrictColumnMatch` 的同名开关；本栈的列匹配只有 `filter_editable` 一处代码点
+    /// ⇒ 它同时是「元数据腿」与「业务表轴」，两轴在 rust 不同形，故档位只能钉死在元数据腿那一档。
+    #[allow(dead_code)]
     strict_columns: bool,
 }
 
@@ -361,7 +362,14 @@ impl PersistPostInterceptor {
         PersistPostInterceptor { meta_provider, table_writer, strict_columns: false }
     }
 
-    /// 显式开启严格列匹配（spec/09「列匹配（1.6.4）」的逃生门；缺省是宽松归一）。
+    /// ~~显式开启严格列匹配（spec/09「列匹配（1.6.4）」的逃生门）~~
+    ///
+    /// **audit8 R78 甲-1 起本方法不再影响任何行为**：元数据腿一律逐字精确（只折大小写），
+    /// 宽松归一档移交集成方 writer 自己决定（尺子仍是公开件 `normalize_column`／
+    /// `column_names_equal`／`find_data_key`）。保留签名只为已发布 crate 不断档。
+    #[deprecated(
+        note = "R78 甲-1：元数据腿恒逐字精确，本开关已无消费者；业务表列匹配请集成方用自己的 writer"
+    )]
     pub fn with_strict_columns(mut self, strict: bool) -> Self {
         self.strict_columns = strict;
         self
@@ -481,17 +489,29 @@ impl PersistPostInterceptor {
 
     /// 按列权限过滤出可写字段（对齐 Java writer 列权限过滤；表无列则不写）。
     ///
-    /// issues/195 ④：列匹配按 spec/09「列匹配（1.6.4）」走**宽松归一**缺省档（驼峰表单键 ↔
-    /// 蛇形表列，命中后**写入用表列原名**，与 java `findDataKey`／moon `filter_editable` 同判据），
-    /// `strict_columns` 显式开严格档。此前只有逐字相等一档 ⇒ 表单驼峰键对蛇形列**静默丢列**
-    /// （该列不落、无报错无日志）。
+    /// **audit8 R78 甲档（2026-10-16 owner 拍甲，同日现读更正为甲-1）**：本腿一律逐字精确（只折大小写），
+    /// 禁止「驼峰↔下划线」分隔符归一。基准＝java `MetaTableWriter.insert:52-77`（`data.get(f.name)`
+    /// ＋ `findField` 的 `equalsIgnoreCase`）与 moon `meta_writer.mbt` 的 `strict=true`。
+    ///
+    /// 为什么 rust 只能这样裁（甲-1 的根据，逐仓现读）：java 把两轴拆在两个类里——元数据腿
+    /// `MetaTableWriter`（恒精确）与无元数据时回落的基础 writer `JdbcDynamicTableWriter`
+    /// （spec/09 1.6.4 默认宽松）；rust 全联邦里 `DynamicTableWriter` 只有测试用的
+    /// `InMemoryTableWriter` 一个实现（真库 writer 由集成侧自写，见 `jeeflow-repository-sqlx`
+    /// 的 ⑥ 注释），`filter_editable` 是唯一的列匹配代码点，也是 `strict_columns` 的唯一下游
+    /// ⇒ 两轴在 rust 同源，钉元数据腿必然撤掉本腿的宽松档。**宽松尺子仍是公开件**
+    /// （`normalize_column`／`column_names_equal`／`find_data_key`），集成方 writer 要用自己接。
+    ///
+    /// 后果与留痕：表单键只差分隔符（`companyName` vs 表列 `company_name`）不再落该列，
+    /// 整单为空时由 `empty_persist_row_warning` 出声（不是静默丢）。此前本腿吃
+    /// `self.strict_columns`，缺省宽松 ⇒ 与参考实现方向相反，是本条要修的违约档。
     fn filter_editable(&self, meta: &TableMeta, data: &HashMap<String, JsonValue>) -> HashMap<String, JsonValue> {
         let mut filtered = HashMap::new();
         for field in &meta.fields {
             if !field.is_editable() {
                 continue;
             }
-            if let Some(key) = find_data_key(data, &field.column_name, self.strict_columns) {
+            // 元数据腿固定严格档（R78 甲）；`strict_columns` 只留给业务表轴
+            if let Some(key) = find_data_key(data, &field.column_name, true) {
                 if let Some(val) = data.get(key) {
                     filtered.insert(field.column_name.clone(), val.clone());
                 }
@@ -1057,8 +1077,55 @@ mod tests {
         assert_eq!(row.get("update_user").and_then(|v| v.as_str()), Some("user1"));
     }
 
-    /// P3：ARCHIVE 仅「结束节点 + FINISHED(20) + submitType=1(同意)」落库一次；
-    /// 发起/办理不写（L2-06 start_empty 断言）；驳回不写；幂等先查后插。
+    // ── audit8 R78 甲档：元数据腿固定严格档，`strict_columns` 只管业务表轴 ──
+
+    #[test]
+    fn test_r78_meta_leg_rejects_camel_key_even_in_lenient_switch() {{
+        // 开关处于缺省（宽松）档：元数据腿也不许把「只差分隔符」的表单键判成命中
+        let mut provider = InMemoryMetaProvider::new();
+        provider.register(merchant_meta());
+        let it = PersistPostInterceptor::new(
+            std::sync::Arc::new(provider),
+            std::sync::Arc::new(InMemoryTableWriter::new()),
+        );
+        assert!(!it.strict_columns, "铁定前提：本例走的确是缺省宽松档");
+        let meta = merchant_meta();
+        let mut data: HashMap<String, JsonValue> = HashMap::new();
+        data.insert("companyName".to_string(), JsonValue::Str("驼峰值".to_string()));
+        let filtered = it.filter_editable(&meta, &data);
+        assert!(
+            !filtered.contains_key("company_name"),
+            "元数据腿必须逐字精确：驼峰键不得命中蛇形列（甲档）"
+        );
+    }}
+
+    #[test]
+    fn test_r78_meta_leg_positive_case_fold_and_switch_scope_intact() {{
+        let mut provider = InMemoryMetaProvider::new();
+        provider.register(merchant_meta());
+        let it = PersistPostInterceptor::new(
+            std::sync::Arc::new(provider),
+            std::sync::Arc::new(InMemoryTableWriter::new()),
+        );
+        let meta = merchant_meta();
+        // 阳性对照：只差大小写仍取到值，且写入用表列原名（防把 java 档整片打死）
+        let mut data: HashMap<String, JsonValue> = HashMap::new();
+        data.insert("COMPANY_NAME".to_string(), JsonValue::Str("大写形".to_string()));
+        let filtered = it.filter_editable(&meta, &data);
+        assert_eq!(
+            filtered.get("company_name").and_then(|v| v.as_str()),
+            Some("大写形"),
+            "java 档允许折大小写"
+        );
+        // 回归：业务表轴那把尺子没被本改带动（缺省宽松仍命中、显式严格才不命中）
+        assert!(
+            column_names_equal("companyName", "company_name", false),
+            "spec/09 业务表轴缺省档＝宽松归一，不许被元数据腿的改动收紧"
+        );
+        assert!(!column_names_equal("companyName", "company_name", true));
+    }}
+
+
     #[test]
     fn test_persist_archive_only_end_finished_agree() {
         let writer = std::sync::Arc::new(InMemoryTableWriter::new());

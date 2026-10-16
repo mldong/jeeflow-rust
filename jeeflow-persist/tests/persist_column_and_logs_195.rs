@@ -1,9 +1,11 @@
 //! issues/195 · audit8 R29 C 案三条真缺陷的判据（rust persist 腿）。
 //!
 //! 覆盖三档，每档都配"修前会红"的形状：
-//! - **④ 列匹配**（spec/09「列匹配（1.6.4）」）：默认宽松归一（驼峰表单键 → 蛇形表列，写入用
-//!   表列原名）＋ `with_strict_columns(true)` 严格档逃生门 ＋ 撞列时的确定性胜者规则。
-//!   修前只有逐字相等一档 ⇒ 驼峰键**静默丢列**，无报错无日志。
+//! - **④ 列匹配**（spec/09「列匹配（1.6.4）」× spec/10 §5.1）：**引擎元数据腿恒逐字精确（只折大小写）**，
+//!   宽松归一档只作为**公开尺子**留给集成方自己的 writer（`normalize_column`／`column_names_equal`／
+//!   `find_data_key`），`with_strict_columns` 自 R78 甲-1 起是**已作废的 no-op**（保留签名不断档）。
+//!   ⇒ 这一档的形状被两次改判，两处判据各钉一刀、不许混：issues/195 ④ 立「默认宽松」，
+//!   audit8 R78 甲-1（2026-10-16 owner 拍）撤回元数据腿那一半，理由与现读根据写在用例注释里。
 //! - **② 两条静默不落腿**：写了 persistMode 却不认识、字段过滤后空集 ⇒ 各落一条可诊断 WARN
 //!   （issues/162 家族形状：纯函数文案＋`eprintln!` 落点）。日志"真拿到"用**自再执行**捕获子进程
 //!   stderr（与 `jeeflow-facade/tests/highlight_degrade_log_162.rs` 同法，不接受"注释自称已落日志"），
@@ -118,14 +120,20 @@ fn camel_vars() -> FlowData {
     v
 }
 
-fn interceptor(
+fn interceptor(meta: TableMeta, writer: Arc<InMemoryTableWriter>) -> PersistPostInterceptor {
+    let mut provider = InMemoryMetaProvider::new();
+    provider.register(meta);
+    PersistPostInterceptor::new(Arc::new(provider), writer)
+}
+
+/// R78 甲-1：本开关已无消费者。判据要用它，就得显式承认自己在调 deprecated 件。
+#[allow(deprecated)]
+fn interceptor_via_inert_switch(
     meta: TableMeta,
     writer: Arc<InMemoryTableWriter>,
     strict: bool,
 ) -> PersistPostInterceptor {
-    let mut provider = InMemoryMetaProvider::new();
-    provider.register(meta);
-    PersistPostInterceptor::new(Arc::new(provider), writer).with_strict_columns(strict)
+    interceptor(meta, writer).with_strict_columns(strict)
 }
 
 fn row_of(writer: &InMemoryTableWriter) -> Option<HashMap<String, JsonValue>> {
@@ -146,36 +154,67 @@ fn test_195_column_name_matching_rules() {
     assert!(!column_names_equal("companyName", "company_name", true));
 }
 
-/// ④ 正向：SYNC 发起 INSERT，驼峰表单键落到蛇形表列，且**写入用表列原名**（spec/09 判据表）。
-/// 修前此条为红：`filter_editable` 只 `data.get(&column_name)` ⇒ 驼峰两列被静默丢弃。
+/// ④（R78 甲-1 重切）：元数据腿恒逐字精确 ⇒ 驼峰表单键**不落**蛇形列；只差大小写的键照落，
+/// 且**写入用表列原名**；宽松归一仍作为公开尺子留在 crate 里（集成方 writer 自己接）。
+///
+/// 本条原先的正向期望值是「驼峰键按宽松归一落到蛇形列」（issues/195 ④ 立）。撤回它的不是本轮
+/// 代码，是 owner 2026-10-16 拍的 R78 甲档＋同日现读更正的甲-1 落法：rust 全联邦里
+/// `DynamicTableWriter` 只有测试用的 `InMemoryTableWriter`（真库 writer 由集成侧自写，见
+/// `jeeflow-repository-sqlx` 的 ⑥ 注释），`filter_editable` 是本栈**唯一**的列匹配代码点
+/// ⇒ spec/09 1.6.4 那条「业务表轴」在 rust 没有独立一条腿，两轴同源时按 spec/10 §5.1 钉元数据腿。
+/// java 参考实现同档（`MetaTableWriter.insert:52-77` 走 `data.get(f.name)`）。
 #[test]
-fn test_195_sync_camel_key_lands_on_snake_column() {
+fn test_195_meta_leg_verbatim_only_after_r78_jia() {
     let writer = Arc::new(InMemoryTableWriter::new());
-    let itc = interceptor(merchant_meta(), writer.clone(), false);
+    let itc = interceptor(merchant_meta(), writer.clone());
     let mut e = exec("start", NodeType::Start, Some("SYNC"), Some("merchant_settlement"), camel_vars(), 10, None);
     itc.intercept(&mut e).unwrap();
 
-    let row = row_of(&writer).expect("驼峰键应按宽松归一落到蛇形列");
-    assert_eq!(row.get("company_name").and_then(|v| v.as_str()), Some("Acme"));
-    assert_eq!(row.get("contact_name").and_then(|v| v.as_str()), Some("Bob"));
+    // 三枚 f_ 键里只有蛇形那枚（f_contact_phone → contact_phone）能落，两枚驼峰被逐字精确档拒掉
+    let row = row_of(&writer).expect("蛇形键 f_contact_phone 必须落库（阳性对照，防把整片打死）");
     assert_eq!(row.get("contact_phone").and_then(|v| v.as_str()), Some("13900000000"));
-    // 不许把驼峰原键当列名写出去
-    assert!(!row.contains_key("companyName"));
-    assert!(!row.contains_key("f_companyName"));
+    assert!(!row.contains_key("company_name"), "甲-1：驼峰键不得命中蛇形列，实得 {row:?}");
+    assert!(!row.contains_key("contact_name"), "甲-1：驼峰键不得命中蛇形列，实得 {row:?}");
+    assert!(!row.contains_key("companyName") && !row.contains_key("contactName"));
+
+    // 只差大小写 ⇒ 仍要取值，且写出用表列原名（spec/10 §5.1 要求的阳性对照档）
+    let w2 = Arc::new(InMemoryTableWriter::new());
+    let itc2 = interceptor(merchant_meta(), w2.clone());
+    let mut vars = FlowData::new();
+    vars.insert_str("f_COMPANY_NAME", "Acme");
+    let mut e2 = exec("start", NodeType::Start, Some("SYNC"), Some("merchant_settlement"), vars, 10, None);
+    itc2.intercept(&mut e2).unwrap();
+    let row2 = row_of(&w2).expect("只差大小写的键必须落库");
+    assert_eq!(row2.get("company_name").and_then(|v| v.as_str()), Some("Acme"), "写入必须用表列原名");
+
+    // 回归：1.6.4 那把宽松尺子仍是公开件（本栈不接进元数据腿，但集成方要用用得着）
+    assert!(column_names_equal("companyName", "company_name", false));
+    assert_eq!(normalize_column("COMPANY_NAME"), "companyname");
 }
 
-/// ④ 负向：严格档只认逐字（忽略大小写）相等 ⇒ 驼峰键不落，蛇形键照落。
+/// ④（R78 甲-1）：`with_strict_columns` 已是 no-op ⇒ 不传／传 `false`／传 `true` 三条腿读数必须全等。
+/// 这条咬的是"开关作废"这个形状本身：谁把 `filter_editable` 改回吃 `self.strict_columns`，
+/// `false` 腿就会重新收下驼峰键而红。
 #[test]
-fn test_195_strict_column_mode_keeps_verbatim_only() {
-    let writer = Arc::new(InMemoryTableWriter::new());
-    let itc = interceptor(merchant_meta(), writer.clone(), true);
-    let mut e = exec("start", NodeType::Start, Some("SYNC"), Some("merchant_settlement"), camel_vars(), 10, None);
-    itc.intercept(&mut e).unwrap();
-
-    let row = row_of(&writer).expect("严格档下 f_contact_phone 仍应落库");
-    assert_eq!(row.get("contact_phone").and_then(|v| v.as_str()), Some("13900000000"));
-    assert!(!row.contains_key("company_name"), "严格档不该收驼峰键: {row:?}");
-    assert!(!row.contains_key("contact_name"), "严格档不该收驼峰键: {row:?}");
+fn test_195_strict_column_switch_is_inert_three_legs_identical() {
+    let mut rows: Vec<(String, HashMap<String, JsonValue>)> = Vec::new();
+    for (label, strict) in [("不传开关", None), ("传 false", Some(false)), ("传 true", Some(true))] {
+        let writer = Arc::new(InMemoryTableWriter::new());
+        let itc = match strict {
+            None => interceptor(merchant_meta(), writer.clone()),
+            Some(s) => interceptor_via_inert_switch(merchant_meta(), writer.clone(), s),
+        };
+        let mut e = exec("start", NodeType::Start, Some("SYNC"), Some("merchant_settlement"), camel_vars(), 10, None);
+        itc.intercept(&mut e).unwrap();
+        rows.push((label.to_string(), row_of(&writer).unwrap_or_default()));
+    }
+    let first = rows[0].1.clone();
+    for (label, row) in &rows[1..] {
+        assert_eq!(&first, row, "开关三腿读数必须全等（{label} 与不传腿分叉）: {row:?}");
+    }
+    // 全等之外还要有内容：蛇形落、驼峰不落（三条恒空的腿也能"全等"自证绿 ⇒ 必须有阳性对照）
+    assert!(first.contains_key("contact_phone"), "不传腿蛇形键应落库: {first:?}");
+    assert!(!first.contains_key("company_name"), "不传腿驼峰键不该落库: {first:?}");
 }
 
 /// ④ 确定性：同一列被两个键命中（逐字蛇形 ＋ 驼峰同义）时，**逐字相等者优先**。
@@ -189,7 +228,7 @@ fn test_195_verbatim_key_wins_when_both_forms_present() {
     assert_eq!(find_data_key(&data, "company_name", false).map(String::as_str), Some("company_name"));
 
     let writer = Arc::new(InMemoryTableWriter::new());
-    let itc = interceptor(merchant_meta(), writer.clone(), false);
+    let itc = interceptor(merchant_meta(), writer.clone());
     let mut vars = FlowData::new();
     vars.insert_str("f_company_name", "SNAKE");
     vars.insert_str("f_companyName", "CAMEL");
@@ -205,7 +244,7 @@ fn test_195_verbatim_key_wins_when_both_forms_present() {
 fn test_195_system_time_follows_injected_clock() {
     let _scope = clock::ClockScope::injected(|| "2026-01-02 03:04:05".to_string());
     let writer = Arc::new(InMemoryTableWriter::new());
-    let itc = interceptor(merchant_meta(), writer.clone(), false);
+    let itc = interceptor(merchant_meta(), writer.clone());
     let mut vars = FlowData::new();
     vars.insert_str("f_company_name", "Acme");
     let mut e = exec("start", NodeType::Start, Some("SYNC"), Some("merchant_settlement"), vars, 10, None);
@@ -222,7 +261,7 @@ fn test_195_system_time_follows_injected_clock() {
 fn test_195_system_time_falls_back_to_core_default_clock() {
     let _guard = clock::lock_scope();
     let writer = Arc::new(InMemoryTableWriter::new());
-    let itc = interceptor(merchant_meta(), writer.clone(), false);
+    let itc = interceptor(merchant_meta(), writer.clone());
     let mut vars = FlowData::new();
     vars.insert_str("f_company_name", "Acme");
     let mut e = exec("start", NodeType::Start, Some("SYNC"), Some("merchant_settlement"), vars, 10, None);
@@ -262,7 +301,7 @@ fn test_195_unknown_persist_mode_warns_and_skips() {
         // 子进程 ①：拼错的模式串（ARCHIVE + 尾空格 trim 后仍不认识）
         Ok("typo") => {
             let writer = Arc::new(InMemoryTableWriter::new());
-            let itc = interceptor(merchant_meta(), writer.clone(), false);
+            let itc = interceptor(merchant_meta(), writer.clone());
             let mut vars = FlowData::new();
             vars.insert_str("f_company_name", "Acme");
             // 结束＋FINISHED＋同意：模式认得的话这一腿必然落库
@@ -274,7 +313,7 @@ fn test_195_unknown_persist_mode_warns_and_skips() {
         // 子进程 ②：正常模式 ⇒ 落库成功
         Ok("ok") => {
             let writer = Arc::new(InMemoryTableWriter::new());
-            let itc = interceptor(merchant_meta(), writer.clone(), false);
+            let itc = interceptor(merchant_meta(), writer.clone());
             let mut vars = FlowData::new();
             vars.insert_str("f_company_name", "Acme");
             let mut e = exec("end", NodeType::End, Some("ARCHIVE"), Some("merchant_settlement"), vars, 20, Some(1));
@@ -309,7 +348,7 @@ fn test_195_empty_filtered_row_warns_and_skips() {
         // 子进程 ①：表列与表单键名完全对不上 ⇒ 空集
         Ok("empty") => {
             let writer = Arc::new(InMemoryTableWriter::new());
-            let itc = interceptor(unrelated_meta(), writer.clone(), false);
+            let itc = interceptor(unrelated_meta(), writer.clone());
             let mut vars = FlowData::new();
             vars.insert_str("f_company_name", "Acme");
             let mut e = exec("start", NodeType::Start, Some("SYNC"), Some("merchant_settlement"), vars, 10, None);
@@ -320,7 +359,7 @@ fn test_195_empty_filtered_row_warns_and_skips() {
         // 子进程 ②：对得上 ⇒ 落库
         Ok("match") => {
             let writer = Arc::new(InMemoryTableWriter::new());
-            let itc = interceptor(merchant_meta(), writer.clone(), false);
+            let itc = interceptor(merchant_meta(), writer.clone());
             let mut vars = FlowData::new();
             vars.insert_str("f_company_name", "Acme");
             let mut e = exec("start", NodeType::Start, Some("SYNC"), Some("merchant_settlement"), vars, 10, None);
@@ -351,7 +390,7 @@ fn test_195_empty_filtered_row_warns_and_skips() {
 #[test]
 fn test_195_trailing_space_mode_persists() {
     let writer = Arc::new(InMemoryTableWriter::new());
-    let itc = interceptor(merchant_meta(), writer.clone(), false);
+    let itc = interceptor(merchant_meta(), writer.clone());
     let mut vars = FlowData::new();
     vars.insert_str("f_company_name", "Acme");
     let mut e = exec("end", NodeType::End, Some("  ARCHIVE  "), Some("merchant_settlement"), vars, 20, Some(1));
