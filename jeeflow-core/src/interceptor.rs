@@ -272,6 +272,7 @@ mod tests {
             model_type: "approval".into(), expire_time: None,
             persist_mode: None, rel_table_name: None,
             nodes: vec![], edges: vec![],
+        ..Default::default()
         };
         let exec = Execution::new(instance, model, define, "user1", FlowData::new());
         let handler = OperatorAssignmentHandler;
@@ -300,6 +301,7 @@ mod tests {
             model_type: "approval".into(), expire_time: None,
             persist_mode: None, rel_table_name: None,
             nodes: vec![], edges: vec![],
+        ..Default::default()
         };
         let mut exec = Execution::new(instance, model, define, "user1", args);
         exec.current_node = Some(node);
@@ -347,6 +349,7 @@ mod tests {
             name: "i183".into(), display_name: "I183".into(), model_type: "approval".into(),
             expire_time: None, persist_mode: None, rel_table_name: None,
             nodes: vec![], edges: vec![],
+        ..Default::default()
         };
         let mut args = FlowData::new();
         args.insert_str("f_amount", "999");

@@ -707,8 +707,49 @@ impl JeeflowEngineImpl {
     /// py `engine._fire_pre`／node `engine.firePre`／php `NodeModel::execPreInterceptors`／
     /// csharp `ExecPreInterceptorsAsync`／moon `ctx.pre_interceptors` 七家本是真派发）。
     /// 拦截器**不做异常隔离**（spec12 §12.2 副作用面）：抛错即中断并可回滚整次动作，故用 `?` 上抛。
+    /// 按档位解析本节点该跑的拦截器（audit8 R91，issues/234 §4.2／spec02 §3 三条）。
+    ///
+    /// 基准＝java `NodeModel.java:49-59`：节点 `properties` 声明优先，串空才回落流程根同名键，
+    /// 两档**不叠加**；两档都没声明才回落引擎级数组（＝现状语义，向后兼容）。
+    /// 声明名按注册表解析（键形按丙＝java 类全名串），查不到 ⇒ 显式报错带档位与 nodeId，
+    /// 不静默忽略（issues/60 同一条纪律）。本栈无 DB 回查（模型已在 `exec.process_model` 里），
+    /// 故不存在 go/py/node 那条"根声明每定义只回查一行"的读放大问题。
+    fn resolve_interceptors(&self, exec: &Execution, phase: &str)
+        -> JeeflowResult<Vec<Arc<dyn FlowInterceptor>>> {
+        let is_pre = phase == "pre";
+        let prop = if is_pre { "preInterceptors" } else { "postInterceptors" };
+        let node_decl = exec.current_node.as_ref()
+            .and_then(|n| n.prop_str(prop))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let root_decl = if is_pre {
+            exec.process_model.pre_interceptors.clone()
+        } else {
+            exec.process_model.post_interceptors.clone()
+        };
+        let declared = match node_decl.or(root_decl) {
+            None => return Ok(if is_pre { self.ctx.pre_interceptors.clone() }
+                              else { self.ctx.interceptors.clone() }),
+            Some(s) => s,
+        };
+        let node_id = exec.current_node.as_ref().map(|n| n.id.as_str()).unwrap_or("-");
+        let mut out = Vec::new();
+        for raw in declared.split(',') {
+            let name = raw.trim();
+            if name.is_empty() { continue; }
+            match self.ctx.named_interceptors.get(name) {
+                Some(ic) => out.push(ic.clone()),
+                None => return Err(JeeflowError::Business(format!(
+                    "{} 声明的拦截器未注册: {}（nodeId={}）", prop, name, node_id))),
+            }
+        }
+        out.sort_by_key(|i| i.order());
+        Ok(out)
+    }
+
     fn fire_pre_interceptors(&self, exec: &mut Execution) -> JeeflowResult<()> {
-        for interceptor in &self.ctx.pre_interceptors {
+        let list = self.resolve_interceptors(exec, "pre")?;
+        for interceptor in list {
             interceptor.intercept(exec)?;
         }
         Ok(())
@@ -716,7 +757,8 @@ impl JeeflowEngineImpl {
 
     /// Fire post-interceptors (sorted by order).
     fn fire_post_interceptors(&self, exec: &mut Execution) -> JeeflowResult<()> {
-        for interceptor in &self.ctx.interceptors {
+        let list = self.resolve_interceptors(exec, "post")?;
+        for interceptor in list {
             interceptor.intercept(exec)?;
         }
         Ok(())
@@ -6025,5 +6067,159 @@ mod after_commit_r77_tests {
         assert_eq!(vec!["inner"], *legs.lock().unwrap());
         assert_eq!(1, stub.nested_opens.load(Ordering::SeqCst), "最外层只该开一次");
         assert_eq!(1, stub.join_branch.load(Ordering::SeqCst), "内层必须走 join 支");
+    }
+}
+
+/// audit8 R91 节点级 `pre`/`postInterceptors`（issues/234 §4.2／spec02 §3 三条）：
+/// 节点声明优先、缺省回落流程根、两档不叠加、声明未注册必须显式报错。
+/// 基准＝java `NodeModel.java:49-59`；同形的另有 node／python／go／csharp 四栈。
+/// 判据一律经引擎的**私有派发口** `fire_pre_interceptors`/`fire_post_interceptors` 走一趟
+/// （不是只量 `resolve_interceptors`）——拦截器真被 `intercept()` 调到才算数，防 spy 式空转。
+#[cfg(test)]
+mod node_level_interceptor_r91_tests {
+    use super::{Execution, JeeflowEngineImpl};
+    use crate::context::ServiceContext;
+    use crate::error::JeeflowResult;
+    use crate::json::FlowData;
+    use crate::memory::MemoryRepository;
+    use crate::model::*;
+    use crate::parser::{NodeModel, NodeType, ProcessModel};
+    use crate::spi::{FlowInterceptor, ProcessRepository};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct Rec {
+        tag: &'static str,
+        sink: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FlowInterceptor for Rec {
+        fn intercept(&self, exec: &mut Execution) -> JeeflowResult<()> {
+            let node = exec.current_node.as_ref().map(|n| n.id.clone()).unwrap_or_default();
+            self.sink.lock().unwrap().push(format!("{}:{}", self.tag, node));
+            Ok(())
+        }
+    }
+
+    fn rec(tag: &'static str, sink: &Arc<Mutex<Vec<String>>>) -> Arc<dyn FlowInterceptor> {
+        Arc::new(Rec { tag, sink: sink.clone() })
+    }
+
+    fn node(id: &str, kind: NodeType, decls: &[(&str, &str)]) -> NodeModel {
+        let mut properties: HashMap<String, crate::json::JsonValue> = HashMap::new();
+        for (k, v) in decls {
+            properties.insert((*k).to_string(), crate::json::JsonValue::Str((*v).to_string()));
+        }
+        NodeModel { id: id.to_string(), node_type: kind, display_name: id.to_string(), properties }
+    }
+
+    /// 造一台只装了注册表的引擎＋一份停在 apply 节点上的 Execution。
+    fn harness(root_post: Option<&str>, root_pre: Option<&str>,
+               sink: &Arc<Mutex<Vec<String>>>) -> (JeeflowEngineImpl, Execution) {
+        let mut ctx = ServiceContext::new()
+            .with_repository(Arc::new(MemoryRepository::new()) as Arc<dyn ProcessRepository>);
+        for tag in ["A", "B", "C", "D"] {
+            ctx.register_named_interceptor(&format!("r91.{}", tag), rec(tag, sink));
+        }
+        let model = ProcessModel {
+            name: "r91".into(), display_name: "R91".into(), model_type: "approval".into(),
+            pre_interceptors: root_pre.map(str::to_string),
+            post_interceptors: root_post.map(str::to_string),
+            ..Default::default()
+        };
+        let define = ProcessDefine {
+            id: 1, name: "r91".into(), display_name: "R91".into(),
+            define_type: "approval".into(), state: 1, content: b"{}".to_vec(),
+            version: 1, create_time: None, create_user: None,
+            update_time: None, update_user: None,
+        };
+        let instance = ProcessInstance::create(&define, "user1", &FlowData::new());
+        let mut exec = Execution::new(instance, model, define, "user1", FlowData::new());
+        exec.current_node = Some(node("apply", NodeType::Task, &[]));
+        (JeeflowEngineImpl::new(ctx), exec)
+    }
+
+    fn sink_of() -> Arc<Mutex<Vec<String>>> { Arc::new(Mutex::new(Vec::new())) }
+    fn tags(sink: &Arc<Mutex<Vec<String>>>) -> Vec<String> { sink.lock().unwrap().clone() }
+
+    #[test]
+    fn r9101_node_declaration_wins_and_no_stacking() {
+        let sink = sink_of();
+        let (engine, mut ex) = harness(Some("r91.A"), None, &sink);
+        ex.current_node = Some(node("apply", NodeType::Task, &[("postInterceptors", "r91.B")]));
+        engine.fire_post_interceptors(&mut ex).unwrap();
+        let got = tags(&sink);
+        assert!(got.contains(&"B:apply".to_string()),
+            "前置失效：节点档拦截器没真被调到（＝spy 空转）{:?}", got);
+        assert!(!got.contains(&"A:apply".to_string()),
+            "节点声明与根声明叠加了（两档不叠加）{:?}", got);
+    }
+
+    #[test]
+    fn r9102_falls_back_to_process_root() {
+        let sink = sink_of();
+        let (engine, mut ex) = harness(Some("r91.A"), None, &sink);
+        engine.fire_post_interceptors(&mut ex).unwrap();
+        assert_eq!(vec!["A:apply".to_string()], tags(&sink), "节点不声明时应回落到流程根那一档");
+    }
+
+    #[test]
+    fn r9103_root_pre_is_read_and_dispatched() {
+        let sink = sink_of();
+        let (engine, mut ex) = harness(None, Some("r91.C"), &sink);
+        engine.fire_pre_interceptors(&mut ex).unwrap();
+        assert_eq!(vec!["C:apply".to_string()], tags(&sink),
+            "根级 preInterceptors 仍不被解析（修前＝只遍历 ctx.pre_interceptors 数组）");
+    }
+
+    #[test]
+    fn r9104_node_pre_uses_same_priority() {
+        let sink = sink_of();
+        let (engine, mut ex) = harness(None, Some("r91.C"), &sink);
+        ex.current_node = Some(node("apply", NodeType::Task, &[("preInterceptors", "r91.D")]));
+        engine.fire_pre_interceptors(&mut ex).unwrap();
+        let got = tags(&sink);
+        assert!(got.contains(&"D:apply".to_string()), "节点级 pre 没触发{:?}", got);
+        assert!(!got.contains(&"C:apply".to_string()), "apply 上节点 pre 与根 pre 叠加了{:?}", got);
+    }
+
+    #[test]
+    fn r9105_unregistered_declaration_is_an_explicit_error() {
+        let sink = sink_of();
+        let (engine, mut ex) = harness(None, None, &sink);
+        ex.current_node = Some(node("apply", NodeType::Task,
+            &[("postInterceptors", "com.mldong.jeeflow.ghost.GhostInterceptor")]));
+        let err = engine.fire_post_interceptors(&mut ex).unwrap_err().to_string();
+        assert!(err.contains("未注册") && err.contains("postInterceptors") && err.contains("apply"),
+            "错误须含档位＋未注册名＋nodeId：{}", err);
+        assert!(tags(&sink).is_empty(), "报错路径上不得有拦截器被调");
+    }
+
+    #[test]
+    fn r9106_two_nodes_use_their_own_declarations() {
+        let sink = sink_of();
+        let (engine, mut ex) = harness(None, None, &sink);
+        ex.current_node = Some(node("apply", NodeType::Task, &[("postInterceptors", "r91.A")]));
+        engine.fire_post_interceptors(&mut ex).unwrap();
+        ex.current_node = Some(node("approval", NodeType::Task, &[("postInterceptors", "r91.B")]));
+        engine.fire_post_interceptors(&mut ex).unwrap();
+        ex.current_node = Some(node("end", NodeType::End, &[]));
+        engine.fire_post_interceptors(&mut ex).unwrap();
+        assert_eq!(
+            vec!["A:apply".to_string(), "B:approval".to_string()], tags(&sink),
+            "两节点须各取各串，且不声明的那一档不得凭空多跑");
+    }
+
+    #[test]
+    fn r9107_engine_level_arrays_still_apply_when_nothing_declared() {
+        // 回归哨兵：两档都没声明 ⇒ 回落引擎级两条数组（＝现状"进程级恒挂"），行为逐字不变
+        let sink = sink_of();
+        let (mut engine, mut ex) = harness(None, None, &sink);
+        engine.ctx.register_interceptor(rec("A", &sink));
+        engine.ctx.register_pre_interceptor(rec("C", &sink));
+        engine.fire_post_interceptors(&mut ex).unwrap();
+        engine.fire_pre_interceptors(&mut ex).unwrap();
+        assert_eq!(vec!["A:apply".to_string(), "C:apply".to_string()], tags(&sink),
+            "未声明时应回落到引擎级两条数组（后置／前置各一条）");
     }
 }

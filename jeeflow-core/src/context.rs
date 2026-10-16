@@ -49,6 +49,16 @@ pub struct ServiceContext {
     /// 默认空 ⇒ 不注册就零行为变化；挂入后在 Decision / Fork / Join / End 四类节点的执行体
     /// **之前**触发（引擎调用点见 `engine.rs` 的 `fire_pre_interceptors`）。
     pub pre_interceptors: Vec<Arc<dyn FlowInterceptor>>,
+    /// **按名注册表**（audit8 R91，issues/234 §4.2／spec02 §3）：流程 JSON 的
+    /// `preInterceptors`／`postInterceptors` 声明串按逗号拆开后到这里查。
+    ///
+    /// 键形按丙＝沿用 java 的类全名串（八栈共享流程定义可移植；本栈无反射，
+    /// 与 `assignment_handlers`／`custom_handlers` 同一条路），不得另发明短名。
+    /// 声明了但查不到 ⇒ 引擎显式报错（不静默忽略）。
+    /// 两档共用一张表：本栈 `FlowInterceptor` 只有一个 `intercept()`，
+    /// 由"声明挂在哪一档"决定它在哪一档被调（`ctx.interceptors`/`pre_interceptors`
+    /// 那两条数组仍是"没有任何声明时的引擎级回落"，与其余各栈同形）。
+    pub named_interceptors: HashMap<String, Arc<dyn FlowInterceptor>>,
     /// Event listeners.
     pub event_listeners: Vec<Arc<dyn ProcessEventListener>>,
     /// 委托代理自动生效开关（issues/116 批次 D，**默认开启**）。
@@ -81,6 +91,7 @@ impl ServiceContext {
             custom_handlers: HashMap::new(),
             interceptors: Vec::new(),
             pre_interceptors: Vec::new(),
+            named_interceptors: HashMap::new(),
             event_listeners: Vec::new(),
             // 委托自动生效默认开启（issues/116 批次 D）——集成方零配置即生效，
             // 对齐内置版 mldong-wf `SurrogateInterceptor` 标 @Component 的"白拿"体验。
@@ -185,6 +196,13 @@ impl ServiceContext {
     pub fn register_interceptor(&mut self, interceptor: Arc<dyn FlowInterceptor>) {
         self.interceptors.push(interceptor);
         self.interceptors.sort_by_key(|i| i.order());
+    }
+
+    /// 按名注册拦截器（audit8 R91）：`name` ＝流程 JSON 里 `pre/postInterceptors` 声明用的
+    /// 那一串（java 类全名，键形按丙）。注册进 [`Self::named_interceptors`]，
+    /// 与 `register_interceptor`（引擎级恒挂数组）互不影响。
+    pub fn register_named_interceptor(&mut self, name: &str, interceptor: Arc<dyn FlowInterceptor>) {
+        self.named_interceptors.insert(name.to_string(), interceptor);
     }
 
     /// 注册**前置**拦截器（issues/196）——挂在 [`Self::pre_interceptors`] 这条独立通道上，

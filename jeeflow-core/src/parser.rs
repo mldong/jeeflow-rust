@@ -11,7 +11,7 @@ use std::collections::HashMap;
 // Process Model
 // ═══════════════════════════════════════════════════════
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProcessModel {
     pub name: String,
     pub display_name: String,
@@ -19,6 +19,11 @@ pub struct ProcessModel {
     pub expire_time: Option<String>,
     pub persist_mode: Option<String>,     // ARCHIVE / SYNC
     pub rel_table_name: Option<String>,
+    /// 流程根一档的拦截器声明（逗号分隔的注册名；audit8 R91）。
+    /// 节点自身 `properties.preInterceptors` 非空时**优先**、两档不叠加（spec02 §3 三条）。
+    pub pre_interceptors: Option<String>,
+    /// 同上，后置档（＝ java `ProcessModel.postInterceptors`／go·py·node·php·csharp 的根级同名键）。
+    pub post_interceptors: Option<String>,
     pub nodes: Vec<NodeModel>,
     pub edges: Vec<EdgeModel>,
 }
@@ -470,6 +475,11 @@ impl ModelParser {
             expire_time,
             persist_mode,
             rel_table_name,
+            // audit8 R91：根级两档声明都要读（旧形状只读节点 properties、根级整条不读）
+            pre_interceptors: root.get_str("preInterceptors")
+                .map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+            post_interceptors: root.get_str("postInterceptors")
+                .map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
             nodes,
             edges,
         })

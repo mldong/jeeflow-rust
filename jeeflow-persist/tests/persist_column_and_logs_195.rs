@@ -67,6 +67,7 @@ fn exec(
             properties: HashMap::new(),
         }],
         edges: vec![],
+        ..Default::default()
     };
     let instance = ProcessInstance {
         instance_id: 9001,
