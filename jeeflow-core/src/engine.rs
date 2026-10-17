@@ -323,7 +323,7 @@ impl JeeflowEngineImpl {
                 // Clone next nodes to avoid borrow conflict
                 let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
                     .iter()
-                    .filter_map(|e| exec.process_model.get_target_node(e).cloned())
+                    .filter_map(|e| target_node_or_warn(&exec.process_model, &node.id, e))
                     .collect();
                 for next in next_nodes {
                     self.execute_node(exec, &next)?;
@@ -388,6 +388,8 @@ impl JeeflowEngineImpl {
                     if let Some(next) = exec.process_model.get_target_node(&edge) {
                         let next = next.clone();
                         self.execute_node(exec, &next)?;
+                    } else {
+                        eprintln!("{}", unknown_edge_warning(&node.id, &edge.target_node_id));
                     }
                 } else {
                     // issues/164 A：零命中（两条 expr 边全 false / 变量缺失 / 零出边 /
@@ -404,7 +406,7 @@ impl JeeflowEngineImpl {
                 self.fire_pre_interceptors(exec)?;
                 let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
                     .iter()
-                    .filter_map(|e| exec.process_model.get_target_node(e).cloned())
+                    .filter_map(|e| target_node_or_warn(&exec.process_model, &node.id, e))
                     .collect();
                 for next in next_nodes {
                     self.execute_node(exec, &next)?;
@@ -419,7 +421,7 @@ impl JeeflowEngineImpl {
                     exec.is_merged = true;
                     let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
                         .iter()
-                        .filter_map(|e| exec.process_model.get_target_node(e).cloned())
+                        .filter_map(|e| target_node_or_warn(&exec.process_model, &node.id, e))
                         .collect();
                     for next in next_nodes {
                         self.execute_node(exec, &next)?;
@@ -608,7 +610,7 @@ impl JeeflowEngineImpl {
         // ── ③ 令牌继续沿出边流转 ──
         let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
             .iter()
-            .filter_map(|e| exec.process_model.get_target_node(e).cloned())
+            .filter_map(|e| target_node_or_warn(&exec.process_model, &node.id, e))
             .collect();
         for next in next_nodes {
             self.execute_node(exec, &next)?;
@@ -1315,7 +1317,7 @@ impl JeeflowEngineImpl {
         if let Some(node) = node {
             let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
                 .iter()
-                .filter_map(|e| exec.process_model.get_target_node(e).cloned())
+                .filter_map(|e| target_node_or_warn(&exec.process_model, &node.id, e))
                 .collect();
             for next in next_nodes {
                 self.execute_node(&mut exec, &next)?;
@@ -1713,6 +1715,21 @@ fn countersign_roster(vars: &FlowData, key: &str) -> Vec<String> {
 /// c# 把两者合成同一个异常、覆盖面比 java 宽，本轮跟改）。落点是 stderr——本仓 core 零依赖、
 /// 没有可注入的 logger 门面，与 `event.rs::ProcessPublisher`／`surrogate.rs::expand_actors`
 /// 同口径；拆成纯函数是为了让用例钉得住文案（"记了日志"这件事否则无法断）。
+fn unknown_edge_warning(from: &str, to: &str) -> String {
+    format!(
+        "[jeeflow] WARNING 转移出边的目标节点不在模型里（该节点类型未建档，解析期已跳过），本次流转停在这条边: from={}, to={}",
+        from, to
+    )
+}
+
+fn target_node_or_warn(model: &crate::parser::ProcessModel, from: &str, edge: &EdgeModel) -> Option<NodeModel> {
+    let target = model.get_target_node(edge).cloned();
+    if target.is_none() {
+        eprintln!("{}", unknown_edge_warning(from, &edge.target_node_id));
+    }
+    target
+}
+
 fn custom_missing_clazz_warning(node_id: &str) -> String {
     format!("[jeeflow] custom 节点 nodeId={} 未配置 clazz（处理器类名为空），跳过处理器执行；历史行照常落库、令牌继续流转", node_id)
 }
@@ -5563,6 +5580,13 @@ mod custom_node_tests {
         assert!(msg.contains("custom1") && msg.contains("com.example.NotRegistered"),
             "未注册档必须带 nodeId 与实得 clazz：{msg}");
         assert!(msg.contains("register_custom_handler"), "要给出注册入口，排障不必猜：{msg}");
+    }
+
+    #[test]
+    fn test_unknown_edge_warning_carries_from_to() {
+        let s = unknown_edge_warning("node-a", "node-b");
+        assert!(s.contains("from=node-a") && s.contains("to=node-b"), "{s}");
+        assert!(s.contains("WARNING"), "{s}");
     }
 
     /// `clazz` 为空串／缺键／纯空白三形 ⇒ 同一档（"没配"），既不炸也不并入"未注册"那一档；
