@@ -19,6 +19,8 @@ pub trait ProcessRepository: Send + Sync {
     fn update_define(&self, define: &ProcessDefine) -> JeeflowResult<()>;
     fn update_define_state(&self, define_id: i64, state: i32) -> JeeflowResult<()>;
     fn remove_define(&self, define_id: i64) -> JeeflowResult<()>;
+    /// audit8 R110：该定义下是否存在任何实例（含已办结/已撤回）。
+    fn has_instances_by_define_id(&self, define_id: i64) -> JeeflowResult<bool>;
 
     // ═══ Instance operations ═══
     fn find_instance_by_id(&self, instance_id: i64) -> JeeflowResult<Option<ProcessInstance>>;

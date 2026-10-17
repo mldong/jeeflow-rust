@@ -53,6 +53,7 @@ impl ProcessRepository for ErrRepo {
     fn update_define(&self, _: &ProcessDefine) -> JeeflowResult<()> { self.fail() }
     fn update_define_state(&self, _: i64, _: i32) -> JeeflowResult<()> { self.fail() }
     fn remove_define(&self, _: i64) -> JeeflowResult<()> { self.fail() }
+    fn has_instances_by_define_id(&self, _: i64) -> JeeflowResult<bool> { self.fail() }
     fn find_instance_by_id(&self, _: i64) -> JeeflowResult<Option<ProcessInstance>> { self.fail() }
     fn save_instance(&self, _: &mut ProcessInstance) -> JeeflowResult<()> { self.fail() }
     fn update_instance(&self, _: &ProcessInstance) -> JeeflowResult<()> { self.fail() }

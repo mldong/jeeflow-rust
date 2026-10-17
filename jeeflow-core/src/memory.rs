@@ -226,6 +226,11 @@ impl ProcessRepository for MemoryRepository {
         Ok(())
     }
 
+    fn has_instances_by_define_id(&self, define_id: i64) -> JeeflowResult<bool> {
+        let instances = self.instances.lock().unwrap();
+        Ok(instances.values().any(|i| i.define_id == define_id))
+    }
+
     fn find_instance_by_id(&self, instance_id: i64) -> JeeflowResult<Option<ProcessInstance>> {
         let mut inst = {
             let instances = self.instances.lock().unwrap();
@@ -1706,6 +1711,7 @@ mod cc_i141_tests {
             fn update_define(&self, _: &ProcessDefine) -> JeeflowResult<()> { unimplemented!() }
             fn update_define_state(&self, _: i64, _: i32) -> JeeflowResult<()> { unimplemented!() }
             fn remove_define(&self, _: i64) -> JeeflowResult<()> { unimplemented!() }
+            fn has_instances_by_define_id(&self, _: i64) -> JeeflowResult<bool> { Ok(false) }
             fn find_instance_by_id(&self, _: i64) -> JeeflowResult<Option<ProcessInstance>> { unimplemented!() }
             fn save_instance(&self, _: &mut ProcessInstance) -> JeeflowResult<()> { unimplemented!() }
             fn update_instance(&self, _: &ProcessInstance) -> JeeflowResult<()> { unimplemented!() }

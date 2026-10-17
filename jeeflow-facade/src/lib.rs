@@ -1108,6 +1108,12 @@ impl JeeflowFacade {
         if ids.is_empty() {
             return Err(JeeflowError::Business("缺少id参数".into()));
         }
+        // audit8 R110：先对整批做存在性校验再删，避免"前面的删了、后面的被拒"的半删。
+        for id in &ids {
+            if self.repo.has_instances_by_define_id(*id)? {
+                return Err(JeeflowError::Business("存在正在未完成的流程实例，不允许删除！".into()));
+            }
+        }
         for id in ids {
             self.repo.remove_define(id)?;
         }
@@ -3596,6 +3602,46 @@ mod tests {
         args.insert("id".to_string(), json!(id));
         let resp = facade.flow("processDefine/remove", &args).await;
         assert_eq!(resp["code"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_r110_define_remove_any_instance_guard() {
+        let (facade, define_id) = make_facade_with_define();
+        let mut a = HashMap::new();
+        a.insert("processDefineId".to_string(), json!(define_id));
+        a.insert("operator".to_string(), json!("user1"));
+        let r = facade.flow("processInstance/startAndExecute", &a).await;
+        assert_eq!(r["code"], 0, "start failed: {:?}", r);
+
+        let msg = "存在正在未完成的流程实例，不允许删除！";
+        let mut a = HashMap::new();
+        a.insert("id".to_string(), json!(define_id));
+        let r = facade.flow("processDefine/remove", &a).await;
+        assert_eq!(r["code"], 99999999);
+        assert_eq!(r["msg"], msg);
+        assert!(facade.repo().find_define_by_id(define_id).unwrap().is_some(), "被拒时定义不得被删");
+
+        let dirty = facade.repo().find_define_by_id(define_id).unwrap().unwrap();
+        let mut clean = dirty.clone();
+        clean.id = 0;
+        clean.name = "r110-clean".into();
+        clean.display_name = "r110-clean".into();
+        facade.repo().save_define(&mut clean).unwrap();
+        let clean_id = clean.id;
+
+        let mut a = HashMap::new();
+        a.insert("ids".to_string(), json!([clean_id, define_id]));
+        let r = facade.flow("processDefine/remove", &a).await;
+        assert_eq!(r["code"], 99999999);
+        assert_eq!(r["msg"], msg);
+        assert!(facade.repo().find_define_by_id(clean_id).unwrap().is_some(), "clean 不得半删");
+        assert!(facade.repo().find_define_by_id(define_id).unwrap().is_some(), "dirty 不得被删");
+
+        let mut a = HashMap::new();
+        a.insert("id".to_string(), json!(clean_id));
+        let r = facade.flow("processDefine/remove", &a).await;
+        assert_eq!(r["code"], 0);
+        assert!(facade.repo().find_define_by_id(clean_id).unwrap().is_none());
     }
 
     // ─── processDesign tests ───
@@ -8348,6 +8394,9 @@ mod tests {
     }
 
     impl ProcessRepository for DirtyRowSpyRepo {
+        fn has_instances_by_define_id(&self, define_id: i64) -> JeeflowResult<bool> {
+            self.inner.has_instances_by_define_id(define_id)
+        }
         fn find_task_actors(&self, task_id: i64) -> JeeflowResult<Vec<String>> {
             let mut out = self.inner.find_task_actors(task_id)?;
             let rows: Vec<String> = {

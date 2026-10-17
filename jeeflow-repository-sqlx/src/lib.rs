@@ -787,6 +787,18 @@ impl ProcessRepository for SqlxRepository {
         }))
     }
 
+    fn has_instances_by_define_id(&self, define_id: i64) -> JeeflowResult<bool> {
+        self.with_exec(|mut exec| self.block_on(async {
+            let row = sqlx::query("SELECT COUNT(*) AS cnt FROM wf_process_instance WHERE process_define_id=?")
+                .bind(define_id)
+                .fetch_one(exec.reborrow())
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            let count: i64 = row.get("cnt");
+            Ok(count > 0)
+        }))
+    }
+
     fn find_instance_by_id(&self, instance_id: i64) -> JeeflowResult<Option<ProcessInstance>> {
         self.with_exec(|mut exec| self.block_on(async {
             let row = sqlx::query(
