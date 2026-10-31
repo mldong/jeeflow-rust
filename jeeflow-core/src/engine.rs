@@ -1745,6 +1745,17 @@ impl JeeflowEngineImpl {
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
 
+        // 「退回修改、重提直返」：带标记的申请待办不得借跳转/血缘回退/再次退回改道
+        // （java `executeAndJumpTask`／`executeAndJumpToFirstTaskNode` 同款守卫，文案逐字取它）。
+        // 必须排在下面所有状态变更之前——本栈宿主没注册事务模板时是裸跑，晚一步就留下半截事实。
+        crate::reapply::reject_marked_applicant(
+            &task,
+            match mode {
+                JumpTarget::FirstTaskNode => "再次退回",
+                _ => "跳转",
+            },
+        )?;
+
         let mut instance = self.repo().find_instance_by_id(task.process_instance_id)?
             .ok_or(JeeflowError::InstanceNotFound(task.process_instance_id))?;
         instance.tasks = self.repo().find_history_tasks(instance.instance_id)?;
@@ -1884,6 +1895,10 @@ impl JeeflowEngineImpl {
         let args = &args;
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
+
+        // 「退回修改、重提直返」：带标记的申请待办不得被"拒绝"直接推到结束
+        // （java `executeAndJumpToEnd` 同款守卫，文案逐字取它）。
+        crate::reapply::reject_marked_applicant(&task, "拒绝")?;
 
         let mut instance = self.repo().find_instance_by_id(task.process_instance_id)?
             .ok_or(JeeflowError::InstanceNotFound(task.process_instance_id))?;

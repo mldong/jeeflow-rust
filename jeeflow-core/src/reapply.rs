@@ -379,6 +379,20 @@ pub fn require_source_task_id(ctx: &ReapplyCtx) -> JeeflowResult<i64> {
     Ok(ctx.source_task_id)
 }
 
+/// 带直返标记的进行中申请待办只接受重新提交（submitType=5）：跳转/血缘回退/拒绝/
+/// 再次退回四个入口一律在**任何状态变更之前**拒绝（对齐 java `rejectMarkedApplicant`）。
+/// 少了这道守卫，对标记申请待办提交 6 会完成旧申请、建一条无标记新申请 ⇒ 旧申请的
+/// 分支等待随之消失，另一支汇合提前放行。
+pub fn reject_marked_applicant(task: &ProcessTask, action: &str) -> JeeflowResult<()> {
+    if task.is_doing() && reapply_of(&task.variables).is_some() {
+        return Err(JeeflowError::Business(format!(
+            "带重提直返标记的申请待办不允许{}，只接受重新提交(submitType=5)",
+            action
+        )));
+    }
+    Ok(())
+}
+
 // ═══════════════════════════════════════════════════════
 // 建单时计算分支归属
 // ═══════════════════════════════════════════════════════

@@ -10,11 +10,14 @@ use jeeflow_core::parser::ModelParser;
 use jeeflow_core::reapply::{self, ReapplyMode};
 use jeeflow_core::spi::ProcessRepository;
 use jeeflow_core::id_gen::AtomicIdGenerator;
-use jeeflow_core::{FlowData, JeeflowEngineImpl, ServiceContext};
+use jeeflow_core::{FlowData, JeeflowEngineImpl, JeeflowResult, ProcessTask, ServiceContext};
 use std::sync::Arc;
 
 const SUBMIT_APPLY: i64 = 0;
 const SUBMIT_AGREE: i64 = 1;
+const SUBMIT_REJECT: i64 = 2;
+const SUBMIT_ROLLBACK: i64 = 3;
+const SUBMIT_JUMP: i64 = 4;
 const SUBMIT_REAPPLY: i64 = 5;
 const SUBMIT_RETURN: i64 = 6;
 
@@ -697,4 +700,78 @@ fn test_rts_concurrent_reapply_only_once() {
             .len(),
         1
     );
+}
+
+// ═══ 10.8 负向：带标记申请待办不得走其他办理/跳转入口（java `test16` 同款） ═══
+
+#[test]
+fn test_rts_marked_applicant_rejects_return_and_jumps() {
+    let (engine, repo) = rts_engine();
+    let define_id = save_define(&repo, "return-to-source", &load_flow("14-return-to-source"));
+    let iid = start_flow(&engine, &repo, define_id, &FlowData::new());
+    let task_a = doing_named(&repo, iid, "taskA").unwrap();
+    engine
+        .execute_and_jump_to_first_sync(task_a.task_id, "userA", &submit(SUBMIT_RETURN))
+        .unwrap();
+    let apply = doing_named(&repo, iid, "apply").unwrap();
+    let doing_before = doing_all(&repo, iid).len();
+    let hist_before = repo.find_history_tasks(iid).unwrap().len();
+
+    fn assert_marked(r: JeeflowResult<Vec<ProcessTask>>) {
+        let err = r.expect_err("带直返标记的申请待办不应被其他入口接受");
+        assert!(
+            err.message().contains("只接受重新提交"),
+            "守卫文案须点名只接受重新提交：{}",
+            err.message()
+        );
+    }
+
+    assert_marked(engine.execute_and_jump_to_first_sync(
+        apply.task_id,
+        "applicant",
+        &submit(SUBMIT_RETURN),
+    ));
+    assert_marked(engine.execute_and_jump_sync(
+        apply.task_id,
+        "applicant",
+        &submit(SUBMIT_ROLLBACK),
+        None,
+    ));
+    assert_marked(engine.execute_and_jump_sync(
+        apply.task_id,
+        "applicant",
+        &submit(SUBMIT_JUMP),
+        Some("taskB"),
+    ));
+    assert_marked(engine.execute_and_jump_to_end_sync(
+        apply.task_id,
+        "applicant",
+        &submit(SUBMIT_REJECT),
+    ));
+
+    assert_eq!(
+        doing_all(&repo, iid).len(),
+        doing_before,
+        "拒绝后不新增任务"
+    );
+    assert_eq!(
+        repo.find_history_tasks(iid).unwrap().len(),
+        hist_before,
+        "拒绝后不新增历史行"
+    );
+    let still = doing_named(&repo, iid, "apply").expect("原申请待办仍在");
+    assert_eq!(still.task_id, apply.task_id);
+    assert_eq!(
+        reapply::reapply_of(&task_row(&repo, apply.task_id).variables)
+            .expect("原等待上下文仍在")
+            .source_task_id,
+        task_a.task_id
+    );
+    assert_eq!(rows(&repo, iid, "taskA"), 1, "来源任务保持完成态、未被重建");
+
+    // 正常重提仍然可用
+    engine
+        .execute_task_sync(apply.task_id, "applicant", &submit(SUBMIT_REAPPLY))
+        .unwrap();
+    assert!(doing_named(&repo, iid, "taskA").is_some());
 }
