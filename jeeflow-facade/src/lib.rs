@@ -293,14 +293,36 @@ fn define_row_to_json(r: &DefineRow) -> Json {
     })
 }
 
+/// 任务行 ext 的出口投影（issues/121 P1 判据体）：任务变量只剩引擎建单必写的控制键 ⇒ 回退
+/// 实例变量。控制键集合除行级首节点标记外，还含 spec 04 的两枚直返保留键（`_branchCtx`／
+/// `_reapplyContext`，建单时无条件写入、空分支也写 []）——不认它们，每条任务行都从此不再回退，
+/// 且内部键直接从公开出口透出（本轮八栈齐漏，php 的内容级用例才报红）。
+/// `_reapplyContext` 是前端「重新提交后返回：X」的唯一取数口（jeeflow-ui helpers.ts 读
+/// ext._reapplyContext）⇒ 回退后原样合回。合回必须落在**副本**上：instanceExt 是同一响应里的
+/// 另一个出口，不能被任务侧的键污染。
+fn project_task_ext(
+    task_vars: serde_json::Map<String, Json>,
+    instance_ext: serde_json::Map<String, Json>,
+) -> serde_json::Map<String, Json> {
+    let is_control = |k: &str| {
+        k == "isFirstTaskNode"
+            || k == jeeflow_core::reapply::VAR_BRANCH_CTX
+            || k == jeeflow_core::reapply::VAR_REAPPLY_CTX
+    };
+    if task_vars.keys().any(|k| !is_control(k)) {
+        return task_vars;
+    }
+    let reapply = task_vars.get(jeeflow_core::reapply::VAR_REAPPLY_CTX).cloned();
+    let mut out = instance_ext;
+    if let Some(v) = reapply {
+        out.insert(jeeflow_core::reapply::VAR_REAPPLY_CTX.to_string(), v);
+    }
+    out
+}
+
 fn task_row_to_json(r: &TaskRow) -> Json {
     let instance_ext = parse_json_map(r.instance_variable.as_deref());
-    let mut ext = parse_json_map(r.variable.as_deref());
-    // issues/121 P1：引擎建单必写的控制键不算「任务变量非空」，否则新建任务的 ext
-    // 永远不再回退实例变量（issues/82-3 既有契约）。
-    if ext.is_empty() || (ext.len() == 1 && ext.contains_key("isFirstTaskNode")) {
-        ext = instance_ext.clone();
-    }
+    let ext = project_task_ext(parse_json_map(r.variable.as_deref()), instance_ext.clone());
     json!({
         "id": r.id,
         "process_instance_id": r.process_instance_id,
@@ -7835,6 +7857,104 @@ mod tests {
         let resp2 = facade.flow("processInstance/detail", &detail_args).await;
         assert_eq!(ext_of(&resp2, "apply"), Some(false),
             "缺键的存量历史行回退现算：仅进行中判定 ⇒ false（不报错、不读成未定义）");
+    }
+
+    /// spec 04 保留键 × issues/82-3 回退（**内容级**判据）。建单现在往每条任务变量写
+    /// `_branchCtx`（空分支也写 `[]`），两枚直返保留键必须算进「引擎控制键」：否则每条任务行
+    /// 从此不再回退实例变量、内部键还从公开出口透出（本轮八栈齐漏，php 的内容级用例才报红）。
+    /// `_reapplyContext` 是前端「重新提交后返回：X」的唯一取数口（jeeflow-ui helpers.ts 读
+    /// ext._reapplyContext）⇒ 回退后原样合回；合回只落任务侧副本，不得污染同一响应的
+    /// instanceExt 出口。
+    #[tokio::test]
+    async fn test_task_row_ext_falls_back_with_reapply_reserved_keys() {
+        async fn todo_rows(facade: &JeeflowFacade, who: &str) -> Vec<Json> {
+            let mut m = HashMap::new();
+            m.insert("operator".to_string(), json!(who));
+            m.insert("pageSize".to_string(), json!(100));
+            let resp = facade.flow("processTask/todoList", &m).await;
+            assert_eq!(resp["code"], 0, "todoList({who}) 应成功: {resp:?}");
+            resp["data"]["rows"].as_array().cloned().unwrap_or_default()
+        }
+
+        let facade = make_facade();
+        let mut a1 = HashMap::new();
+        a1.insert("name".to_string(), json!("rts_ext_flow"));
+        a1.insert("displayName".to_string(), json!("rts_ext_flow"));
+        let r1 = facade.flow("processDesign/save", &a1).await;
+        assert_eq!(r1["code"], 0, "design save: {r1:?}");
+        let design_id = r1["data"]["id"].as_str().unwrap().parse::<i64>().unwrap();
+
+        let content = r#"{
+            "name":"rts_ext_flow","displayName":"rts_ext_flow","type":"approval",
+            "nodes":[
+                {"id":"start","type":"snaker:start","text":{"value":"Start"}},
+                {"id":"apply","type":"snaker:task","text":{"value":"Apply"},"properties":{"assignee":"applicant"}},
+                {"id":"taskA","type":"snaker:task","text":{"value":"A"},"properties":{"assignee":"userA","reapplyMode":"RETURN_TO_SOURCE"}},
+                {"id":"taskB","type":"snaker:task","text":{"value":"B"},"properties":{"assignee":"userB"}},
+                {"id":"end","type":"snaker:end","text":{"value":"End"}}
+            ],
+            "edges":[
+                {"id":"e1","sourceNodeId":"start","targetNodeId":"apply"},
+                {"id":"e2","sourceNodeId":"apply","targetNodeId":"taskA"},
+                {"id":"e3","sourceNodeId":"taskA","targetNodeId":"taskB"},
+                {"id":"e4","sourceNodeId":"taskB","targetNodeId":"end"}
+            ]
+        }"#.to_string();
+        let mut a2 = HashMap::new();
+        a2.insert("id".to_string(), json!(design_id));
+        a2.insert("content".to_string(), json!(content));
+        assert_eq!(facade.flow("processDesign/updateDefine", &a2).await["code"], 0);
+        let mut a3 = HashMap::new();
+        a3.insert("id".to_string(), json!(design_id));
+        assert_eq!(facade.flow("processDesign/deploy", &a3).await["code"], 0);
+
+        let mut a4 = HashMap::new();
+        a4.insert("name".to_string(), json!("rts_ext_flow"));
+        a4.insert("operator".to_string(), json!("applicant"));
+        a4.insert("f_reason".to_string(), json!("unit-test"));
+        let r4 = facade.flow("processDefine/startAndExecute", &a4).await;
+        assert_eq!(r4["code"], 0, "start failed: {r4:?}");
+        let iid: i64 = r4["data"]["processInstanceId"].as_str().unwrap().parse().unwrap();
+
+        // ① 普通任务行：变量只剩 isFirstTaskNode + _branchCtx ⇒ ext 回退实例变量
+        let rows = todo_rows(&facade, "userA").await;
+        assert!(!rows.is_empty(), "userA 应有 taskA 待办");
+        let row = &rows[0];
+        let ext = row["ext"].as_object().cloned().unwrap_or_default();
+        let i_ext = row["instanceExt"].as_object().cloned().unwrap_or_default();
+        assert!(!i_ext.is_empty(), "前置：instanceExt 必须非空，否则下面的回退断言恒真空 → {row:?}");
+        assert!(!ext.contains_key(jeeflow_core::reapply::VAR_BRANCH_CTX),
+            "内部键 _branchCtx 不得从任务行 ext 透出（spec 04 保留键）: {ext:?}");
+        assert_eq!(ext, i_ext,
+            "任务变量只剩控制键 ⇒ ext 应回退实例变量（issues/82-3 / 121 P1）: ext={ext:?} instanceExt={i_ext:?}");
+
+        // ② 直返申请待办：ext = 实例变量 + _reapplyContext，且不带 _branchCtx
+        let task_a = doing_task_of(&facade, iid, "taskA");
+        let r_ret = exec_task(&facade, task_a, "userA", vec![("submitType", json!(6))]).await;
+        assert_eq!(r_ret["code"], 0, "退回发起人应成功: {r_ret:?}");
+
+        let rows2 = todo_rows(&facade, "applicant").await;
+        let marked: Vec<&Json> = rows2.iter().filter(|r| {
+            r["ext"].as_object()
+                .map(|m| m.contains_key(jeeflow_core::reapply::VAR_REAPPLY_CTX))
+                .unwrap_or(false)
+        }).collect();
+        assert_eq!(marked.len(), 1,
+            "应恰有一条带 _reapplyContext 的申请待办（前端提示的取数口），实得 {rows2:?}");
+        let app = marked[0];
+        let a_ext = app["ext"].as_object().cloned().unwrap_or_default();
+        let a_i = app["instanceExt"].as_object().cloned().unwrap_or_default();
+        for k in a_i.keys() {
+            assert!(a_ext.contains_key(k),
+                "回退仍要发生：实例变量键 {k} 应在 ext 上 → ext={a_ext:?} instanceExt={a_i:?}");
+        }
+        assert!(!a_ext.contains_key(jeeflow_core::reapply::VAR_BRANCH_CTX),
+            "内部键 _branchCtx 不得从 ext 透出: {a_ext:?}");
+        let ctx = a_ext.get(jeeflow_core::reapply::VAR_REAPPLY_CTX).cloned().unwrap_or(Json::Null);
+        assert_eq!(ctx["sourceNode"], json!("taskA"),
+            "来源节点应可读（前端「重新提交后返回：X」就取这一格）: {ctx:?}");
+        assert!(!a_i.contains_key(jeeflow_core::reapply::VAR_REAPPLY_CTX),
+            "合回不得污染同一响应里的 instanceExt 出口: {a_i:?}");
     }
 
     // ═══════════════════════════════════════════════════════
