@@ -5,6 +5,7 @@
 
 use crate::json::{JsonValue, parse_json};
 use crate::error::{JeeflowError, JeeflowResult};
+use crate::reapply::{self, ReapplyMode};
 use std::collections::HashMap;
 
 // ═══════════════════════════════════════════════════════
@@ -210,6 +211,9 @@ pub struct NodeModel {
     pub node_type: NodeType,
     pub display_name: String,
     pub properties: HashMap<String, JsonValue>,
+    /// 退回发起人后的重提方式（节点属性 `reapplyMode`，对齐 java `TaskModel.reapplyMode`）。
+    /// 缺省/空串 ⇒ [`ReapplyMode::Normal`]；非法值在**解析期**报配置错误（不静默当缺省）。
+    pub reapply_mode: ReapplyMode,
 }
 
 impl NodeModel {
@@ -431,11 +435,21 @@ impl ModelParser {
                     }
                 }
 
+                // 「退回修改、重提直返」：节点属性 `reapplyMode` 在**解析期**校验
+                // （对齐 java `TaskParser` → `ReapplyModeEnum.parse`：缺省 NORMAL，
+                // 非法值必须报配置错误，不得静默当缺省）。非任务节点不读该属性。
+                let reapply_mode = if node_type == NodeType::Task {
+                    ReapplyMode::parse(properties.get(reapply::PROP_REAPPLY_MODE), &id)?
+                } else {
+                    ReapplyMode::Normal
+                };
+
                 nodes.push(NodeModel {
                     id,
                     node_type,
                     display_name,
                     properties,
+                    reapply_mode,
                 });
             }
         }
@@ -509,6 +523,7 @@ mod tests {
         let node = NodeModel {
             id: "n1".into(), node_type: NodeType::Task,
             display_name: "N1".into(), properties: props,
+            reapply_mode: ReapplyMode::Normal,
         };
         let perms = node.field_permissions();
         assert_eq!(perms.len(), 3, "只收 field 子对象的 PERMISSION_* 键");

@@ -67,6 +67,7 @@ fn exec(
             node_type,
             display_name: node_id.to_string(),
             properties: HashMap::new(),
+            reapply_mode: jeeflow_core::reapply::ReapplyMode::Normal,
         }],
         edges: vec![],
         ..Default::default()

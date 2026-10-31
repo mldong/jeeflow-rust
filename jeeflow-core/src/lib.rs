@@ -22,6 +22,7 @@ pub mod interceptor;
 pub mod surrogate;
 pub mod memory;
 pub mod filter_sql;
+pub mod reapply;
 #[cfg(any(test, feature = "dev-flows"))]
 pub mod flowsdir;
 

@@ -102,11 +102,24 @@ pub trait JeeflowEngine: Send + Sync {
 
 pub struct JeeflowEngineImpl {
     ctx: ServiceContext,
+    /// 同实例串行化锁（对齐 java `InstanceLock`）。
+    ///
+    /// 汇合「一次性放行」、同一任务重复办理、退回与另一支汇合交错，都必须在同一临界区里
+    /// 「重验状态 → 建后继任务」——`execute_process_task` 与
+    /// `execute_and_jump_to_first_task_node` 两条办理入口在此按实例互斥。
+    ///
+    /// ⚠️ **只覆盖单进程部署**：这是进程内互斥，多进程/多实例部署时两个进程各自持锁、
+    /// 互相不可见。真要横向扩展需由仓储侧提供分布式锁（行级 `FOR UPDATE` 或 Redis 锁），
+    /// 见 java `InstanceLock` 的同位注释与 plan §4.4。
+    instance_locks: std::sync::Mutex<HashMap<i64, Arc<std::sync::Mutex<()>>>>,
 }
 
 impl JeeflowEngineImpl {
     pub fn new(ctx: ServiceContext) -> Self {
-        JeeflowEngineImpl { ctx }
+        JeeflowEngineImpl {
+            ctx,
+            instance_locks: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     pub fn context(&self) -> &ServiceContext {
@@ -230,6 +243,26 @@ impl JeeflowEngineImpl {
 
     fn next_id(&self) -> i64 {
         self.ctx.get_id_generator().next_id()
+    }
+
+    /// 取任务所属实例的同实例互斥锁（对齐 java `InstanceLock.forTask`：任务查不到时
+    /// 退化为实例 0 的锁，无副作用）。锁对象常驻、按实例复用。
+    fn instance_lock(&self, task_id: i64) -> Arc<std::sync::Mutex<()>> {
+        let instance_id = self
+            .repo()
+            .find_task_by_id(task_id)
+            .ok()
+            .flatten()
+            .map(|t| t.process_instance_id)
+            .unwrap_or(0);
+        let mut locks = self
+            .instance_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(instance_id)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Add user info variables (u_userId, u_realName, etc.)
@@ -415,9 +448,12 @@ impl JeeflowEngineImpl {
             }
             NodeType::Join => {
                 self.fire_pre_interceptors(exec)?;
-                // Check if all parallel branches have completed
-                let doing_tasks = exec.process_instance.get_doing_tasks();
-                if doing_tasks.is_empty() || exec.is_merged {
+                // 汇合判据两档（对齐 java `MergeBranchHandler`，契约见 `reapply` 模块头）：
+                // ① 到达任务带本汇合点的 `_branchCtx` ⇒ 按本轮 round 统计全部分支根，
+                //    任一根下仍有进行中任务、或任一根的申请待办在改（`_reapplyContext.branch`
+                //    命中 fork+join+round）都不放行；
+                // ② 不带（存量任务）⇒ 回落旧判据，行为与改前逐字一致。
+                if self.join_ready(exec, node) {
                     exec.is_merged = true;
                     let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
                         .iter()
@@ -470,6 +506,77 @@ impl JeeflowEngineImpl {
         Ok(())
     }
 
+    /// 汇合点是否放行（对齐 java `MergeBranchHandler.computeMerged`，本处理器只做判定，
+    /// 「一次性放行」由调用方在同一临界区里完成——见 [`Self::instance_lock`]）。
+    ///
+    /// 两档：
+    /// - **有分支归属**：取到达（刚办结）任务 `_branchCtx` 里本汇合点那一档 `(fork, round)`，
+    ///   把实例中该 fork+round 的全部任务按 `root` 分组；任一根下还有 DOING 任务 ⇒ 不放行；
+    ///   DOING 的申请待办若其 `_reapplyContext.branch` 命中同一个 join+fork+round ⇒ 同样
+    ///   视为「该分支还在申请人手里改」（申请任务不叫任何分支节点名，按节点名扫描看不见它）。
+    /// - **无分支归属**（存量任务）：回落旧判据——实例无进行中任务（或本步已合并）即可合并。
+    fn join_ready(&self, exec: &Execution, join: &NodeModel) -> bool {
+        let arriving = match exec.process_task.as_ref() {
+            Some(t) => t,
+            None => return Self::legacy_join_ready(exec),
+        };
+        let arriving_scopes = crate::reapply::scopes_of(&arriving.variables);
+        let arriving_scope = match crate::reapply::find_scope(&arriving_scopes, &join.id) {
+            Some(s) => s.clone(),
+            None => return Self::legacy_join_ready(exec),
+        };
+        let fork = arriving_scope.fork.clone();
+        let round = arriving_scope.round;
+
+        // root → 是否仍阻塞（true＝该分支未完成）；保持首次出现顺序，便于诊断
+        let mut roots: Vec<(i64, bool)> = Vec::new();
+        // 标记某分支根未完成：不在表里就插入（java `roots.put(root, TRUE)` 同义——
+        // 任务表遍历顺序不定，先遇到「申请人手里的那条」时根可能还没被登记过）
+        fn mark_blocked(roots: &mut Vec<(i64, bool)>, root: i64) {
+            match roots.iter_mut().find(|(r, _)| *r == root) {
+                Some(slot) => slot.1 = true,
+                None => roots.push((root, true)),
+            }
+        }
+        for task in &exec.process_instance.tasks {
+            let scope = crate::reapply::scopes_of(&task.variables)
+                .into_iter()
+                .find(|s| s.join == join.id);
+            let in_round = scope
+                .as_ref()
+                .map(|s| s.fork == fork && s.round == round)
+                .unwrap_or(false);
+            let root = scope.as_ref().map(|s| s.root).unwrap_or(0);
+            if in_round && !roots.iter().any(|(r, _)| *r == root) {
+                roots.push((root, false));
+            }
+            if !task.is_doing() {
+                continue;
+            }
+            if in_round {
+                mark_blocked(&mut roots, root);
+            }
+            // 该分支正在申请人手里修改：申请任务本身不在分支节点名集合里，
+            // 必须按 `_reapplyContext.branch` 的等待关系计入
+            if let Some(ctx) = crate::reapply::reapply_of(&task.variables) {
+                for b in ctx.branch.iter() {
+                    if b.join == join.id && b.fork == fork && b.round == round {
+                        mark_blocked(&mut roots, b.root);
+                    }
+                }
+            }
+        }
+        if roots.is_empty() {
+            return Self::legacy_join_ready(exec);
+        }
+        !roots.iter().any(|(_, blocked)| *blocked)
+    }
+
+    /// 存量/无归属任务的旧判据（本栈改前形状：进行中任务为空，或本步已合并）。
+    fn legacy_join_ready(exec: &Execution) -> bool {
+        exec.process_instance.get_doing_tasks().is_empty() || exec.is_merged
+    }
+
     /// Create a task with assignment resolution.
     fn create_task_with_assignment(&self, exec: &mut Execution, node: &NodeModel) -> JeeflowResult<()> {
         let actor_ids = self.resolve_assignee(exec, node);
@@ -490,6 +597,12 @@ impl JeeflowEngineImpl {
         let task_type = TaskType::from_code(node.task_type());
         // issues/126 案 A：节点上配的到期表达式一次读好、三条建单支路共用（未配 ⇒ 该列保持 NULL）
         let expr = crate::expire_time::expire_expr_of(node);
+        // 分支归属（对齐 java `CreateTaskHandler` 收尾那段）：本节点落在哪些「fork…join」范围内、
+        // 每档的 round/root 从父任务同档继承（父任务不在该档 ⇒ 本任务就是分支根）。
+        // 建单时 task_id 尚未生成 ⇒ 传 0，落库拿到 id 后由 `persist_tasks` 回填 root。
+        // 记录起点：本函数一次调用可能建 1..n 行（会签），只给**本次新建**的行挂归属。
+        let agg_start = exec.process_instance.tasks.len();
+        let new_start = exec.new_tasks.len();
 
         let task = if perform_type == PerformType::Countersign {
             // 会签的建单是**逐成员**一行（java `createCountersignTasks` 同款 for-actor），
@@ -554,6 +667,19 @@ impl JeeflowEngineImpl {
         // TASK_START 统一改在 persist_tasks 落库后 fire（见下）。此处只登记新任务。
         if perform_type != PerformType::Countersign {
             exec.new_tasks.push(task);
+        }
+
+        // 分支归属落变量（`_branchCtx`）：新任务与聚合根内的副本两份都写，才算"落库那份带上了"
+        // （create_task 往聚合根 push 的是克隆——同 issues/131 会签簿记那条教训）。
+        let scopes = crate::reapply::build_scopes(
+            exec.process_task.as_ref(), &exec.process_model, &node.id, 0);
+        if !scopes.is_empty() {
+            for t in exec.new_tasks.iter_mut().skip(new_start) {
+                crate::reapply::put_scopes(t, &scopes);
+            }
+            for t in exec.process_instance.tasks.iter_mut().skip(agg_start) {
+                crate::reapply::put_scopes(t, &scopes);
+            }
         }
 
         Ok(())
@@ -864,6 +990,12 @@ impl JeeflowEngineImpl {
                 merged_actors.push((task.task_id, task.actor_ids.clone()));
             }
             self.repo().save_task(task)?;
+            // 分支根任务建单时自身 id 尚未生成，落库后回填 `_branchCtx.root`；
+            // 仓储在 INSERT 时已序列化变量，回填必须补一次 UPDATE 才落盘
+            // （对齐 java `saveNewTask` 里那句 fillRootSelf → updateTask）。
+            if crate::reapply::fill_root_self(task) {
+                self.repo().update_task(task)?;
+            }
             // Save actors（集合已含代理人，与任务同批落库）
             if !task.actor_ids.is_empty() {
                 self.repo().add_task_actor(task.task_id, &task.actor_ids)?;
@@ -1002,6 +1134,8 @@ impl JeeflowEngineImpl {
         // 3. Build args with user info (sync)
         let mut full_args = FlowData::new();
         full_args.merge(args);
+        // 客户端不得伪造/覆盖引擎控制键（`_branchCtx` / `_reapplyContext` 只由引擎写）
+        crate::reapply::strip_reserved(&mut full_args);
         self.add_user_info(&mut full_args, operator);
 
         // Auto-generate title
@@ -1098,11 +1232,39 @@ impl JeeflowEngineImpl {
     }
 
     /// 同步内核（不自行包裹）。
+    ///
+    /// 同实例串行化：锁在**入口**取（覆盖"重验状态 → 建后继任务"整段），
+    /// 见 [`Self::instance_lock`] 与那里的单进程限制说明。
     pub fn execute_task_sync(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
+        let lock = self.instance_lock(task_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.execute_task_locked(task_id, operator, args)
+    }
+
+    fn execute_task_locked(&self, task_id: i64, operator: &str, args: &FlowData)
+        -> JeeflowResult<Vec<ProcessTask>> {
+        // 客户端不得伪造/覆盖引擎控制键（`_branchCtx` / `_reapplyContext`）：
+        // 办理入口先剥再合，路由/汇合判定只认引擎自己写的值（对齐 java `prepareExecution`）。
+        let args = {
+            let mut a = args.clone();
+            crate::reapply::strip_reserved(&mut a);
+            a
+        };
+        let args = &args;
         // 1. Load task (sync)
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
+
+        // 1.5 「重提直返」：申请待办带 `_reapplyContext` 时**不走**申请节点出边，
+        //     只接受重新提交（submitType=5，缺省按 5）并直接回来源节点建待办。
+        //     判据排在完整状态校验之前（对齐 java `executeProcessTask` 首段）：
+        //     非 DOING 的旧申请任务仍落回下面的常规路径报"非进行中"。
+        if task.task_state == TaskState::Doing.code()
+            && crate::reapply::reapply_of(&task.variables).is_some()
+        {
+            return self.execute_reapply(&task, operator, args);
+        }
 
         if task.task_state != TaskState::Doing.code() {
             return Err(JeeflowError::InvalidState(format!("Task {} is not DOING", task_id)));
@@ -1348,6 +1510,205 @@ impl JeeflowEngineImpl {
         Ok(exec.new_tasks)
     }
 
+    // ═══ 退回修改、重提直返（对齐 java `JeeflowEngineImpl.executeReapply` /
+    //     `createReturnToSourceApplication`）═══
+
+    /// `submitType=5` 且申请待办带直返上下文：校验来源后，在来源节点直接建新待办。
+    ///
+    /// 不执行申请节点出边（不重算来源前条件、不重触发分叉），也不执行来源节点出边。
+    fn execute_reapply(&self, apply_task: &ProcessTask, operator: &str, args: &FlowData)
+        -> JeeflowResult<Vec<ProcessTask>> {
+        // ① 只接受重新提交（submitType=5；没带按 5）
+        let submit_type = args.get_i64("submitType");
+        if !matches!(submit_type, None | Some(5)) {
+            return Err(JeeflowError::Business(
+                "带重提直返标记的申请待办只接受重新提交(submitType=5)".to_string(),
+            ));
+        }
+
+        // ② 实例 / 定义 / 模型
+        let mut instance = self.repo().find_instance_by_id(apply_task.process_instance_id)?
+            .ok_or_else(|| JeeflowError::Business("流程实例不存在".to_string()))?;
+        instance.tasks = self.repo().find_history_tasks(instance.instance_id)?;
+        let define = self.repo().find_define_by_id(instance.define_id)?
+            .ok_or(JeeflowError::DefineNotFound(instance.define_id))?;
+        let model = ModelParser::parse(&define.content_str())?;
+
+        // ③ 上下文与来源校验（任何状态变更之前）
+        let ctx = crate::reapply::reapply_of(&apply_task.variables)
+            .ok_or_else(|| JeeflowError::Business("重提直返上下文缺失".to_string()))?;
+        let source_task_id = crate::reapply::require_source_task_id(&ctx)?;
+        let source = instance
+            .tasks
+            .iter()
+            .find(|t| t.task_id == source_task_id)
+            .cloned()
+            .filter(|t| t.is_finished())
+            .ok_or_else(|| {
+                JeeflowError::Business("重提直返来源任务无效或未完成".to_string())
+            })?;
+        let source_node = model
+            .get_node(&source.task_name)
+            .cloned()
+            .filter(|n| {
+                n.node_type == NodeType::Task
+                    && n.reapply_mode == crate::reapply::ReapplyMode::ReturnToSource
+            })
+            .ok_or_else(|| {
+                JeeflowError::Business("重提直返来源节点配置已变更，拒绝执行".to_string())
+            })?;
+        if !model.is_first_task_node(&apply_task.task_name) {
+            return Err(JeeflowError::Business(
+                "重提直返必须从申请待办发起".to_string(),
+            ));
+        }
+
+        // ④ 办理人校验 + 入口字段权限过滤（与常规办理同门）
+        if !apply_task.is_allowed(operator) {
+            return Err(JeeflowError::PermissionDenied(format!(
+                "Operator {} not allowed on task {}",
+                operator, apply_task.task_id
+            )));
+        }
+        let task_args =
+            crate::interceptor::filter_args_by_node_permission(args, &model, &apply_task.task_name);
+        let mut full_args = instance.variables.clone();
+        full_args.merge(&task_args);
+        self.add_user_info(&mut full_args, operator);
+
+        // ⑤ 完成申请任务（先落库任务行，再 fire，与 prepareExecution 同序）
+        instance
+            .complete_task(apply_task.task_id, operator, &task_args)
+            .map_err(JeeflowError::Business)?;
+        if let Some(t) = instance.tasks.iter().find(|t| t.task_id == apply_task.task_id) {
+            self.repo().update_task(t)?;
+        }
+        self.notify_task_outcome(
+            ProcessEventType::TaskComplete,
+            instance.instance_id,
+            apply_task.task_id,
+            operator,
+            Some(submit_type.unwrap_or(5)),
+        );
+
+        // ⑥ 在来源节点直接建待办（不执行申请/来源任一出边）
+        let mut exec = Execution::new(instance, model, define, operator, full_args);
+        exec.process_task = Some(apply_task.clone());
+        // 遗留的「下一节点指定人」参数不得影响本次建单（历史记录不删，只是本次不读）
+        exec.args.remove("tf_nextNodeOperator");
+        let actors = self.resolve_assignee(&exec, &source_node);
+        if actors.is_empty() {
+            return Err(JeeflowError::Business(format!(
+                "目标节点[{}]没有可用参与者，重提已回滚",
+                source_node.id
+            )));
+        }
+        let mut new_task = exec.process_instance.create_task(
+            &source_node.id,
+            &source_node.display_name,
+            &actors,
+            operator,
+            TaskType::from_code(source_node.task_type()),
+            PerformType::from_code(source_node.perform_type()),
+            source_node.form_key(),
+            Some(apply_task.task_id),
+        );
+        // 分支归属＝退回时快照（不按模型静态范围重算：来源在分叉内时 round/root 必须沿用本轮）
+        crate::reapply::put_scopes(&mut new_task, &ctx.branch);
+        if let Some(t) = exec.process_instance.tasks.last_mut() {
+            crate::reapply::put_scopes(t, &ctx.branch);
+        }
+        // 到期时间与常规建单同一把尺子（节点没配 ⇒ 保持 NULL）
+        let expr = crate::expire_time::expire_expr_of(&source_node);
+        stamp_expire(
+            std::slice::from_mut(&mut new_task),
+            &mut exec.process_instance.tasks,
+            expr.as_deref(),
+            &exec.process_instance.variables,
+        );
+        exec.new_tasks.push(new_task);
+
+        self.persist_tasks(&mut exec)?;
+        self.repo().update_instance(&exec.process_instance)?;
+        Ok(exec.new_tasks)
+    }
+
+    /// `submitType=6` 的直返落点（提交入口在完成来源任务后调用）：在原实例里给**发起人**
+    /// 建一条申请待办，并在任务变量里写本次退回绑定（`_reapplyContext`）；
+    /// 不重放来源出边、不重触发分叉。
+    fn create_return_to_source_application(
+        &self,
+        exec: &mut Execution,
+        source_node: &NodeModel,
+        source_task: &ProcessTask,
+    ) -> JeeflowResult<()> {
+        let apply_model = exec.process_model.get_first_task_node().cloned()
+            .ok_or_else(|| {
+                JeeflowError::Business("流程定义缺少申请节点，无法退回发起人".to_string())
+            })?;
+        // 参与者＝实例发起人（不是当前办理人）：退回后的申请单得回到申请人手里
+        let initiator = exec.process_instance.operator.clone();
+        let ctx = crate::reapply::ReapplyCtx::new(
+            source_task.task_id,
+            source_node.id.clone(),
+            crate::reapply::scopes_of(&source_task.variables),
+        );
+        let mut app_task = exec.process_instance.create_task(
+            &apply_model.id,
+            &apply_model.display_name,
+            std::slice::from_ref(&initiator),
+            &initiator,
+            TaskType::from_code(apply_model.task_type()),
+            PerformType::from_code(apply_model.perform_type()),
+            apply_model.form_key(),
+            Some(source_task.task_id),
+        );
+        // 申请待办本身不在任何分支内（`_branchCtx` 空表），直返绑定写进 `_reapplyContext`
+        crate::reapply::put_scopes(&mut app_task, &[]);
+        crate::reapply::put_reapply(&mut app_task, &ctx);
+        // 聚合根 push 的是克隆 ⇒ 两份都写
+        if let Some(t) = exec.process_instance.tasks.last_mut() {
+            crate::reapply::put_scopes(t, &[]);
+            crate::reapply::put_reapply(t, &ctx);
+        }
+        let expr = crate::expire_time::expire_expr_of(&apply_model);
+        stamp_expire(
+            std::slice::from_mut(&mut app_task),
+            &mut exec.process_instance.tasks,
+            expr.as_deref(),
+            &exec.process_instance.variables,
+        );
+        exec.new_tasks.push(app_task);
+        Ok(())
+    }
+
+    /// `RETURN_TO_SOURCE` 来源节点的准入校验（**不改任何状态**，排在完成来源任务之前）：
+    /// 会签节点不支持、申请节点不能配直返、流程定义必须能定位到申请节点。
+    fn validate_return_to_source(
+        &self,
+        model: &ProcessModel,
+        source_node: &NodeModel,
+    ) -> JeeflowResult<()> {
+        if PerformType::from_code(source_node.perform_type()) == PerformType::Countersign {
+            return Err(JeeflowError::Business(format!(
+                "会签节点[{}]不支持退回修改直返",
+                source_node.id
+            )));
+        }
+        if model.is_first_task_node(&source_node.id) {
+            return Err(JeeflowError::Business(format!(
+                "申请节点[{}]不能配置重提直返",
+                source_node.id
+            )));
+        }
+        if model.get_first_task_node().is_none() {
+            return Err(JeeflowError::Business(
+                "流程定义缺少申请节点，无法退回发起人".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Async execute and jump to specific task node（签名保留）。
     pub async fn execute_and_jump_async(&self, task_id: i64, operator: &str,
                                           args: &FlowData, target_name: Option<&str>)
@@ -1373,6 +1734,13 @@ impl JeeflowEngineImpl {
 
     fn execute_jump_inner(&self, task_id: i64, operator: &str, args: &FlowData,
                           mode: JumpTarget<'_>) -> JeeflowResult<Vec<ProcessTask>> {
+        // 客户端不得伪造/覆盖引擎控制键（同 `execute_task_locked` 入口剥离）
+        let args = {
+            let mut a = args.clone();
+            crate::reapply::strip_reserved(&mut a);
+            a
+        };
+        let args = &args;
         // Similar to execute_task_async but jumps to target node
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
@@ -1395,6 +1763,24 @@ impl JeeflowEngineImpl {
                 return Err(JeeflowError::Business(
                     format!("根据节点名称[{}]无法找到节点模型", name)));
             }
+        }
+
+        // 「退回修改、重提直返」的 submitType=6 分支：来源节点配了 `RETURN_TO_SOURCE` ⇒
+        // 完成来源任务后给**发起人**建一张申请待办（绑定本轮来源），不重放来源出边、
+        // 不重触发分叉。校验必须放在**任何状态变更之前**（非法配置/不支持的形状不得
+        // 先完成任务、先发通知）——对齐 java `executeAndJumpToFirstTaskNode`。
+        let direct_source: Option<NodeModel> = match mode {
+            JumpTarget::FirstTaskNode if task.task_state == TaskState::Doing.code() => model
+                .get_node(&task.task_name)
+                .filter(|n| {
+                    n.node_type == NodeType::Task
+                        && n.reapply_mode == crate::reapply::ReapplyMode::ReturnToSource
+                })
+                .cloned(),
+            _ => None,
+        };
+        if let Some(source_node) = direct_source.as_ref() {
+            self.validate_return_to_source(&model, source_node)?;
         }
 
         // resume 语义对齐 Go mergeVars(args, inst.Variables)：实例已持久化变量为底、
@@ -1449,7 +1835,7 @@ impl JeeflowEngineImpl {
         self.notify_task_outcome(outcome, instance.instance_id, task_id, operator, submit_type);
 
         let mut exec = Execution::new(instance, model, define, operator, full_args);
-        exec.process_task = Some(task);
+        exec.process_task = Some(task.clone());
 
         match mode {
             JumpTarget::Node(name) => {
@@ -1461,9 +1847,12 @@ impl JeeflowEngineImpl {
                 })?;
                 self.execute_node(&mut exec, &node)?;
             }
-            // submitType=6 退回发起人：跳 start 直接后继那条节点（形状与原实现一致，已与 3 彻底分开）
+            // submitType=6 退回发起人：直返来源节点 ⇒ 建申请待办；否则跳 start 直接后继
+            // 那条节点（形状与原实现一致，已与 3 彻底分开）
             JumpTarget::FirstTaskNode => {
-                if let Some(node) = exec.process_model.get_first_task_node().cloned() {
+                if let Some(source_node) = direct_source.as_ref() {
+                    self.create_return_to_source_application(&mut exec, source_node, &task)?;
+                } else if let Some(node) = exec.process_model.get_first_task_node().cloned() {
                     self.execute_node(&mut exec, &node)?;
                 }
             }
@@ -1486,6 +1875,13 @@ impl JeeflowEngineImpl {
     /// 同步内核（不自行包裹）。
     pub fn execute_and_jump_to_end_sync(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
+        // 客户端不得伪造/覆盖引擎控制键（办理/跳转/退结束三个入口同一剥离判据）
+        let args = {
+            let mut a = args.clone();
+            crate::reapply::strip_reserved(&mut a);
+            a
+        };
+        let args = &args;
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
 
@@ -1569,9 +1965,13 @@ impl JeeflowEngineImpl {
     }
 
     /// 同步内核（不自行包裹）。
+    ///
+    /// 同实例串行化：与 [`Self::execute_task_sync`] 同一把按实例的互斥锁（见 `instance_lock`）。
     pub fn execute_and_jump_to_first_sync(&self, task_id: i64, operator: &str, args: &FlowData)
         -> JeeflowResult<Vec<ProcessTask>> {
         // issues/121 P2：不再借道 execute_and_jump_async(None)——那条现在是血缘回退（3）
+        let lock = self.instance_lock(task_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         self.execute_jump_inner(task_id, operator, args, JumpTarget::FirstTaskNode)
     }
 
@@ -6223,7 +6623,8 @@ mod node_level_interceptor_r91_tests {
         for (k, v) in decls {
             properties.insert((*k).to_string(), crate::json::JsonValue::Str((*v).to_string()));
         }
-        NodeModel { id: id.to_string(), node_type: kind, display_name: id.to_string(), properties }
+        NodeModel { id: id.to_string(), node_type: kind, display_name: id.to_string(), properties,
+            reapply_mode: crate::reapply::ReapplyMode::Normal }
     }
 
     /// 造一台只装了注册表的引擎＋一份停在 apply 节点上的 Execution。
