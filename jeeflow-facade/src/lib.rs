@@ -2530,26 +2530,23 @@ fn collect_high_light_path(
         .find(|n| n.id == node_id)
         .map(|n| n.node_type == jeeflow_core::parser::NodeType::Decision)
         .unwrap_or(false);
-    for edge in model.get_output_edges(node_id) {
-        // 决策档：空表达式不过滤（java `StringUtils.isNotEmpty(tm.getExpr())` 同一判据）
-        if is_decision {
-            if let Some(expr) = edge.expr() {
-                if !expr.is_empty()
-                    && !eval_decision_expr(
-                        model,
-                        node_id,
-                        &expr,
-                        instance_vars,
-                        history_tasks,
-                        evaluator,
-                        instance_id,
-                        define_id,
-                    )
-                {
-                    continue;
-                }
-            }
-        }
+    // issues/241：决策节点选边以任务行佐证为准（活跃目标 → 有任务行的目标），
+    // 一条佐证都没有才回落到按当前实例变量求值（旧口径）
+    let outputs: Vec<&jeeflow_core::parser::EdgeModel> = if is_decision {
+        select_decision_edges(
+            model,
+            node_id,
+            active,
+            instance_vars,
+            history_tasks,
+            evaluator,
+            instance_id,
+            define_id,
+        )
+    } else {
+        model.get_output_edges(node_id)
+    };
+    for edge in outputs {
         if !edge.id.is_empty() && !edges.contains(&edge.id) {
             edges.push(edge.id.clone());
         }
@@ -2577,6 +2574,71 @@ fn collect_high_light_path(
             define_id,
         );
     }
+}
+
+/// 决策节点选边（issues/241）：先按表达式求值（issues/06/153 旧口径），
+/// **当表达式给出的非空结果与任务行佐证相矛盾时，以任务行为准**；求值失败/零命中时保持
+/// 既有降级面（issues/164/201 的口径不被本规则改写）。
+///
+/// 直返单（reapplyMode=RETURN_TO_SOURCE）重提后实例变量已按新值落库，而来源节点之前的
+/// 条件分支按契约不重算；按当前变量重放会选出没走过的分支，走过的分支在任务表里有行
+/// （活跃目标也算）——这是执行事实。
+#[allow(clippy::too_many_arguments)]
+fn select_decision_edges<'a>(
+    model: &'a jeeflow_core::parser::ProcessModel,
+    decision_id: &str,
+    active: &[String],
+    instance_vars: &HashMap<String, JsonValue>,
+    history_tasks: &[ProcessTask],
+    evaluator: &dyn ExpressionEvaluator,
+    instance_id: i64,
+    define_id: i64,
+) -> Vec<&'a jeeflow_core::parser::EdgeModel> {
+    let outs = model.get_output_edges(decision_id);
+    let selected: Vec<&jeeflow_core::parser::EdgeModel> = outs
+        .iter()
+        .filter(|edge| match edge.expr() {
+            Some(expr) if !expr.is_empty() => eval_decision_expr(
+                model,
+                decision_id,
+                &expr,
+                instance_vars,
+                history_tasks,
+                evaluator,
+                instance_id,
+                define_id,
+            ),
+            _ => true,
+        })
+        .copied()
+        .collect();
+    if selected.is_empty() {
+        return selected;
+    }
+    for edge in &selected {
+        if active.contains(&edge.target_node_id)
+            || history_tasks.iter().any(|t| t.task_name == edge.target_node_id)
+        {
+            return selected; // 表达式与执行事实一致，维持原口径
+        }
+    }
+    let active_hits: Vec<&jeeflow_core::parser::EdgeModel> = outs
+        .iter()
+        .filter(|e| active.contains(&e.target_node_id))
+        .copied()
+        .collect();
+    if !active_hits.is_empty() {
+        return active_hits;
+    }
+    let evidenced: Vec<&jeeflow_core::parser::EdgeModel> = outs
+        .iter()
+        .filter(|e| history_tasks.iter().any(|t| t.task_name == e.target_node_id))
+        .copied()
+        .collect();
+    if !evidenced.is_empty() {
+        return evidenced;
+    }
+    selected
 }
 
 /// 决策出边表达式求值（spec/06 §4.6 highLight 义务 2；基准＝java `evalDecisionExpr`
