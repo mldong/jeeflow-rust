@@ -639,6 +639,11 @@ fn test15_control_keys_never_enter_instance_variables() {
 
 /// test16 加签链上「退回上一步」(3) **禁**：当前行与血缘 parent 同节点，
 /// 既有血缘守卫不过 ⇒ 走本栈既有的等价错误出口（内部码 20010008 档，对外逐字文案不带码）。
+///
+/// **报错那一次零写入**（issues/243 甲案，2026-11-03 落地）：血缘守卫由引擎排在
+/// `complete_task`（办结当前行并落库）**之前**（java `checkRollbackPossible` 提到
+/// `prepareExecution` 之前的同位），内存仓储无回滚也照得见——报错后当前行仍 DOING、
+/// 待办还在办理人手里。修前的形状是"点了退回、报错了、待办也没了"（下面四格当时全红）。
 #[test]
 fn test16_rollback_on_add_sign_chain_rejected() {
     let (engine, repo) = as_engine();
@@ -647,6 +652,7 @@ fn test16_rollback_on_add_sign_chain_rejected() {
     let a = doing_named(&repo, iid, "review").unwrap();
     engine.execute_task_sync(a.task_id, "userA", &agree("userB")).unwrap();
     let b = doing_named(&repo, iid, "review").unwrap();
+    let total_rows = repo.find_history_tasks(iid).unwrap().len();
 
     let err = engine
         .execute_and_jump_sync(b.task_id, "userB", &submit(SUBMIT_ROLLBACK), None)
@@ -657,11 +663,14 @@ fn test16_rollback_on_add_sign_chain_rejected() {
         err.message()
     );
     assert!(doing_named(&repo, iid, "final").is_none(), "不得流出本节点");
-    // 守卫不过＝不建复活行。注意这一支的报错点在本栈（与 java 参考实现同位）排在
-    // `complete_task` **之后**（java `executeAndJumpTask` → `prepareExecution` 先办结再
-    // `rollbackToParent`，内存仓储无事务回滚 ⇒ 当前行已是完成态、库里没有第三条行）。
+    // 守卫不过＝不建复活行；守卫前置＝当前行也不许被办结（报错即零写入）。
     assert_eq!(2, rows(&repo, iid, "review"), "不得复活出第三条同节点行");
-    assert_eq!(0, doing_count(&repo, iid, "review"), "复活行一条都不建");
+    assert_eq!(1, doing_count(&repo, iid, "review"),
+        "报错零写入：当前行必须仍是待办（守卫排在办结之前）");
+    let still = doing_named(&repo, iid, "review").expect("待办还在办理人手里");
+    assert_eq!(b.task_id, still.task_id, "还是报错那一条，不是新建的行");
+    assert_eq!(total_rows, repo.find_history_tasks(iid).unwrap().len(), "报错不建单：行总数不变");
+    assert_eq!(10, instance_state(&repo, iid), "实例状态不受这次失败影响");
 }
 
 /// test17 共享夹具 `flows/19-add-sign-after.json` 必须真被本栈消费

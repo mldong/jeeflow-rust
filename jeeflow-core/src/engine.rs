@@ -1957,6 +1957,18 @@ impl JeeflowEngineImpl {
         // 同一口径。排在任何状态变更之前，报错时零写入。
         add_sign::validate_submission(&model, &task, &task_args, operator)?;
 
+        // issues/243 甲案：「退回上一步」（nodeName 空 ⇒ 血缘腿）的两道守卫（20010007／20010008）
+        // 上提到下面 `complete_task`（办结当前行并 update_task 落库）**之前**——内存仓储无回滚，
+        // 守卫后置时报错那次调用结束后"当前待办凭空消失且没有复活行"。与后加签写入口四判据
+        // 同一规矩：判据一律排在任何状态变更之前，报错即零写入。
+        // 任务不在进行中一律放行：「不在进行中／无权办理」留在 `complete_task` 的既有固定错
+        // （它们本来就排在办结之前，天然零写入；搬守卫会改既有报顺序）——java
+        // `checkRollbackPossible` 同款放行口径。取不到任务/实例/定义在上面加载处就已退出，
+        // 那些错同样在任何写入之前。
+        if matches!(mode, JumpTarget::RollbackLineage) && task.is_doing() {
+            check_rejectable(&model, &instance.tasks, &task)?;
+        }
+
         // Inject countersignDisagreeFlag if submitType==20 (issues/94 round 2)
         let submit_type = full_args.get_i64("submitType")
             .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
@@ -2182,25 +2194,17 @@ impl JeeflowEngineImpl {
     ///
     /// 对外 msg 用固定中文文案、不含引擎内部码：本栈 `JeeflowError::code()` 恒 99999999，
     /// 两格语义由文案区分（引擎内部码 20010007、20010008 只留在规范与本注释，HTTP 出口仍 99999999）。
+    ///
+    /// issues/243 甲案：两道血缘守卫（20010007／20010008）的判据只有 `check_rejectable`
+    /// **一份实现**——引擎前置位（`execute_jump_inner`，排在 `complete_task` 之前）与本复活腿
+    /// 共用（java `ProcessInstance.checkRejectable` 同形）。走到本方法时前置守卫已过，
+    /// 这里的复用只是把前驱行取回来供复活，不再另立判据。
     fn rollback_to_parent(&self, exec: &mut Execution) -> JeeflowResult<()> {
-        const NO_LINEAGE: &str = "上一步任务ID为空，无法驳回至上一步处理";
-        const GUARD: &str = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务";
-
         let current = match exec.process_task.clone() {
             Some(t) => t,
-            None => return Err(JeeflowError::Business(NO_LINEAGE.to_string())),
+            None => return Err(JeeflowError::Business(ROLLBACK_NO_LINEAGE_MSG.to_string())),
         };
-        let parent_id = match current.parent_task_id {
-            Some(p) if p != 0 => p,
-            _ => return Err(JeeflowError::Business(NO_LINEAGE.to_string())),
-        };
-        let history = match exec.process_instance.tasks.iter().find(|t| t.task_id == parent_id) {
-            Some(t) => t.clone(),
-            None => return Err(JeeflowError::Business(NO_LINEAGE.to_string())),
-        };
-        if !exec.process_model.can_rejected(&current.task_name, &history.task_name) {
-            return Err(JeeflowError::Business(GUARD.to_string()));
-        }
+        let history = check_rejectable(&exec.process_model, &exec.process_instance.tasks, &current)?;
 
         // 复活行的变量只带数据类键：tf_*（上一次表单提交）与 csv_*/会签簿记都是"上次提交"的残留，
         // 留着会让新待办显示用户这次没填的东西、或让复活的会签节点从错位的序号继续推进。
@@ -2226,7 +2230,7 @@ impl JeeflowEngineImpl {
         } else {
             match history.actor_id.clone() {
                 Some(a) => a,
-                None => return Err(JeeflowError::Business(NO_LINEAGE.to_string())),
+                None => return Err(JeeflowError::Business(ROLLBACK_NO_LINEAGE_MSG.to_string())),
             }
         };
         vars.insert("isFirstTaskNode".to_string(), JsonValue::Bool(is_first_row));
@@ -2260,6 +2264,43 @@ impl JeeflowEngineImpl {
         exec.new_tasks.push(revived);
         Ok(())
     }
+}
+
+// ═══════════════════════════════════════════════════════
+// issues/243 甲案 · 「退回上一步」两道血缘守卫（唯一实现，纯读）
+// ═══════════════════════════════════════════════════════
+
+/// 20010007「上一步任务ID为空」档的逐字文案（引擎内部码只留在规范与注释，
+/// 本栈 HTTP 出口恒 `code=99999999` ＋ 这句原文——issues/121 口径，不许改）。
+const ROLLBACK_NO_LINEAGE_MSG: &str = "上一步任务ID为空，无法驳回至上一步处理";
+/// 20010008「canRejected 不过」档的逐字文案（同上，不许改）。
+const ROLLBACK_GUARD_MSG: &str = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务";
+
+/// 「退回上一步」（submitType=3，nodeName 空 ⇒ 血缘腿）的两道**纯读**守卫（规范 04 · 退回上一步）：
+/// ①20010007 无血缘——当前行 `parent_task_id` 为空/0，或指向的历史行在仓储里查不到
+///   （含 P1 之前落的老行形状）；
+/// ②20010008 `canRejected` 不过——上一步是 fork/join/subprocess/会签一类不可回退节点
+///   （含加签链上 parent 与本行同节点、旁支血缘）。
+///
+/// 过 ⇒ 返回血缘前驱那条历史行（克隆，供复活腿使用）。**本函数不写任务行、不写实例、
+/// 不 fire 事件、不建历史行**。判据只有这一份实现：复活腿 `JeeflowEngineImpl::rollback_to_parent`
+/// 与引擎前置位（`execute_jump_inner` 里排在 `complete_task` **之前**的那一调）共用
+/// ——java 参考实现 `ProcessInstance.checkRejectable` 同形（issues/243 甲案，commit `feefaf6`），
+/// 不许在任一侧另立第二套语义。
+fn check_rejectable(model: &ProcessModel, all_tasks: &[ProcessTask],
+                    current: &ProcessTask) -> JeeflowResult<ProcessTask> {
+    let parent_id = match current.parent_task_id {
+        Some(p) if p != 0 => p,
+        _ => return Err(JeeflowError::Business(ROLLBACK_NO_LINEAGE_MSG.to_string())),
+    };
+    let history = match all_tasks.iter().find(|t| t.task_id == parent_id) {
+        Some(t) => t.clone(),
+        None => return Err(JeeflowError::Business(ROLLBACK_NO_LINEAGE_MSG.to_string())),
+    };
+    if !model.can_rejected(&current.task_name, &history.task_name) {
+        return Err(JeeflowError::Business(ROLLBACK_GUARD_MSG.to_string()));
+    }
+    Ok(history)
 }
 
 
@@ -4388,6 +4429,10 @@ mod tests {
     /// ① 无血缘（parent 为 0，＝P1 之前落的老行形状）⇒ 20010007，不得静默不建单；
     /// ② 血缘前驱跨不过 fork/join（boot2 canRejected 遇到 fork/join/start 直接跳过、不深入）
     ///    ⇒ 20010008。夹具 04-fork-join：分支任务的 parent 是 fork 之前的 apply。
+    ///
+    /// issues/243 甲案（2026-11-03）：四档都补**零写入断言**——血缘守卫排在 `complete_task`
+    /// 之前，报错后当前行仍 DOING、待办还在办理人手里、行数与实例状态不变
+    /// （修前形状＝报错那一次当前行已被静默办结）。
     #[tokio::test]
     async fn test_i121_p2_rollback_rejects_no_lineage_and_guard() {
         // ① 无血缘：02-multi-task 的 apply 行 parent 落 0（发起 execution 无当前任务）
@@ -4403,6 +4448,13 @@ mod tests {
             .await.err().expect("无血缘必须报错，不得静默通过");
         assert!(e.to_string().contains("上一步任务ID为空，无法驳回至上一步处理") && !e.to_string().contains("2001000"),
             "msg 应为固定文案且不含内部码，实得 {}", e.to_string());
+        // 零写入：当前行仍是 DOING、没有第三条行、实例状态不动
+        assert!(repo.find_task_by_id(apply.task_id).unwrap().unwrap().is_doing(),
+            "①报错零写入：当前行必须仍是待办（守卫排在办结之前）");
+        assert_eq!(1, repo.find_history_tasks(inst.instance_id).unwrap().len(),
+            "①报错不建单：行数不变");
+        assert_eq!(InstanceState::Doing.code(),
+            repo.find_instance_by_id(inst.instance_id).unwrap().unwrap().state, "①实例状态不变");
 
         // ①′ 老行形状 A：parent 为 None（P1 之前建的数据该列是 NULL）——本栈它与 Some(0) 走的是
         //     两个 match 分支，故必须单独钉一次
@@ -4414,6 +4466,10 @@ mod tests {
         let eb = engine.execute_and_jump_async(apply_b.task_id, "applicant", &rb, None)
             .await.err().expect("parent=None 的老行必须报错，不得静默不建单");
         assert!(eb.to_string().contains("上一步任务ID为空，无法驳回至上一步处理") && !eb.to_string().contains("2001000"), "实得 {}", eb.to_string());
+        assert!(repo.find_task_by_id(apply_b.task_id).unwrap().unwrap().is_doing(),
+            "①′报错零写入：None 血缘那一档当前行同样不得被办结");
+        assert_eq!(1, repo.find_history_tasks(inst_b.instance_id).unwrap().len(),
+            "①′报错不建单：行数不变");
 
         // ①″ 老行形状 B：parent 是非 0 但仓储里查不到行（老数据被清过 / 跨库迁移来的样子）
         //     ⇒ 走"取不到历史行"那条分支，同样必须 20010007
@@ -4425,6 +4481,10 @@ mod tests {
         let ec = engine.execute_and_jump_async(apply_c.task_id, "applicant", &rb, None)
             .await.err().expect("parent 指不到真实行时必须报错");
         assert!(ec.to_string().contains("上一步任务ID为空，无法驳回至上一步处理") && !ec.to_string().contains("2001000"), "实得 {}", ec.to_string());
+        assert!(repo.find_task_by_id(apply_c.task_id).unwrap().unwrap().is_doing(),
+            "①″报错零写入：查不到前驱行那一档当前行同样不得被办结");
+        assert_eq!(1, repo.find_history_tasks(inst_c.instance_id).unwrap().len(),
+            "①″报错不建单：行数不变");
 
         // ② 守卫：fork 分支任务的 parent 在 fork 之前 ⇒ boot2 语义下不可回退
         let (engine2, repo2) = make_surrogate_engine();
@@ -4433,10 +4493,17 @@ mod tests {
         let branch = advance_until_doing(&engine2, &repo2, inst2.instance_id, "taskA").await;
         assert!(branch.parent_task_id.unwrap_or(0) != 0,
             "前置条件：分支行的 parent 应已由 P1 写入");
+        let rows_before = repo2.find_history_tasks(inst2.instance_id).unwrap().len();
         let who = branch.actor_ids.first().cloned().unwrap_or_else(|| "applicant".to_string());
         let e2 = engine2.execute_and_jump_async(branch.task_id, &who, &rb, None)
             .await.err().expect("血缘前驱跨不过 fork 时必须被守卫拦下");
         assert!(e2.to_string().contains("无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务") && !e2.to_string().contains("2001000"), "实得 {}", e2.to_string());
+        // ② 零写入（issues/243 甲案，同 java test168 那两档）：canRejected 不过 ⇒
+        // 报错后该并行待办仍在办理人手里，且没有凭空多出的行。
+        assert!(repo2.find_task_by_id(branch.task_id).unwrap().unwrap().is_doing(),
+            "②报错零写入：canRejected 那一档当前行必须仍是 DOING");
+        assert_eq!(rows_before, repo2.find_history_tasks(inst2.instance_id).unwrap().len(),
+            "②报错不建单：实例下任务行总数不变");
     }
 
     // ═══════════════════════════════════════════════════════

@@ -5115,8 +5115,11 @@ mod tests {
         });
     }
 
-    /// ② 入口原子档：引擎入口内中途失败（血缘退回在 `update_task` 之后必然报错）⇒ 整体回滚；
-    /// 无模板红样（修前形态）同路径留下"已完成"半完成，钉住入口包裹修的是什么。
+    /// ② 入口原子档：引擎入口内中途失败 ⇒ 整体回滚。
+    /// issues/243 甲案（2026-11-03）：血缘守卫（20010007/20010008）已上提到 `complete_task`
+    /// 之前 ⇒ 这一路报错发生在**任何写入之前**——本档旧"红样"（无模板留下 20 半完成＝
+    /// 修前形态）不复存在，改钉**报错即零写入**（无模板同样留 10）。入口包裹的判别力
+    /// 仍由 145_c 复合档（多拍各自提交的中途失败）钉住，本档不再冒充"修前形态"。
     #[test]
     fn test_mysql_tx_tier_145_b_entry_atomic() {
         if skip_mysql() { return; }
@@ -5142,7 +5145,8 @@ mod tests {
                 .expect("应有 apply 任务");
             let state_sql = "SELECT task_state FROM wf_process_task WHERE id = ?";
 
-            // ① 带模板：血缘退回（parent 为空）必报错的**中途失败**——update_task 已写 ⇒ 整体回滚
+            // ① 带模板：血缘退回（parent 为空）报错——守卫前置 ⇒ 本就没有要回滚的写；
+            //    回滚兜底仍由模板提供（其它中途失败档），此处读数照旧钉 10
             let engine1 = jeeflow_core::engine::JeeflowEngineImpl::new(txt_ctx(repo.clone(), &pool, true));
             let r = engine1.in_tx(|| {
                 engine1.execute_and_jump_sync(
@@ -5159,7 +5163,8 @@ mod tests {
                 "入口级包裹必须把 update_task 回滚（任务仍 DOING=10）"
             );
 
-            // ② 红样（无模板＝修前形态）：同一路径错误后，任务行留下"已完成"的半完成
+            // ② issues/243 甲案：无模板同路径同样零写入——守卫排在 complete_task 之前，
+            //    报错时没有任何写发生（旧"红样"钉的是守卫后置形态，2026-11-03 起作废）
             let r0 = engine0.in_tx(|| {
                 engine0.execute_and_jump_sync(
                     apply.task_id,
@@ -5171,8 +5176,8 @@ mod tests {
             assert!(r0.is_err());
             assert_eq!(
                 txt_count(&pool2, state_sql, apply.task_id).await,
-                20,
-                "无模板时半完成留存＝修前形态（钉住入口包裹修的是什么）"
+                10,
+                "报错即零写入：守卫已排在办结之前，无模板留存也必须是 DOING=10（issues/243 甲案）"
             );
 
             clean_by_define(&pool, 930014).await;
