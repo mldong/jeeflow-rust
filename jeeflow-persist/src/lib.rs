@@ -341,9 +341,19 @@ impl PersistMode {
 ///   任务节点推进 UPDATE（f_ 按目标节点 properties.field.PERMISSION_* 过滤 +
 ///   tf_ 冗余 + 状态字段=DOING）→ 结束节点定稿 UPDATE（最终状态 FINISHED/REJECT）。
 ///
-/// 字段提取对齐 Java/Go：从**实例变量**取 f_/tf_ 前缀键**去前缀**后按列名匹配
-/// （业务表列 company_name 对应表单字段 f_company_name）；旧实现误用 execution.args
-/// （带前缀键）导致 filter 恒空、静默不落库（L2-06/07 根因）。
+/// 字段提取的**两档读源不同，不是随手写的**（逐字对齐 java `PersistPostInterceptor.extractFields`）：
+/// - `f_` 是业务表单数据 ⇒ 读**实例变量**（全流程可读，去前缀后按列名匹配：
+///   业务表列 company_name 对应表单字段 f_company_name）；
+/// - `tf_` 是**当次提交**的控制类参数 ⇒ 读**本次执行的 `exec.args`**，不得读实例变量。
+///
+/// 为什么第二档必须换源：规范 spec/04「实例变量只收数据类键」连同其连带条款立法后，`complete_task`
+/// 只并 `f_`（`jeeflow-core/src/model.rs::complete_task`），实例变量里从此没有当次的 `tf_*`；
+/// 而 `exec.args` 是「实例变量 ← 本次提交」的合并结果（java 的 `mergedArgs` 同形），
+/// 本次提交的 `tf_*` 只在它里面。旧实现两档同读实例变量 ⇒ `tf_` 那一档**静默断掉**
+/// （业务表的审批意见列恒空、无测试钉住时一声不吭），正是 java 那边 `2cbc0d6` 修的同一条腿。
+///
+/// 历史注脚：更早的实现两档同读 `execution.args`，`f_` 那一档因当时 args 的键带前缀而 filter 恒空、
+/// 静默不落库（L2-06/07 根因），修复时把两档一起挪到了实例变量——挪对了 `f_`、挪断了 `tf_`。
 pub struct PersistPostInterceptor {
     meta_provider: std::sync::Arc<dyn IDynamicMetaProvider>,
     table_writer: std::sync::Arc<dyn DynamicTableWriter>,
@@ -397,7 +407,8 @@ impl PersistPostInterceptor {
             return Ok(());
         }
 
-        let mut data = self.extract_fields(&exec.process_instance.variables, None, false, true); // 只 f_ 全量
+        let mut data = self.extract_fields(
+            &exec.process_instance.variables, &exec.args, None, false, true); // 只 f_ 全量
         self.fill_context(&mut data, exec);
         let meta = self.meta(table)?;
         let filtered = self.filter_editable(&meta, &data);
@@ -432,8 +443,11 @@ impl PersistPostInterceptor {
         } else {
             None
         };
+        // 两档同尺（＝ java `extractFields` 的两处都传 `!exists || taskNode`）：非任务节点（结束定稿）
+        // 既不带出 f_、也不带出 tf_——否则结束节点会拿本次提交的 tf_ 再盖一遍任务节点刚写过的列。
         let include_fields = !exists || is_task;
-        let mut data = self.extract_fields(&instance.variables, field_perm.as_ref(), true, include_fields);
+        let mut data = self.extract_fields(
+            &instance.variables, &exec.args, field_perm.as_ref(), include_fields, include_fields);
 
         // 状态字段：优先 {节点ID}_{状态码} 列，无则 {节点ID} 列（列探测过滤）。
         // 任务节点写 DOING(10)——execPost 在流转链之后触发，不能用实例状态；
@@ -520,24 +534,34 @@ impl PersistPostInterceptor {
         filtered
     }
 
-    /// 提取字段（对齐 Java/Go extractFields）：f_ 去前缀（SYNC 任务节点按字段权限过滤），
-    /// tf_ 去前缀冗余（有列则写，列过滤由 filter_editable 做）。
+    /// 提取字段（对齐 Java/Go extractFields）：`f_` 从**实例变量**去前缀（SYNC 任务节点按字段权限过滤），
+    /// `tf_` 从**本次执行参数**去前缀冗余（有列则写，列过滤由 filter_editable 做）。
+    ///
+    /// 两档读源分开传，见类型头文档「两档读源不同，不是随手写的」。
     fn extract_fields(
         &self,
         variables: &FlowData,
+        task_fields: &FlowData,
         field_perm: Option<&HashMap<String, JsonValue>>,
         include_task_fields: bool,
         include_form_fields: bool,
     ) -> HashMap<String, JsonValue> {
         let mut data = HashMap::new();
-        for (key, value) in variables.iter() {
-            if let Some(name) = key.strip_prefix("f_") {
-                if !name.is_empty() && include_form_fields && self.is_editable(field_perm, name) {
-                    data.insert(name.to_string(), value.clone());
+        if include_form_fields {
+            for (key, value) in variables.iter() {
+                if let Some(name) = key.strip_prefix("f_") {
+                    if !name.is_empty() && self.is_editable(field_perm, name) {
+                        data.insert(name.to_string(), value.clone());
+                    }
                 }
-            } else if let Some(name) = key.strip_prefix("tf_") {
-                if !name.is_empty() && include_task_fields {
-                    data.insert(name.to_string(), value.clone());
+            }
+        }
+        if include_task_fields {
+            for (key, value) in task_fields.iter() {
+                if let Some(name) = key.strip_prefix("tf_") {
+                    if !name.is_empty() {
+                        data.insert(name.to_string(), value.clone());
+                    }
                 }
             }
         }
@@ -943,6 +967,8 @@ mod tests {
                 display_name: node_id.to_string(),
                 properties: HashMap::new(),
                 reapply_mode: jeeflow_core::reapply::ReapplyMode::Normal,
+                allow_add_sign: false,
+                add_sign_max_rounds: 0,
             }],
             edges: vec![],
         ..Default::default()
@@ -1058,9 +1084,13 @@ mod tests {
         let mut vars = start_vars();
         vars.insert_str("f_company_name", "HACK");   // 只读 → 不更新
         vars.insert_str("f_contact_name", "NewBob"); // 可编辑 → 更新
-        vars.insert_str("tf_comment", "同意");        // tf_ 去前缀
         let mut task_exec = make_exec("approve", NodeType::Task, Some("SYNC"),
             Some("merchant_settlement"), vars, 10, Some(1));
+        // tf_ 的读源＝**本次提交的执行参数**（`exec.args`），不是实例变量：引擎的 `complete_task`
+        // 只并 `f_`（spec/04「实例变量只收数据类键」），真链路里 `tf_comment` 只在 args 上出现。
+        // 本例原先把它插在实例变量里，是把断掉的读源当成了契约——断言（comment 列＝"同意"）没动，
+        // 动的只是入参落点，改回引擎真正会给的那份形状。
+        task_exec.args.insert_str("tf_comment", "同意");   // tf_ 去前缀冗余
         task_exec.operator = "user2".into(); // 不同操作人，验证 create 组不被 update 重写
         set_node_field_perm(&mut task_exec,
             vec![("PERMISSION_f_company_name", 1), ("PERMISSION_f_contact_name", 2)]);

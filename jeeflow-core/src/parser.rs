@@ -5,6 +5,7 @@
 
 use crate::json::{JsonValue, parse_json};
 use crate::error::{JeeflowError, JeeflowResult};
+use crate::add_sign;
 use crate::reapply::{self, ReapplyMode};
 use std::collections::HashMap;
 
@@ -214,6 +215,12 @@ pub struct NodeModel {
     /// 退回发起人后的重提方式（节点属性 `reapplyMode`，对齐 java `TaskModel.reapplyMode`）。
     /// 缺省/空串 ⇒ [`ReapplyMode::Normal`]；非法值在**解析期**报配置错误（不静默当缺省）。
     pub reapply_mode: ReapplyMode,
+    /// 后加签（可重复）开关（节点属性 `allowAddSign`，对齐 java `TaskModel.allowAddSign`）。
+    /// 缺省 false＝该节点不可后加签，行为与既有普通任务逐字一致；
+    /// 非法值在**解析期**报配置错误（校验纪律照 `reapply_mode` 的先例，不静默当缺省）。
+    pub allow_add_sign: bool,
+    /// 后加签轮次上限（节点属性 `addSignMaxRounds`）：整数 ≥0，0＝不限轮次（缺省）。
+    pub add_sign_max_rounds: i64,
 }
 
 impl NodeModel {
@@ -444,12 +451,27 @@ impl ModelParser {
                     ReapplyMode::Normal
                 };
 
+                // 「后加签（可重复）」：两枚节点属性同样在**解析期**校验
+                // （对齐 java `TaskParser` → `AddSignSupport.parseAllow/parseMaxRounds`：
+                // 缺省 false / 0，非法值必须报配置错误，不得静默当缺省）。非任务节点不读这两项。
+                let (allow_add_sign, add_sign_max_rounds) = if node_type == NodeType::Task {
+                    (
+                        add_sign::parse_allow(properties.get(add_sign::PROP_ALLOW_ADD_SIGN), &id)?,
+                        add_sign::parse_max_rounds(
+                            properties.get(add_sign::PROP_ADD_SIGN_MAX_ROUNDS), &id)?,
+                    )
+                } else {
+                    (false, 0)
+                };
+
                 nodes.push(NodeModel {
                     id,
                     node_type,
                     display_name,
                     properties,
                     reapply_mode,
+                    allow_add_sign,
+                    add_sign_max_rounds,
                 });
             }
         }
@@ -482,7 +504,7 @@ impl ModelParser {
             }
         }
 
-        Ok(ProcessModel {
+        let model = ProcessModel {
             name,
             display_name,
             model_type,
@@ -496,7 +518,15 @@ impl ModelParser {
                 .map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
             nodes,
             edges,
-        })
+        };
+
+        // 后加签两条解析期硬校验（spec/02 §4.3）——配了就直接报错，不做运行时降级：
+        // 静默跑下去会让配置者以为开关生效，实际两档推进闸各裁各的。
+        // 排在节点与边都接好之后，因为"是不是首任务节点"要沿 start 的出边看
+        // （逐字对齐 java `ModelParser` 收尾那一段的位置）。
+        add_sign::validate_model(&model)?;
+
+        Ok(model)
     }
 }
 
@@ -524,6 +554,8 @@ mod tests {
             id: "n1".into(), node_type: NodeType::Task,
             display_name: "N1".into(), properties: props,
             reapply_mode: ReapplyMode::Normal,
+            allow_add_sign: false,
+            add_sign_max_rounds: 0,
         };
         let perms = node.field_permissions();
         assert_eq!(perms.len(), 3, "只收 field 子对象的 PERMISSION_* 键");

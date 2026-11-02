@@ -3,6 +3,7 @@
 //! spec/04-engine-ops.md
 
 use crate::context::ServiceContext;
+use crate::add_sign;
 use crate::error::{JeeflowError, JeeflowResult};
 use crate::event::{ProcessPublisher, ProcessEvent, ProcessEventType};
 use crate::json::{JsonValue, FlowData};
@@ -34,6 +35,15 @@ pub struct Execution {
     pub instance_finished: bool,
     /// Gate variables for countersign expression evaluation (nrOfInstances, etc.)
     pub gate_vars: FlowData,
+    /// **本次请求**点名的后加签办理人（已归一，没点人为空表）。
+    ///
+    /// 为什么不从 [`Execution::args`] 读：`args` 是"实例变量 ← 本次提交"的合并结果，
+    /// 一旦上一轮的 `tf_addSignOperators` 落到实例变量就会**跨请求复活**，凭空多建一条
+    /// 本节点待办。根因那一刀在 `model.rs::complete_task`（实例变量只收 `f_` 数据类键），
+    /// 这一枚字段是**第二道**：加签腿只认当次请求，不靠剥键兜底。
+    /// 判据出处＝spec/04「流程变量约定」末注；`tf_nextNodeOperator` 同病，直返腿的显式剥键
+    /// （`execute_reapply` 那句 `exec.args.remove`）保留不动。
+    pub add_sign_operators: Vec<String>,
 }
 
 /// 跳转落点的三种语义（issues/121 P2：3「退回上一步」与 6「退回发起人」必须分开）
@@ -63,6 +73,7 @@ impl Execution {
             new_tasks: Vec::new(),
             instance_finished: false,
             gate_vars: FlowData::new(),
+            add_sign_operators: Vec::new(),
         }
     }
 }
@@ -1299,6 +1310,14 @@ impl JeeflowEngineImpl {
                 format!("Operator {} not allowed on task {}", operator, task_id)));
         }
 
+        // 5.2. 后加签写入口校验（spec/04 · 后加签 ＋ spec/06 §2.7）：互斥／开关未开／加给自己／
+        // 超上限四道判据**必须排在任何状态变更之前**——本栈宿主没注册事务模板时是裸跑（见 `in_tx`
+        // 的 None 分支），晚一步就留下"任务已 DONE 却报错"的半截事实（对齐 java
+        // `JeeflowEngineImpl.prepareExecution` 里 `AddSignSupport.validateSubmission` 的那一刀）。
+        // 收**已过入口字段权限过滤的本次提交**（`task_args`），不读合并了实例变量的 `full_args`：
+        // 加签人只认当次请求，这是 `tf_*` 跨请求复活那一族的第二道防线。
+        add_sign::validate_submission(&model, &task, &task_args, operator)?;
+
         // 5.5. Inject countersignDisagreeFlag if submitType==20 (issues/94)
         let submit_type = full_args.get_i64("submitType")
             .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
@@ -1344,6 +1363,11 @@ impl JeeflowEngineImpl {
         // 9. Build execution
         let mut exec = Execution::new(instance, model, define, operator, full_args);
         exec.process_task = Some(task.clone());
+        // 9.2. 加签人取**本次请求**的值显式带上（`task_args`＝已过入口字段权限过滤的提交参数），
+        // 不让加签腿去读合并了实例变量的 `exec.args`——那里一旦混进上一轮的 `tf_addSignOperators`
+        // 就会凭空多建一条本节点待办（根因在 `model.rs::complete_task` 只收数据类键；
+        // 这一枚字段是第二道，判据与病因见 `Execution::add_sign_operators` 的注释）。
+        exec.add_sign_operators = add_sign::operators(&task_args);
 
         // 9.5. 任务完成节点自身的后置拦截器（对齐 Go ExecuteProcessTask 1.8.0 SYNC 同步演进）：
         // 此时 exec.args 携带本次提交的 f_/tf_ 字段（已并入 instance.variables），
@@ -1474,15 +1498,37 @@ impl JeeflowEngineImpl {
             }
         }
 
+        // 10.5 后加签档（spec/04 · 后加签）＝三档推进闸的第二档：
+        // 会签档在上面（不动）；本档只在节点开了 `allowAddSign` 且不是会签时接管裁决；
+        // 其余档无条件流出（不开开关的节点行为逐字不变）。
+        //
+        // merged 判据三档**顺序不可反**（spec/04 原话）：
+        //   ① 本次给了加签人 ⇒ 同节点建单，不放行；
+        //   ② 没给但本节点还有未完成待办（多选时同圈的兄弟待办）⇒ 不放行；
+        //   ③ 两者皆否 ⇒ 放行，由下面的 10b 走既有出边。
+        // 停止条件即此判据本身，**不另设第二判据源**：被加签人觉得够了、直接同意不点人，
+        // 令牌即流出本节点。多选时只有最后一个办结且没再点人才 merged=true。
+        let mut run_out_edges = true;
+        if !is_countersign {
+            if let Some(n) = node.as_ref() {
+                if n.allow_add_sign {
+                    run_out_edges = self.add_sign_leg(&mut exec, n)?;
+                }
+            }
+        }
+
         // 10b. Continue execution from current node: non-countersign tasks always,
         // and countersign tasks once the gate is merged (issues/94 fall-through).
-        if let Some(node) = node {
-            let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
-                .iter()
-                .filter_map(|e| target_node_or_warn(&exec.process_model, &node.id, e))
-                .collect();
-            for next in next_nodes {
-                self.execute_node(&mut exec, &next)?;
+        // 后加签档不放行时同样跳过这一支（令牌停留本节点）。
+        if run_out_edges {
+            if let Some(node) = node {
+                let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
+                    .iter()
+                    .filter_map(|e| target_node_or_warn(&exec.process_model, &node.id, e))
+                    .collect();
+                for next in next_nodes {
+                    self.execute_node(&mut exec, &next)?;
+                }
             }
         }
 
@@ -1508,6 +1554,98 @@ impl JeeflowEngineImpl {
         self.repo().update_instance(&exec.process_instance)?;
 
         Ok(exec.new_tasks)
+    }
+
+    // ═══ 后加签（可重复）· 推进闸与同节点续建（基准 java `handler/impl/AddSignHandler`）═══
+
+    /// 后加签档的裁决＋建单：返回 `true` ＝ merged（放行出边，由 10b 走既有出边），
+    /// `false` ＝令牌停留本节点（要么刚建了同节点的加签待办，要么本节点还有兄弟待办没办完）。
+    ///
+    /// 三档判据的**顺序不可反**（spec/04 · 后加签）：先看"本次给了人"，再看"本节点还有未完成
+    /// 待办"，两者皆否才放行；停止条件即此判据本身，不另设第二判据源。
+    ///
+    /// 建单形状照串行会签的续建腿（本栈 `create_task_with_assignment` 的会签那一支 ＋
+    /// 串行推进那一支），逐条对齐 java：
+    /// - `parent_task_id`＝刚办结那条 ⇒ 加签链血缘串成链；
+    /// - `performType=Normal`（加签任务是普通任务，不是会签）、`taskType`/`form` 继承节点配置；
+    /// - 参与者＝本次 `tf_addSignOperators` 的归一结果，**一人一行**（多选＝同圈多行）；
+    /// - 轮次记在**任务变量** `addSignRound_{节点名}`（新键，不复用会签簿记 `loopCounter`）；
+    /// - 到期时间按本节点 `expireTime` 表达式走 [`stamp_expire`] 那把共用尺子（三档语义与
+    ///   误配落穿→NULL 纪律沿用 spec/04「任务行 `expire_time` 由谁写」，不另造尺子）；
+    /// - 分支归属 `_branchCtx` 与每一次普通建单同一条腿（并行范围内的加签任务必须继承父任务归属，
+    ///   否则汇合判据读不到这一支）；
+    /// - 账本 `tf_addSignHistory` append 在**刚办结那一条**的行变量上（只追加不覆盖）；
+    /// - 建单落库、委托并入、`TASK_START` 事件一律由 [`Self::persist_tasks`] 既有腿收口，
+    ///   不新造时序（调用方紧接着跑 11/12 两步，抄送与实例落库都不绕）。
+    ///
+    /// ⚠️ 报错类判据（互斥／开关未开／加给自己／超上限）不在这里——那四道排在
+    /// `execute_task_locked` 的 5.2、**任何状态变更之前**；进到这里的提交都已判定合法。
+    fn add_sign_leg(&self, exec: &mut Execution, node: &NodeModel) -> JeeflowResult<bool> {
+        let node_id = node.id.clone();
+        // 只认**本次请求**点名的办理人（`Execution::add_sign_operators`），不读 exec.args——
+        // 那里混着实例变量，上一轮的 tf_ 键一旦复活就会凭空多建一条本节点待办。
+        let operators = exec.add_sign_operators.clone();
+        if operators.is_empty() {
+            // 第二/第三档：本节点还有未完成待办 ⇒ 不放行；两者皆否 ⇒ 放行出边。
+            // merged 同步落到 exec 上（照 java `AddSignHandler` 那句 setMerged），
+            // 下游汇合判据读的就是这一枚。
+            let merged = !add_sign::has_doing_on_node(&exec.process_instance, &node_id);
+            exec.is_merged = merged;
+            return Ok(merged);
+        }
+
+        let completed_id = exec.process_task.as_ref().map(|t| t.task_id).unwrap_or(0);
+        let round = exec.process_task.as_ref()
+            .map(|t| add_sign::round_of(t, &node_id) + 1)
+            .unwrap_or(1);
+        let task_type = TaskType::from_code(node.task_type());
+        let expr = crate::expire_time::expire_expr_of(node);
+        let agg_start = exec.process_instance.tasks.len();
+
+        let mut created: Vec<ProcessTask> = Vec::with_capacity(operators.len());
+        for actor in &operators {
+            let mut next = exec.process_instance.create_task(
+                &node_id, &node.display_name, std::slice::from_ref(actor), &exec.operator,
+                task_type, PerformType::Normal, node.form_key(), Some(completed_id));
+            // 新任务两份拷贝都要写轮次键（聚合根 push 的是克隆——issues/131 同款教训）
+            next.variables.insert_i64(add_sign::round_key(&node_id), round);
+            if let Some(t) = exec.process_instance.tasks.last_mut() {
+                t.variables.insert_i64(add_sign::round_key(&node_id), round);
+            }
+            created.push(next);
+        }
+        // 到期时间与其余四处建单同一把尺子
+        stamp_expire(&mut created, &mut exec.process_instance.tasks,
+                     expr.as_deref(), &exec.process_instance.variables);
+
+        // 分支归属：静态范围逐档继承父任务同档的 round/root（建单时 id 尚未生成 ⇒ 传 0，
+        // 由 persist_tasks 里的 fill_root_self 回填），与 create_task_with_assignment 同一姿势。
+        let scopes = crate::reapply::build_scopes(
+            exec.process_task.as_ref(), &exec.process_model, &node_id, 0);
+        if !scopes.is_empty() {
+            for t in created.iter_mut() {
+                crate::reapply::put_scopes(t, &scopes);
+            }
+            for t in exec.process_instance.tasks.iter_mut().skip(agg_start) {
+                crate::reapply::put_scopes(t, &scopes);
+            }
+        }
+        exec.new_tasks.extend(created);
+
+        // 账本落在刚办结那一条（`tf_` 前缀 ⇒ 血缘回退腿天然剔掉它，只留在已完成的历史行上）。
+        // 该行在第 7 步已 update_task 过一次，这里补一次把账本一起落盘。
+        let mut ledger: Option<ProcessTask> = None;
+        if let Some(t) = exec.process_instance.tasks.iter_mut().find(|t| t.task_id == completed_id) {
+            add_sign::append_history(t, &exec.operator, &operators, round);
+            ledger = Some(t.clone());
+        }
+        if let Some(t) = ledger {
+            self.repo().update_task(&t)?;
+        }
+
+        // merged=false：令牌停留本节点，10b 不放行出边
+        exec.is_merged = false;
+        Ok(false)
     }
 
     // ═══ 退回修改、重提直返（对齐 java `JeeflowEngineImpl.executeReapply` /
@@ -1572,6 +1710,13 @@ impl JeeflowEngineImpl {
         }
         let task_args =
             crate::interceptor::filter_args_by_node_permission(args, &model, &apply_task.task_name);
+        // 后加签写入口校验（同 `execute_task_locked` 的 5.2）：**重提直返那一拍也是"办理"的一个入口**，
+        // 不能留第五道口子——java 那边它与其余入口共用 `prepareExecution`
+        // （`JeeflowEngineImpl.java:391` 就调 `prepareExecution`，`:449` 的 `validateSubmission` 一并覆盖）。
+        // 申请节点结构性开不了 `allowAddSign`（spec/02 §4.3 首任务节点禁令），所以这里可达的是
+        // 互斥与"未开启开关"两档，都得逐字报错而不是静默丢掉这次点人。
+        // 排在 ⑤ `complete_task` 之前＝报错时零写入（本栈无事务回滚，见 `add_sign.rs` 模块头）。
+        add_sign::validate_submission(&model, apply_task, &task_args, operator)?;
         let mut full_args = instance.variables.clone();
         full_args.merge(&task_args);
         self.add_user_info(&mut full_args, operator);
@@ -1807,6 +1952,11 @@ impl JeeflowEngineImpl {
                 format!("Operator {} not allowed on task {}", operator, task_id)));
         }
 
+        // 后加签写入口校验（同 `execute_task_locked` 的 5.2）：办理／跳转／退结束／退发起人四条
+        // 入口都不能绕过四道判据——java 那边四条入口共用 `prepareExecution`，本栈三份编排必须
+        // 同一口径。排在任何状态变更之前，报错时零写入。
+        add_sign::validate_submission(&model, &task, &task_args, operator)?;
+
         // Inject countersignDisagreeFlag if submitType==20 (issues/94 round 2)
         let submit_type = full_args.get_i64("submitType")
             .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
@@ -1861,6 +2011,22 @@ impl JeeflowEngineImpl {
             // submitType=6 退回发起人：直返来源节点 ⇒ 建申请待办；否则跳 start 直接后继
             // 那条节点（形状与原实现一致，已与 3 彻底分开）
             JumpTarget::FirstTaskNode => {
+                // 退回发起人：本节点未完成的加签任务一并废弃，不留孤儿待办（spec/04 · 后加签，
+                // 对齐 java `executeAndJumpToFirstTaskNode` 里 `AddSignSupport.abandonDoingOnNode`
+                // 那一刀的位置——排在建申请待办之前）。只动开了 `allowAddSign` 的节点：会签兄弟
+                // 行由既有会签腿管，不在此扩面；拒绝那一档由 `execute_and_jump_to_end_sync`
+                // 既有的 `abandon_all_doing` 覆盖（本节点这一族是它的子集）。
+                let abandoned = add_sign::abandon_doing_on_node(
+                    &exec.process_model, &mut exec.process_instance, &task.task_name, operator);
+                if !abandoned.is_empty() {
+                    let rows: Vec<ProcessTask> = exec.process_instance.tasks.iter()
+                        .filter(|t| abandoned.contains(&t.task_id))
+                        .cloned()
+                        .collect();
+                    for t in &rows {
+                        self.repo().update_task(t)?;
+                    }
+                }
                 if let Some(source_node) = direct_source.as_ref() {
                     self.create_return_to_source_application(&mut exec, source_node, &task)?;
                 } else if let Some(node) = exec.process_model.get_first_task_node().cloned() {
@@ -1922,6 +2088,11 @@ impl JeeflowEngineImpl {
                 format!("Operator {} not allowed on task {}", operator, task_id)));
         }
 
+        // 后加签写入口校验（同 `execute_task_locked` 的 5.2）：办理／跳转／退结束／退发起人四条
+        // 入口都不能绕过四道判据——java 那边四条入口共用 `prepareExecution`，本栈三份编排必须
+        // 同一口径。排在任何状态变更之前，报错时零写入。
+        add_sign::validate_submission(&model, &task, &task_args, operator)?;
+
         // Inject countersignDisagreeFlag if submitType==20 (issues/94 round 2)
         let submit_type = full_args.get_i64("submitType")
             .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
@@ -1939,6 +2110,22 @@ impl JeeflowEngineImpl {
         }
         if let Some(t) = instance.tasks.iter().find(|t| t.task_id == task_id) {
             self.repo().update_task(t)?;
+        }
+
+        // 拒绝结束：本节点未完成的**加签**任务一并废弃，不留孤儿待办（spec/04 · 后加签）。
+        // 位置与窄口径都对齐 java `executeAndJumpToEnd` 里 `AddSignSupport.abandonDoingOnNode`
+        // 那一刀（完成任务并落库之后、推向 End 之前；只动开了 `allowAddSign` 的本节点，
+        // 会签兄弟行由既有会签腿管）。
+        // ⚠️ 这一条腿必须自己 `update_task` 落盘：下面既有那支"Abandon all doing tasks"的判据
+        // 取在 `abandon_all_doing()` **之后**（那时已经没有 Doing 行了）⇒ 一次 UPDATE 都不发，
+        // 废弃只落在聚合副本、仓储行仍留 DOING。那是与本特性无关的既有缺陷（fork／并行会签
+        // 的兄弟待办同样留在库里办不动），已按另案上报、不在这里悄悄扩面。
+        let add_sign_abandoned: Vec<i64> = add_sign::abandon_doing_on_node(
+            &model, &mut instance, &task.task_name, operator);
+        for tid in &add_sign_abandoned {
+            if let Some(t) = instance.tasks.iter().find(|t| t.task_id == *tid) {
+                self.repo().update_task(t)?;
+            }
         }
 
         // 拒绝（submitType 2）＝任务被退回/拒绝 → 6 TASK_REJECT，任务行落库之后 fire
@@ -2098,7 +2285,11 @@ fn seed_countersign_bookkeeping(t: &mut ProcessTask, node: &str, roster: &[Strin
 /// 两个字段就能过借用检查——否则会撞成"同时可变借 `exec.process_instance`"。
 ///
 /// `expr` 为空（节点没配）⇒ 一份都不动：这一列保持 NULL，不写 `now()`、不写 `''`、不写 0。
-fn stamp_expire(new: &mut [ProcessTask], aggregate: &mut Vec<ProcessTask>,
+///
+/// 后加签腿共用这一把尺子（`add_sign.rs`）——本栈的到期写点在引擎侧（不像 java 落在
+/// `ProcessInstance.createTask` 内部），加签续建必须显式走这里，否则会出现
+/// "首成员有到期、加签那一轮没有"的错位（issues/126 案 A 同一族病）。
+pub(crate) fn stamp_expire(new: &mut [ProcessTask], aggregate: &mut Vec<ProcessTask>,
                 expr: Option<&str>, args: &FlowData) {
     for t in new.iter_mut() {
         crate::expire_time::apply_expire_time(t, expr, args);
@@ -2162,9 +2353,10 @@ fn custom_unregistered_clazz_warning(node_id: &str, clazz: &str) -> String {
 ///
 /// issues/142 B 批把它从"抄送专用"升格为通用单点：抄送三条入口与消费腿
 /// `f_nextNodeOperator`／`tf_nextNodeOperator` **共用这一支**，不再各写一份拆形判据。
+/// 后加签的 `tf_addSignOperators` 同样复用这一枚（spec 06 §2.7「两形同判据」）。
 /// 数组元素一律收成字符串（`null` 丢弃），**不得静默丢弃数字元素**（旧形状只收 `as_str()`
 /// ⇒ 指定纯数字用户 id 时整档落回 assignee 字面量），也不得串化成类型名。
-fn parse_actor_ids(v: Option<&JsonValue>) -> Vec<String> {
+pub(crate) fn parse_actor_ids(v: Option<&JsonValue>) -> Vec<String> {
     let Some(v) = v else { return Vec::new(); };
     let raw: Vec<String> = match v {
         // 数组：逐项取原始标量（对齐 Go fmt.Sprintf("%v", a)，兼容字符串/数字 id）。
@@ -6639,7 +6831,8 @@ mod node_level_interceptor_r91_tests {
             properties.insert((*k).to_string(), crate::json::JsonValue::Str((*v).to_string()));
         }
         NodeModel { id: id.to_string(), node_type: kind, display_name: id.to_string(), properties,
-            reapply_mode: crate::reapply::ReapplyMode::Normal }
+            reapply_mode: crate::reapply::ReapplyMode::Normal,
+            allow_add_sign: false, add_sign_max_rounds: 0 }
     }
 
     /// 造一台只装了注册表的引擎＋一份停在 apply 节点上的 Execution。

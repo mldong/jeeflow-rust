@@ -68,6 +68,8 @@ fn exec(
             display_name: node_id.to_string(),
             properties: HashMap::new(),
             reapply_mode: jeeflow_core::reapply::ReapplyMode::Normal,
+            allow_add_sign: false,
+            add_sign_max_rounds: 0,
         }],
         edges: vec![],
         ..Default::default()

@@ -294,6 +294,8 @@ mod tests {
             display_name: "Node 1".into(),
             properties: std::collections::HashMap::new(),
             reapply_mode: crate::reapply::ReapplyMode::Normal,
+            allow_add_sign: false,
+            add_sign_max_rounds: 0,
         };
         let mut args = FlowData::new();
         args.insert_str("node1", "user2,user3");
@@ -366,6 +368,8 @@ mod tests {
             id: "dec1".into(), node_type: NodeType::Decision,
             display_name: "D1".into(), properties: HashMap::new(),
             reapply_mode: crate::reapply::ReapplyMode::Normal,
+            allow_add_sign: false,
+            add_sign_max_rounds: 0,
         });
         let r = filter_args_by_node_permission(&args, &model, "dec1");
         assert_eq!(r.get_str("f_amount"), Some("999"), "非任务节点必须原样放行");
@@ -375,6 +379,8 @@ mod tests {
             id: "t_free".into(), node_type: NodeType::Task,
             display_name: "T-free".into(), properties: HashMap::new(),
             reapply_mode: crate::reapply::ReapplyMode::Normal,
+            allow_add_sign: false,
+            add_sign_max_rounds: 0,
         });
         let r = filter_args_by_node_permission(&args, &model, "t_free");
         assert_eq!(r.get_str("f_amount"), Some("999"), "无声明节点必须原样放行（缺省可编辑）");
@@ -388,6 +394,8 @@ mod tests {
             id: "t_ro".into(), node_type: NodeType::Task,
             display_name: "T-ro".into(), properties: props,
             reapply_mode: crate::reapply::ReapplyMode::Normal,
+            allow_add_sign: false,
+            add_sign_max_rounds: 0,
         });
         let r = filter_args_by_node_permission(&args, &model, "t_ro");
         assert_eq!(r.get_str("f_amount"), None, "只读字段必须被剔除");
