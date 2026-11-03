@@ -616,24 +616,32 @@ impl JeeflowEngineImpl {
         let new_start = exec.new_tasks.len();
 
         let task = if perform_type == PerformType::Countersign {
-            // 会签的建单是**逐成员**一行（java `createCountersignTasks` 同款 for-actor），
-            // 名册为空 ⇒ 天然 0 行，"零参与者建单"那一档在会签上不成立（基准 java 亦然）。
-            // 这里必须早退：下面两支收尾都要 `tasks.last().cloned().unwrap()`，
-            // 空名册时不是 panic（聚合还空着）就是把**别人的**行当本节点的新单返回。
-            if actor_ids.is_empty() {
-                return Ok(());
-            }
+            // 会签的建单是**逐成员**一行（java `createCountersignTasks` 同款 for-actor）。
+            // **名册为空时两支各有明确语义**（issues/244-②，跨栈对齐后的实话）：
+            // - **串行（SEQUENTIAL/SERIAL）**：跨栈已定语义＝「建一行、不挂任何参与者、不报错」
+            //   （go/python/node/moon 同一档；java/c# 抛越界、php 写 `[null]` 各属另案）。
+            //   这一行的价值与普通任务零参与者档同源（见上方 issues/142 那段）：实例停在哪个
+            //   节点**可查**，且还能被 transfer / nextNodeOperator 救活。旧形状静默 0 行＝
+            //   前一个任务已办结、流程原地停住、库里一条痕迹都没有（spec/02 §6.1 的死锁黑洞）。
+            // - **并行（其余）**：名册为空仍 **0 行**，保持原状、**不在本条范围**——那一支收尾要
+            //   `tasks.last().cloned().unwrap()`，空名册时不是 panic（聚合还空着）就是把
+            //   **别人的**行当本节点的新单返回，故仍必须早退。
             let cs_type = node.countersign_type();
             if cs_type.to_uppercase() == "SEQUENTIAL" || cs_type.to_uppercase() == "SERIAL" {
-                // SEQUENTIAL: only create first actor's task (issues/94)
-                if actor_ids.is_empty() {
-                    return Ok(());
-                }
-                // Create only the first actor's task
-                let mut tasks = exec.process_instance.create_countersign_tasks(
-                    &node.id, &node.display_name, &[actor_ids[0].clone()], &exec.operator,
-                    task_type, node.form_key(), None);
+                // SEQUENTIAL: only create first actor's task (issues/94)。
+                // 名册为空也要建那一行：`create_countersign_tasks` 对 actor 做 `map`，空 slice 得 0 行，
+                // 所以这一档直接走聚合根 `create_task` 收空 slice（改动面最小，不破既有签名）。
+                let mut tasks = if actor_ids.is_empty() {
+                    vec![exec.process_instance.create_task(
+                        &node.id, &node.display_name, &[], &exec.operator,
+                        task_type, PerformType::Countersign, node.form_key(), None)]
+                } else {
+                    exec.process_instance.create_countersign_tasks(
+                        &node.id, &node.display_name, &[actor_ids[0].clone()], &exec.operator,
+                        task_type, node.form_key(), None)
+                };
                 // issues/131：簿记三件落在首位成员任务的变量上（java ProcessInstance.java:257-259）。
+                // 零名册档同样写三件（名册＝空数组、loopCounter＝0、nrOfInstances＝roster.len()＝0）。
                 // 聚合根 push 的是克隆 ⇒ 返回值与 tasks.last() 两份都写，才算"落库那份带上了"。
                 if let Some(t) = tasks.first_mut() {
                     seed_countersign_bookkeeping(t, &node.id, &actor_ids, 0);
@@ -653,7 +661,11 @@ impl JeeflowEngineImpl {
                 exec.new_tasks.extend(tasks);
                 exec.process_instance.tasks.last().cloned().unwrap()
             } else {
-                // PARALLEL: create all tasks at once
+                // PARALLEL: create all tasks at once；**名册为空仍 0 行**（保持原状，不在 244-② 范围）：
+                // 收尾 `tasks.last().cloned().unwrap()` 在空名册下会 panic / 拿到别人的行，必须早退。
+                if actor_ids.is_empty() {
+                    return Ok(());
+                }
                 let mut tasks = exec.process_instance.create_countersign_tasks(
                     &node.id, &node.display_name, &actor_ids, &exec.operator,
                     task_type, node.form_key(), None);
@@ -3358,6 +3370,80 @@ mod tests {
         assert_eq!(inst.state, 20, "c06: after userB instance should be finished");
         let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
         assert_eq!(tasks.len(), 0, "c06: no DOING tasks after finish");
+    }
+
+    /// issues/244-②夹具：串行会签节点**解析不到任何办理人**（无 assignee / handler / 候选人）。
+    /// 内联不新增共享 `flows/`（理由同 issues/164 那档：这条判据不需要进八仓镜像）。
+    fn zero_actor_sequential_countersign_flow() -> String {
+        r#"{
+            "name": "i244-zero-actor-sequential",
+            "displayName": "串行会签零候选人(244夹具)",
+            "type": "approval",
+            "nodes": [
+                {"id": "start", "type": "snaker:start", "text": {"value": "开始"}},
+                {"id": "apply", "type": "snaker:task", "text": {"value": "发起申请"},
+                 "properties": {"assignee": "applicant", "taskType": 0, "performType": 0}},
+                {"id": "cs1", "type": "snaker:task", "text": {"value": "串行会签"},
+                 "properties": {"taskType": 0, "performType": 1, "countersignType": "SEQUENTIAL"}},
+                {"id": "end", "type": "snaker:end", "text": {"value": "结束"}}
+            ],
+            "edges": [
+                {"id": "e1", "sourceNodeId": "start", "targetNodeId": "apply"},
+                {"id": "e2", "sourceNodeId": "apply", "targetNodeId": "cs1"},
+                {"id": "e3", "sourceNodeId": "cs1", "targetNodeId": "end"}
+            ]
+        }"#.to_string()
+    }
+
+    /// issues/244-②：串行会签零候选人 ⇒ **建一行、不挂任何参与者、不报错**。
+    ///
+    /// 跨栈已定语义（go/python/node/moon 同一档；java/c# 抛越界、php 写 `[null]` 各属另案）。
+    /// 改前本栈静默 0 行：申请单已办结、流程原地停住，而库里查不到任何"停在哪"的痕迹——
+    /// 与 spec/02 §6.1 点名的死锁黑洞同一族。断言按"恰好 1 行"钉死，改前 0 行必红。
+    #[tokio::test]
+    async fn test_i244_sequential_countersign_zero_actor_creates_one_blank_row() {
+        let (engine, repo) = make_engine();
+        let did = save_define(&repo, "i244-zero-actor-seq", &zero_actor_sequential_countersign_flow());
+
+        // 发起 → 办结申请节点（这一步解析 cs1 的名册为空 ⇒ 走待修的那一支）
+        let inst = engine.start_async(did, "applicant", &FlowData::new()).await.unwrap();
+        let iid = inst.instance_id;
+        let apply = repo.find_doing_tasks(iid, &[]).unwrap()
+            .into_iter().find(|t| t.actor_ids.contains(&"applicant".to_string()))
+            .expect("申请节点应有 applicant 待办");
+        let created = engine.execute_task_async(apply.task_id, "applicant", &FlowData::new()).await
+            .expect("零候选人串行会签不得报错（跨栈语义：建一行、不挂人）");
+        assert_eq!(created.len(), 1, "零候选人串行会签应建且仅建 1 行，实际 {}", created.len());
+
+        // ① 实例/聚合里恰好 1 行该节点任务，行形状按契约
+        let doing = repo.find_doing_tasks(iid, &[]).unwrap();
+        assert_eq!(doing.len(), 1, "该节点 DOING 行应恰好 1 行（改前是 0 行 ⇒ 流程原地停住）");
+        let row = &doing[0];
+        assert_eq!(row.task_name, "cs1");
+        assert_eq!(row.task_state, TaskState::Doing.code(), "这一行必须是 DOING(10)");
+        assert_eq!(row.perform_type, PerformType::Countersign.code(), "perform_type 必须是会签(1)");
+        assert!(row.actor_ids.is_empty(), "这一行不得挂任何参与者，实际 {:?}", row.actor_ids);
+
+        // ② 参与者落库腿写 0 行（不写出 null / 空串参与者行）
+        let actor_rows = repo.find_task_actors(row.task_id).unwrap();
+        assert!(actor_rows.is_empty(), "参与者落库应为 0 行，实际 {:?}", actor_rows);
+
+        // ③ 三枚会签簿记变量＝空数组 / 0 / 0（名册键用本栈与 java 同名的 `operatorList_{node}`）
+        match row.variables.get("operatorList_cs1") {
+            Some(JsonValue::Array(v)) => assert!(v.is_empty(), "operatorList_cs1 必为空数组，实际 {:?}", v),
+            other => panic!("operatorList_cs1 必须是空数组，实际 {:?}", other),
+        }
+        assert_eq!(row.variables.get_i64_or("loopCounter_cs1", -1), 0, "loopCounter_cs1 必须是 0");
+        assert_eq!(row.variables.get_i64_or("nrOfInstances_cs1", -1), 0, "nrOfInstances_cs1 必须是 0");
+
+        // ④ 聚合副本同形（不是只有返回值带上，落库那份也得带上）
+        let agg = repo.find_instance_by_id(iid).unwrap().unwrap();
+        assert_eq!(
+            agg.tasks.iter().filter(|t| t.task_name == "cs1").count(), 1,
+            "聚合/实例下该节点任务必须恰好 1 行"
+        );
+        // ⑤ 令牌停在 cs1：实例仍在运行中（不跳过、不误判流程结束）
+        assert_eq!(agg.state, InstanceState::Doing.code(), "实例必须仍为进行中(10)");
     }
 
     #[tokio::test]
