@@ -2709,6 +2709,8 @@ mod tests {
         let instance = rt.block_on(engine.start_async(define_id, "user1", &FlowData::new())).unwrap();
         let tid = doing_task(&repo, instance.instance_id);
         capture.rows.lock().unwrap().clear();
+        // issues/243 §8-2 口径：报错零写入要钉"任务行总数不变"，先记基线行数。
+        let total_rows_before = repo.find_history_tasks(instance.instance_id).unwrap().len();
 
         let err = engine.execute_and_jump_sync(tid, "user1", &exp_submit(4), Some("nope"))
             .expect_err("跳转目标节点不存在必须报错（修前＝静默 no-op，对外 code 落 0）");
@@ -2717,12 +2719,15 @@ mod tests {
             "文案要与六栈逐字一致，实得：{}", msg);
 
         let row = repo.find_task_by_id(tid).unwrap().expect("任务行应还在");
+        assert_eq!(row.task_id, tid, "原待办必须还是同一条 id（不是被办结后新建的行）");
         assert_eq!(row.task_state, TaskState::Doing.code(),
             "校验必须排在任何状态变更之前：任务行不得被办掉");
         let inst_row = repo.find_instance_by_id(instance.instance_id).unwrap().expect("实例行");
         assert_eq!(inst_row.state, InstanceState::Doing.code(), "实例不得进入终态");
         assert_eq!(repo.find_doing_tasks(instance.instance_id, &[]).unwrap().len(), 1,
             "既不得新建行，也不得让原有行消失");
+        assert_eq!(repo.find_history_tasks(instance.instance_id).unwrap().len(),
+            total_rows_before, "报错这一腿任务行总数必须不变（零写入，issues/243 §8-2 补钉）");
         let mine: Vec<String> = capture.rows.lock().unwrap().iter()
             .filter(|(_, s)| *s == tid)
             .map(|(t, _)| t.spec_name().to_string())
