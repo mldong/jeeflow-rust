@@ -6,6 +6,8 @@
 use crate::json::{JsonValue, parse_json};
 use crate::error::{JeeflowError, JeeflowResult};
 use crate::add_sign;
+use crate::collect;
+use crate::recall;
 use crate::reapply::{self, ReapplyMode};
 use std::collections::HashMap;
 
@@ -221,6 +223,13 @@ pub struct NodeModel {
     pub allow_add_sign: bool,
     /// 后加签轮次上限（节点属性 `addSignMaxRounds`）：整数 ≥0，0＝不限轮次（缺省）。
     pub add_sign_max_rounds: i64,
+    /// 已办撤回开关（节点属性 `allowRecall`，issues/246，对齐 java `TaskModel.allowRecall`）。
+    /// 缺省 false＝该节点不可已办撤回；会签／申请节点配置＝**解析期**报错（`recall::validate_model`）。
+    pub allow_recall: bool,
+    /// 动态会签（征询模式）开关（节点属性 `dynamicCountersign`，issues/247，
+    /// 对齐 java `TaskModel.dynamicCountersign`）。缺省 false；
+    /// 与 `allowAddSign` 双开／会签节点／申请节点＝**解析期**报错（`collect::validate_model`）。
+    pub dynamic_countersign: bool,
 }
 
 impl NodeModel {
@@ -454,15 +463,24 @@ impl ModelParser {
                 // 「后加签（可重复）」：两枚节点属性同样在**解析期**校验
                 // （对齐 java `TaskParser` → `AddSignSupport.parseAllow/parseMaxRounds`：
                 // 缺省 false / 0，非法值必须报配置错误，不得静默当缺省）。非任务节点不读这两项。
-                let (allow_add_sign, add_sign_max_rounds) = if node_type == NodeType::Task {
-                    (
-                        add_sign::parse_allow(properties.get(add_sign::PROP_ALLOW_ADD_SIGN), &id)?,
-                        add_sign::parse_max_rounds(
-                            properties.get(add_sign::PROP_ADD_SIGN_MAX_ROUNDS), &id)?,
-                    )
-                } else {
-                    (false, 0)
-                };
+                // 「已办撤回」（issues/246）与「动态会签·征询模式」（issues/247）两枚开关
+                // 与 `allowAddSign` **同尺解析**（java 三处都走同一个 `parseAllow`，
+                // 错误文案里的键名跟着换），非任务节点同样不读。
+                let (allow_add_sign, add_sign_max_rounds, allow_recall, dynamic_countersign) =
+                    if node_type == NodeType::Task {
+                        (
+                            add_sign::parse_allow(properties.get(add_sign::PROP_ALLOW_ADD_SIGN), &id)?,
+                            add_sign::parse_max_rounds(
+                                properties.get(add_sign::PROP_ADD_SIGN_MAX_ROUNDS), &id)?,
+                            add_sign::parse_allow_keyed(
+                                properties.get(recall::PROP_ALLOW_RECALL), &id, recall::PROP_ALLOW_RECALL)?,
+                            add_sign::parse_allow_keyed(
+                                properties.get(collect::PROP_DYNAMIC_COUNTERSIGN), &id,
+                                collect::PROP_DYNAMIC_COUNTERSIGN)?,
+                        )
+                    } else {
+                        (false, 0, false, false)
+                    };
 
                 nodes.push(NodeModel {
                     id,
@@ -472,6 +490,8 @@ impl ModelParser {
                     reapply_mode,
                     allow_add_sign,
                     add_sign_max_rounds,
+                    allow_recall,
+                    dynamic_countersign,
                 });
             }
         }
@@ -525,6 +545,10 @@ impl ModelParser {
         // 排在节点与边都接好之后，因为"是不是首任务节点"要沿 start 的出边看
         // （逐字对齐 java `ModelParser` 收尾那一段的位置）。
         add_sign::validate_model(&model)?;
+        // 已办撤回两条禁配（spec/02 §4.4，issues/246）——位序照 java `ModelParser` 收尾三段。
+        recall::validate_model(&model)?;
+        // 动态会签三条禁配（spec/02 §4.4，issues/247）：双开／会签节点／申请节点。
+        collect::validate_model(&model)?;
 
         Ok(model)
     }
@@ -555,6 +579,8 @@ mod tests {
             display_name: "N1".into(), properties: props,
             reapply_mode: ReapplyMode::Normal,
             allow_add_sign: false,
+            allow_recall: false,
+            dynamic_countersign: false,
             add_sign_max_rounds: 0,
         };
         let perms = node.field_permissions();

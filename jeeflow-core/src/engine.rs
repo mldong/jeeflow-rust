@@ -1514,6 +1514,12 @@ impl JeeflowEngineImpl {
         // 会签档在上面（不动）；本档只在节点开了 `allowAddSign` 且不是会签时接管裁决；
         // 其余档无条件流出（不开开关的节点行为逐字不变）。
         //
+        // **动态会签（征询模式，issues/247）复用同一根闸**（java `TaskModel.exec` 的
+        // `else if (dynamicCountersign)` 那一支同样 fire `AddSignHandler`）：发起腿在门面
+        // （带 `tf_addSignOperators` 的提交不办结主办行、到不了这里），能走进执行闸的只有
+        // 成员行办结与主办行收齐后的拍板——主办还 DOING ⇒ merged=false 节点不动；
+        // 主办办结且成员清零 ⇒ 放行出边。
+        //
         // merged 判据三档**顺序不可反**（spec/04 原话）：
         //   ① 本次给了加签人 ⇒ 同节点建单，不放行；
         //   ② 没给但本节点还有未完成待办（多选时同圈的兄弟待办）⇒ 不放行；
@@ -1523,7 +1529,7 @@ impl JeeflowEngineImpl {
         let mut run_out_edges = true;
         if !is_countersign {
             if let Some(n) = node.as_ref() {
-                if n.allow_add_sign {
+                if n.allow_add_sign || n.dynamic_countersign {
                     run_out_edges = self.add_sign_leg(&mut exec, n)?;
                 }
             }
@@ -2275,6 +2281,227 @@ impl JeeflowEngineImpl {
         revived.parent_task_id = Some(history.parent_task_id.unwrap_or(0));
         exec.new_tasks.push(revived);
         Ok(())
+    }
+
+    // ═══ issues/246 · 已办撤回（recall）／issues/247 · 动态会签成员行建单 ═══
+
+    /// 已办撤回（异步入口，签名与其余四条办理入口同族）：经 [`Self::in_tx`] 出事务包裹。
+    pub async fn recall_task_async(&self, task_id: i64, operator: &str)
+        -> JeeflowResult<ProcessTask> {
+        self.in_tx(|| self.recall_task_sync(task_id, operator))
+    }
+
+    /// 同步内核（不自行包裹）。
+    ///
+    /// 同实例串行化：与 [`Self::execute_task_sync`] 同一把按实例的互斥锁——
+    /// 「判窗口（下游无 FINISHED）→ 废弃下游 → 建复活行」必须是一个临界区，
+    /// 否则并发办理能在判据与写入之间把下游推成 FINISHED（规范 04 · 已办撤回「并发与事务」
+    /// 照后加签口径）。
+    pub fn recall_task_sync(&self, task_id: i64, operator: &str) -> JeeflowResult<ProcessTask> {
+        let lock = self.instance_lock(task_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.recall_task_locked(task_id, operator)
+    }
+
+    /// 已办撤回的判据与动作三件（移植 java `JeeflowEngineImpl.recallTask` ＋
+    /// `domain.ProcessInstance.recallTask`，判据位序逐字对齐、不可反）：
+    ///
+    /// 1. 目标行存在且已办结 ⇒ 否则 `MSG_NOT_FINISHED`；
+    /// 2. **参与人按名册判断**（`actor_ids`）——⚠️ 不走 [`ProcessTask::is_allowed`]：那条只认
+    ///    DOING 行，而目标行正是 FINISHED，用它会把每一次合法撤回都判成无权
+    ///    （承重判据，spec 06 §processTask/recall 第 4 条；`flow.auto`／`flow.admin` 特权放行，
+    ///    与转办/摘人同口径）；
+    /// 3. 实例存在且 DOING(10)；
+    /// 4. 节点是任务节点且开了 `allowRecall`；
+    /// 5. 窗口（宽口径）：下游行中**存在任何 FINISHED** ⇒ 报错，否则得到待废弃的 DOING 集合。
+    ///
+    /// **判据一律排在任何状态变更之前**：本栈宿主未注册事务模板时 [`Self::in_tx`] 是裸跑，
+    /// 晚一步判错就留下"下游行停在 99 而无人能改回来"的半截事实。
+    ///
+    /// 落库序照 java：废弃行 updateTask → 复活行走 [`Self::persist_tasks`] 既有建单收口
+    /// （拿 taskId ＋ 全量写参与者 ＋ 委托并入 ＋ `isFirstTaskNode` ＋ fire 码 3）
+    /// → 原行盖 `tf_recallHistory`（`recalledTaskId` 指向复活行）updateTask → 实例 updateTime
+    /// → fire 码 10 `TASK_RECALL`（sourceId＝被撤回的旧行）。
+    fn recall_task_locked(&self, task_id: i64, operator: &str) -> JeeflowResult<ProcessTask> {
+        use crate::recall;
+
+        // ── 判据 1：行存在且已办结 ──
+        let mut target = match self.repo().find_task_by_id(task_id)? {
+            Some(t) if t.is_finished() => t,
+            _ => return Err(JeeflowError::Business(recall::MSG_NOT_FINISHED.to_string())),
+        };
+        // ── 判据 2：参与人（按名册）／特权 ──
+        let privileged = operator.eq_ignore_ascii_case("flow.auto")
+            || operator.eq_ignore_ascii_case("flow.admin");
+        if !privileged && !target.actor_ids.iter().any(|a| a == operator) {
+            return Err(JeeflowError::Business(recall::MSG_NO_PERMISSION.to_string()));
+        }
+
+        // ── 判据 3：实例存在且 DOING ──
+        let mut instance = self.repo().find_instance_by_id(target.process_instance_id)?
+            .ok_or_else(|| JeeflowError::Business(recall::MSG_INSTANCE_NOT_FOUND.to_string()))?;
+        if instance.state != InstanceState::Doing.code() {
+            return Err(JeeflowError::Business(recall::MSG_INSTANCE_NOT_DOING.to_string()));
+        }
+        // 行集合＝该实例全部任务行（窗口判据要看到下游，含已废弃/已撤回行）
+        instance.tasks = self.repo().find_history_tasks(instance.instance_id)?;
+
+        // ── 判据 4：节点开关 ──
+        let define = self.repo().find_define_by_id(instance.define_id)?
+            .ok_or_else(|| JeeflowError::Business("流程定义不存在".to_string()))?;
+        let model = ModelParser::parse(&define.content_str())?;
+        let node = match model.get_node(&target.task_name) {
+            Some(n) if recall::node_enabled(Some(n)) => n.clone(),
+            _ => return Err(JeeflowError::Business(
+                recall::msg_switch_off(&target.task_name))),
+        };
+
+        // ── 判据 5：窗口 ──
+        let doing_descendants = recall::validate_window(&instance.tasks, &target)?;
+
+        // ══ 判据全过，以下才允许写 ══
+        // 写 1：下游全部 DOING 行废弃（后加签续建行、征询成员行、并行分支多支天然覆盖）。
+        // 聚合根与仓储行是两份拷贝，两处都要落，否则 `update_instance` 写回的副本仍是 DOING。
+        if !doing_descendants.is_empty() {
+            let abandoning: Vec<i64> = doing_descendants.iter().map(|t| t.task_id).collect();
+            for t in &mut instance.tasks {
+                if abandoning.contains(&t.task_id) {
+                    let _ = t.abandon();
+                }
+            }
+            for t in instance.tasks.iter().filter(|t| abandoning.contains(&t.task_id)) {
+                self.repo().update_task(t)?;
+            }
+        }
+
+        // 写 2：同节点新建一行 DOING——参与者＝原行名册、`task_parent_id`＝**原行的 parent**
+        // （不是原行 id：撤回不是"往下走一步"，血缘位置必须原地顶替；留 None 会被
+        // persist_tasks 的建单不变量补成原行 id，于是原行 parent=复活行、复活行 parent=原行，
+        // 血缘成二元环——同 `rollback_to_parent` 里那条"老行 NULL 必须落 0"的纪律）。
+        let task_type = TaskType::from_code(node.task_type());
+        // performType 照节点配置取（java `createTask(TaskModel,…)` 用的就是 `taskModel.getPerformType()`）；
+        // 会签节点禁配 allowRecall 由解析期拦下，正常配置下这里恒等 Normal。
+        let perform_type = PerformType::from_code(node.perform_type());
+        let resurrected = instance.create_task(
+            &node.id, &target.display_name, &target.actor_ids, operator,
+            task_type, perform_type, node.form_key(),
+            Some(target.parent_task_id.unwrap_or(0)));
+
+        // 到期时间同尺重算（与三条建单腿同一把尺子，见 `stamp_expire`）。
+        let expr = crate::expire_time::expire_expr_of(&node);
+
+        let mut exec = Execution::new(
+            instance, model, define, operator, FlowData::new());
+        exec.process_task = Some(target.clone());
+        // `create_task` 已把同一份内容 push 进聚合根；`stamp_expire` 按"new_tasks 是聚合根
+        // 尾部 n 条"的约定同时盖到两处（与后加签腿同一把尺子）。
+        exec.new_tasks = vec![resurrected];
+        stamp_expire(&mut exec.new_tasks, &mut exec.process_instance.tasks,
+                     expr.as_deref(), &exec.process_instance.variables);
+        // 建单落库唯一收口：save_task ＋参与者＋委托并入＋isFirstTaskNode＋fire 码 3。
+        self.persist_tasks(&mut exec)?;
+        let resurrected = exec.new_tasks.first().cloned()
+            .ok_or_else(|| JeeflowError::Internal("recall: 复活行未建出".to_string()))?;
+        let instance = exec.process_instance;
+
+        // 写 3：原 FINISHED 行**不改写**，只在行变量上追加 `tf_recallHistory`
+        // （recalledTaskId 要等复活行拿到 taskId，故排在 persist_tasks 之后）。
+        recall::append_recall_history(&mut target, operator, resurrected.task_id);
+        self.repo().update_task(&target)?;
+
+        // 写 4：实例 updateTime/updateUser。
+        let mut instance = instance;
+        instance.update_time = Some(current_time_str());
+        instance.update_user = Some(operator.to_string());
+        self.repo().update_instance(&instance)?;
+
+        // 码 10 `TASK_RECALL`：撤回事实落库之后 fire 一次；**只发 10，不补发 5/6**
+        // （撤回不是办结也不是拒绝，理由同码 8 不补发 2，spec 11 §11.2 原则 2）。
+        // 复活行自己的待办另走码 3（上面 persist_tasks 那一腿）。
+        let mut data = FlowData::new();
+        data.insert_i64("instanceId", instance.instance_id);
+        data.insert_i64("taskId", target.task_id);
+        data.insert_str("operator", operator);
+        self.fire_event(ProcessEvent::new(ProcessEventType::TaskRecall, target.task_id)
+            .with_data(data));
+
+        Ok(resurrected)
+    }
+
+    /// 动态会签成员行建单（issues/247，规范 04 · 动态会签「成员行建单规则」）。
+    ///
+    /// **判据不在这里**——开关/参与人/加给自己/重复/上限/互斥六道全部由门面在调用前拦下
+    /// （报错即零写入那一刀），本腿只做"照后加签建单腿 ＋ 两戳一继承"：
+    /// 每人一行、同节点同名、`task_parent_id`＝主办行 id（成员行的身份锚：闸门判据、detail
+    /// 投影、去重全靠它）、轮次戳 `addSignRound_{节点名}`、`tf_addSignReason`（选填）、
+    /// 分支归属 `_branchCtx` 照后加签腿、到期时间同尺、建单落库与码 3 走
+    /// [`Self::persist_tasks`] 既有收口（委托自动生效同样挂这一处）。
+    ///
+    /// ⚠️ 主办行的账本（`tf_addSignHistory`）与轮次戳**不在本腿写**：java/go 都由调用方
+    /// 盖戳后 `updateTask(host)` 落盘，本栈同样由门面持有主办行副本追加、再落一次库——
+    /// 聚合根与仓储行是两份拷贝，少那一刀账本就丢。
+    pub fn create_collect_member_rows(
+        &self,
+        define: &ProcessDefine,
+        model: &ProcessModel,
+        instance: &mut ProcessInstance,
+        node: &NodeModel,
+        host: &ProcessTask,
+        operator: &str,
+        ops: &[String],
+        round: i64,
+        reason: &str,
+    ) -> JeeflowResult<Vec<ProcessTask>> {
+        let node_id = node.id.clone();
+        let task_type = TaskType::from_code(node.task_type());
+        // performType 照节点配置取（同 java `createTask(TaskModel,…)`）；征询节点不可能是会签
+        // （解析期禁配），正常配置下这里恒等 Normal。
+        let perform_type = PerformType::from_code(node.perform_type());
+        let expr = crate::expire_time::expire_expr_of(node);
+        let agg_start = instance.tasks.len();
+
+        let mut created: Vec<ProcessTask> = Vec::with_capacity(ops.len());
+        for actor in ops {
+            let mut member = instance.create_task(
+                &node_id, &node.display_name, std::slice::from_ref(actor), operator,
+                task_type, perform_type, node.form_key(), Some(host.task_id));
+            member.variables.insert_i64(add_sign::round_key(&node_id), round);
+            if !reason.is_empty() {
+                member.variables.insert_str(crate::collect::KEY_ADD_SIGN_REASON, reason);
+            }
+            // 新任务两份拷贝都要写戳（聚合根 push 的是克隆——issues/131 同款教训）。
+            if let Some(t) = instance.tasks.last_mut() {
+                t.variables.insert_i64(add_sign::round_key(&node_id), round);
+                if !reason.is_empty() {
+                    t.variables.insert_str(crate::collect::KEY_ADD_SIGN_REASON, reason);
+                }
+            }
+            created.push(member);
+        }
+        stamp_expire(&mut created, &mut instance.tasks,
+                     expr.as_deref(), &instance.variables);
+
+        // 分支归属：与每一次普通建单同一条腿（并行范围内的成员行必须继承父任务归属，
+        // 否则汇合判据读不到这一支）；root 传 0 由 persist_tasks 里的 fill_root_self 回填。
+        let scopes = crate::reapply::build_scopes(Some(host), model, &node_id, 0);
+        if !scopes.is_empty() {
+            for t in created.iter_mut() {
+                crate::reapply::put_scopes(t, &scopes);
+            }
+            for t in instance.tasks.iter_mut().skip(agg_start) {
+                crate::reapply::put_scopes(t, &scopes);
+            }
+        }
+
+        let mut exec = Execution::new(
+            instance.clone(), model.clone(), define.clone(), operator, FlowData::new());
+        exec.process_task = Some(host.clone());
+        exec.new_tasks = created;
+        // 建单落库唯一收口（save_task ＋参与者＋委托并入＋isFirstTaskNode＋fire 码 3），
+        // 落库后的真实 taskId 随 new_tasks 带回；聚合根副本还给借用者。
+        self.persist_tasks(&mut exec)?;
+        *instance = exec.process_instance.clone();
+        Ok(exec.new_tasks.clone())
     }
 }
 
@@ -6990,7 +7217,8 @@ mod node_level_interceptor_r91_tests {
         }
         NodeModel { id: id.to_string(), node_type: kind, display_name: id.to_string(), properties,
             reapply_mode: crate::reapply::ReapplyMode::Normal,
-            allow_add_sign: false, add_sign_max_rounds: 0 }
+            allow_add_sign: false, allow_recall: false, dynamic_countersign: false,
+            add_sign_max_rounds: 0 }
     }
 
     /// 造一台只装了注册表的引擎＋一份停在 apply 节点上的 Execution。

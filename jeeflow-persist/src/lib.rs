@@ -968,6 +968,8 @@ mod tests {
                 properties: HashMap::new(),
                 reapply_mode: jeeflow_core::reapply::ReapplyMode::Normal,
                 allow_add_sign: false,
+                allow_recall: false,
+                dynamic_countersign: false,
                 add_sign_max_rounds: 0,
             }],
             edges: vec![],

@@ -44,7 +44,18 @@ pub enum ProcessEventType {
     /// 号位与规范名先按 §11.3 占齐，终止 action 落地时接这根腿
     /// ——严禁集成层"主动补发"代替（§11.1）。
     InstanceTerminated = 9,
-    // 10+ **预留**（超时催办 / 超时自动通过 …）：本轮不发，仅占号防分叉（§11.3 末行＋§11.4-1，
+    /// `TASK_RECALL`（code=10）已办任务撤回发生（issues/246，规范 11 §11.3 码 10）。
+    ///
+    /// sourceId＝**被撤回的旧行** taskId，载荷三键 `instanceId / taskId / operator`；
+    /// 撤回动作落库之后 fire **一次**（原 FINISHED 行保留＋`tf_recallHistory` 追加＋同节点新
+    /// DOING 行建单）。**复活行自己的待办另走码 3**（既有建单腿 `persist_tasks`），
+    /// 与 java `14674d7` 补的那一刀同形。
+    ///
+    /// **只发 10，不补发 5/6**——撤回不是办结也不是拒绝（同码 8 不补发 2 的理由，§11.2 原则 2）。
+    /// 动态会签（issues/247）**不新增事件码**：成员行建/结走既有 3/5，撤回未答成员靠
+    /// `tf_addSignHistory` 账本留痕、不发码。
+    TaskRecall = 10,
+    // 11+ **预留**（超时催办 / 超时自动通过 …）：本轮不发，仅占号防分叉（§11.3 末行＋§11.4-1，
     // 八栈都没有时钟扫描器，发了没有触发源）。
 }
 
@@ -60,6 +71,7 @@ impl ProcessEventType {
             7 => Some(ProcessEventType::TaskTransfer),
             8 => Some(ProcessEventType::TaskWithdraw),
             9 => Some(ProcessEventType::InstanceTerminated),
+            10 => Some(ProcessEventType::TaskRecall),
             _ => None,
         }
     }
@@ -77,6 +89,7 @@ impl ProcessEventType {
             ProcessEventType::TaskTransfer => "TASK_TRANSFER",
             ProcessEventType::TaskWithdraw => "TASK_WITHDRAW",
             ProcessEventType::InstanceTerminated => "INSTANCE_TERMINATED",
+            ProcessEventType::TaskRecall => "TASK_RECALL",
         }
     }
 }
@@ -195,11 +208,15 @@ mod publisher_tests {
         assert_eq!(*recorder.0.lock().unwrap(), vec![42], "panic 后后续监听器应仍被调用");
     }
 
-    /// 规范 11 §11.3 码表自证：码值 A 套 1..9、规范名逐字对齐、`from_code` 全覆盖，
-    /// 10+ 是预留号（本轮不发，`from_code` 必须拒）。
+    /// 规范 11 §11.3 码表自证：码值 A 套 1..10、规范名逐字对齐、`from_code` 全覆盖，
+    /// 11+ 是预留号（本轮不发，`from_code` 必须拒）。
+    ///
+    /// 10 `TASK_RECALL` 由 issues/246 立法（spec 11 §11.3 码表那一行 2026-11-03 落），
+    /// 本栈就此**只补这一枚**、其余号位一字未动——旧版把 10 记在"预留"里，是因为当时
+    /// 还没有触发源；现在触发源＝引擎的已办撤回落库收口（`engine.rs::recall_task_sync`）。
     #[test]
     fn test_event_type_code_table_matches_spec() {
-        let table: [(ProcessEventType, i32, &str); 9] = [
+        let table: [(ProcessEventType, i32, &str); 10] = [
             (ProcessEventType::ProcessInstanceStart, 1, "PROCESS_INSTANCE_START"),
             (ProcessEventType::ProcessInstanceEnd, 2, "PROCESS_INSTANCE_END"),
             (ProcessEventType::ProcessTaskStart, 3, "PROCESS_TASK_START"),
@@ -209,15 +226,16 @@ mod publisher_tests {
             (ProcessEventType::TaskTransfer, 7, "TASK_TRANSFER"),
             (ProcessEventType::TaskWithdraw, 8, "TASK_WITHDRAW"),
             (ProcessEventType::InstanceTerminated, 9, "INSTANCE_TERMINATED"),
+            (ProcessEventType::TaskRecall, 10, "TASK_RECALL"),
         ];
         for (variant, code, name) in table {
-            assert_eq!(variant.code(), code, "码值须是 A 套 1..9：{:?}", variant);
+            assert_eq!(variant.code(), code, "码值须是 A 套 1..10：{:?}", variant);
             assert_eq!(variant.spec_name(), name, "规范名逐字对齐 spec §11.3");
             assert_eq!(variant.to_string(), name, "Display 即规范名（集成层判据用名不用码）");
             assert_eq!(ProcessEventType::from_code(code), Some(variant), "from_code 反查须一致");
         }
-        // 10+ 预留 ⇒ 未发号不得被认成有效码（发了就是分叉）
-        for reserved in [0, 10, 11, 99, i32::MIN, i32::MAX] {
+        // 11+ 预留 ⇒ 未发号不得被认成有效码（发了就是分叉）
+        for reserved in [0, 11, 12, 99, i32::MIN, i32::MAX] {
             assert_eq!(ProcessEventType::from_code(reserved), None, "{} 号位本轮不发", reserved);
         }
     }

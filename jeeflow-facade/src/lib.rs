@@ -893,7 +893,7 @@ impl JeeflowFacade {
             "processInstance/stats/trend" => self.stats_trend(args),
             "processInstance/stats/group" => self.stats_group(args),
 
-            // ═══ processTask (10) ═══
+            // ═══ processTask (12) ═══
             "processTask/todoList" => self.process_task_todo_list(args),
             "processTask/doneList" => self.process_task_done_list(args),
             "processTask/execute" => self.process_task_execute(args),
@@ -904,6 +904,8 @@ impl JeeflowFacade {
             "processTask/addCandidate" => self.process_task_add_candidate(args),
             "processTask/transfer" => self.process_task_transfer(args),
             "processTask/removeTaskActor" => self.process_task_remove_actor(args),
+            "processTask/recall" => self.process_task_recall(args),
+            "processTask/revokeDynamicCountersign" => self.process_task_revoke_countersign(args),
             "processTask/latest" => self.process_task_latest(args),
 
             // ═══ processDesign (9) ═══
@@ -1595,6 +1597,17 @@ impl JeeflowFacade {
         let mut flow_data = args_to_flow_data(args);
         flow_data.insert_i64("submitType", submit_type);
 
+        // ── 动态会签（征询模式）分流与闸门（issues/247，spec 04 · 动态会签）──
+        // 位序照 java `JeeflowFacade.execute`：分流在前、闸门在后，两者都排在**任何状态变更
+        // 之前**（本栈宿主未注册事务模板时 `in_tx` 裸跑，晚一步就留下"主办行已办结／成员行
+        // 已建出却报错"的半截事实——报错即零写入，与后加签写入口同一规矩）。
+        if let Some(marker) = self.try_dynamic_countersign(task_id, &operator, &flow_data)? {
+            // 征询节点带 `tf_addSignOperators`：只建成员行、不办结主办行；
+            // 响应带 `data.dynamicCountersign={round,total,submitted}` 供前端提示。
+            return Ok(marker);
+        }
+        self.gate_dynamic_countersign(task_id, &flow_data)?;
+
         // 对齐 Java JeeflowFacade.execute / spec §11.2 分发
         let new_tasks = match submit_type {
             2 => {
@@ -1635,6 +1648,261 @@ impl JeeflowFacade {
         let task_ids: Vec<i64> = new_tasks.iter().map(|t| t.task_id).collect();
 
         Ok(json!({"task_ids": task_ids}))
+    }
+
+    // ═══ issues/246 · 已办撤回 ／ issues/247 · 动态会签（征询模式）═══
+
+    /// 已办撤回（spec 06 §processTask/recall）：**判据与落库全在引擎**
+    /// （[`JeeflowEngineImpl::recall_task_sync`]），门面只做参数归一与信封包装。
+    ///
+    /// ⚠️ `operator` **硬必填**，不走 [`operator_arg`] 的"空串回落 user1"缺省档——那会把
+    /// 撤回人静默记成别人，审计链失真且不报错（与 `withdraw`／`transfer` 同一条契约，
+    /// spec 06 §2.5）。
+    ///
+    /// 位序照 java `taskRecall`：operator 空判在前、主键缺失判在后；主键缺失**响亮报错**，
+    /// 绝不拿 `''`/`0` 当 id 落库。
+    fn process_task_recall(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        let operator = require_non_empty(args, "operator", "operator 必填")?;
+        let task_id = arg_id(args, &["processTaskId"])?
+            .ok_or(JeeflowError::Business("processTaskId 缺失".into()))?;
+        let resurrected = self.engine.recall_task_sync(task_id, &operator)?;
+        Ok(json!({
+            "process_task_id": resurrected.task_id.to_string(),
+            "task_state": resurrected.task_state,
+        }))
+    }
+
+    /// 动态会签四腿共用的上下文装载：主办行 → 实例 → 定义 → 模型 → 节点。
+    ///
+    /// `None`＝"本行不在征询面内"（实例/定义查不到、节点不是任务节点、或没开
+    /// `dynamicCountersign`），调用方据此原样放行。
+    /// ⚠️ 聚合根的任务行一律按 [`ProcessRepository::find_history_tasks`] 现取——
+    /// SQL 仓的 `find_instance_by_id` 不保证带任务行，而承重判据 1（成员行＝parent 且
+    /// 同节点同名）与 2（收齐＝无 DOING 成员行）读的全是这份行集合；引擎各条办理腿同样
+    /// 在这一枚上做水合（`engine.rs` 里 `instance.tasks = …find_history_tasks(…)`）。
+    fn collect_context(
+        &self,
+        host: &ProcessTask,
+    ) -> JeeflowResult<
+        Option<(
+            ProcessInstance,
+            ProcessDefine,
+            jeeflow_core::parser::ProcessModel,
+            jeeflow_core::parser::NodeModel,
+        )>,
+    > {
+        let mut inst = match self.repo.find_instance_by_id(host.process_instance_id)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        inst.tasks = self.repo.find_history_tasks(inst.instance_id)?;
+        let def = match self.repo.find_define_by_id(inst.define_id)? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        let model = jeeflow_core::parser::ModelParser::parse(&def.content_str())?;
+        let node = match model.get_node(&host.task_name) {
+            Some(n) if jeeflow_core::collect::node_enabled(Some(n)) => n.clone(),
+            _ => return Ok(None),
+        };
+        Ok(Some((inst, def, model, node)))
+    }
+
+    /// 动态会签发起分流（spec 04 · 提交分流；移植 java `JeeflowFacade.tryDynamicCountersign`，
+    /// **判据位序逐字照它**）：征询节点带 `tf_addSignOperators` 的提交＝只建成员行、
+    /// **不办结主办行**，返回响应 marker；`None`＝不接管，走普通流转。
+    ///
+    /// 六道判据（互斥／参与人／上限／加给自己／重复／成员行冒充）全部排在任何写入之前——
+    /// 本栈宿主未注册事务模板时 `in_tx` 裸跑，晚一步判错就留下半截事实（报错即零写入）。
+    fn try_dynamic_countersign(
+        &self,
+        task_id: i64,
+        operator: &str,
+        flow_args: &FlowData,
+    ) -> JeeflowResult<Option<Json>> {
+        use jeeflow_core::add_sign;
+        use jeeflow_core::collect as cs;
+
+        let host = match self.repo.find_task_by_id(task_id)? {
+            Some(h) if h.is_doing() => h,
+            _ => return Ok(None),
+        };
+        let ops = add_sign::operators(flow_args);
+        if ops.is_empty() {
+            return Ok(None);
+        }
+        let (mut inst, def, model, node) = match self.collect_context(&host)? {
+            Some(ctx) => ctx,
+            None => return Ok(None),
+        };
+        // 成员行不能冒充主办发起（拉人只限主办行）⇒ 不接管，放行给闸门腿报它的逐字文案
+        if cs::is_member_row(&inst.tasks, &host) {
+            return Ok(None);
+        }
+
+        // ── 以下每一条报错都必须零写入 ──
+        if add_sign::next_node_present(flow_args) {
+            return Err(JeeflowError::Business(add_sign::MSG_MUTEX.to_string()));
+        }
+        if !host.is_allowed(operator) {
+            // java 这一支抛 `WfErrEnum.NOT_ALLOWED_EXECUTE`，逐字串收在 collect.rs 常量里
+            return Err(JeeflowError::Business(cs::MSG_NOT_ALLOWED.to_string()));
+        }
+        let round = cs::last_round(&host) + 1;
+        if node.add_sign_max_rounds > 0 && round > node.add_sign_max_rounds {
+            return Err(JeeflowError::Business(add_sign::msg_max_rounds(
+                &node.id,
+                node.add_sign_max_rounds,
+            )));
+        }
+        let reason = flow_args
+            .get_str(cs::KEY_ADD_SIGN_REASON)
+            .unwrap_or_default()
+            .to_string();
+        let existing = cs::member_rows(&inst.tasks, &host);
+        for op in &ops {
+            if op == operator {
+                return Err(JeeflowError::Business(add_sign::MSG_SELF.to_string()));
+            }
+            for m in existing.iter() {
+                if m.is_doing() && m.actor_ids.iter().any(|a| a == op) {
+                    return Err(JeeflowError::Business(cs::msg_duplicate(op, &node.id)));
+                }
+            }
+        }
+
+        // ── 判据全过，以下才允许写：成员行建单走引擎既有建单收口（save_task＋参与者＋
+        // 委托并入＋isFirstTaskNode＋fire 码 3），本腿不再重复判据 ──
+        self.engine.create_collect_member_rows(
+            &def, &model, &mut inst, &node, &host, operator, &ops, round, &reason,
+        )?;
+
+        // 主办行的轮次戳＋账本：聚合根与仓储行是两份拷贝 ⇒ 必须补一次 update_task 才落得下
+        // （java 那边是 `appendCollectHistory(host,…)` → `variables.put(round 键)` → `updateTask(host)`）。
+        let mut host = host;
+        cs::append_collect_history(&mut host, operator, &ops, round, &reason);
+        host.variables
+            .insert_i64(add_sign::round_key(&node.id), round);
+        self.repo.update_task(&host)?;
+
+        // marker 的计数读**成员行落库后的行集合**（新拉的这轮已在册，99 行不在册）。
+        let (total, submitted) = cs::count_members(&inst.tasks, &host);
+        Ok(Some(json!({"dynamic_countersign": {
+            "round": round,
+            "total": total,
+            "submitted": submitted,
+        }})))
+    }
+
+    /// 动态会签闸门（spec 04 · 提交分流）：征询节点上主办行未收齐成员意见 ⇒ 逐字文案报错，
+    /// **挡全部 submitType（含驳回）**，唯一出口＝[`Self::process_task_revoke_countersign`]；
+    /// 成员行携带拉人参数 ⇒ 报错。非征询节点/非 DOING 行原样放行。
+    ///
+    /// 收齐判据＝**还有无 DOING 成员行**（承重判据 2：宽口径计数跳过撤回清场的 99 行），
+    /// 所以撤回未答成员后闸门自然恢复，不需要额外的复位动作。
+    fn gate_dynamic_countersign(
+        &self,
+        task_id: i64,
+        flow_args: &FlowData,
+    ) -> JeeflowResult<()> {
+        use jeeflow_core::add_sign;
+        use jeeflow_core::collect as cs;
+
+        let task = match self.repo.find_task_by_id(task_id)? {
+            Some(t) if t.is_doing() => t,
+            _ => return Ok(()),
+        };
+        let (inst, _def, _model, _node) = match self.collect_context(&task)? {
+            Some(ctx) => ctx,
+            None => return Ok(()),
+        };
+        if cs::is_member_row(&inst.tasks, &task) {
+            if !add_sign::operators(flow_args).is_empty() {
+                return Err(JeeflowError::Business(cs::MSG_MEMBER_PULL.to_string()));
+            }
+            return Ok(());
+        }
+        let pending = cs::pending_members(&inst.tasks, &task);
+        if !pending.is_empty() {
+            let (total, submitted) = cs::count_members(&inst.tasks, &task);
+            return Err(JeeflowError::Business(cs::msg_pending(
+                &task.task_name,
+                submitted,
+                total,
+            )));
+        }
+        Ok(())
+    }
+
+    /// 撤回动态会签（spec 06 §processTask/revokeDynamicCountersign）：废弃主办行下**全部未答**
+    /// 成员行 ＋ 账本追加撤回条目；**已提交意见行原样保留**（审计凭证不动）；闸门自然恢复；
+    /// 轮次不消耗。独立 action，不进 execute 参数空间（撤回不是办结动作）。
+    ///
+    /// ⚠️ 承重判据 3：**参与人判断不走 [`ProcessTask::is_allowed`]**——那条只认 DOING 行，
+    /// 主办行办结后会把合法撤回判成无权。这里按**名册**（`actor_ids`）判，
+    /// "无待答成员"那一档由随后的判据兜底。位序照 java `taskRevokeCountersign`。
+    fn process_task_revoke_countersign(
+        &self,
+        args: &HashMap<String, Json>,
+    ) -> JeeflowResult<Json> {
+        use jeeflow_core::collect as cs;
+
+        let operator = require_non_empty(args, "operator", "operator 必填")?;
+        let task_id = arg_id(args, &["processTaskId"])?
+            .ok_or(JeeflowError::Business("processTaskId 缺失".into()))?;
+        let reason = arg_str(args, "reason").unwrap_or_default();
+
+        let host = match self.repo.find_task_by_id(task_id)? {
+            Some(h) => h,
+            None => return Err(JeeflowError::Business("任务不存在".into())),
+        };
+        if !is_privileged_operator(&operator)
+            && !host.actor_ids.iter().any(|a| a == &operator)
+        {
+            return Err(JeeflowError::Business(
+                cs::MSG_NO_PERMISSION_REVOKE.to_string(),
+            ));
+        }
+        let (inst, _def, _model, _node) = match self.collect_context(&host)? {
+            Some(ctx) => ctx,
+            None => {
+                return Err(JeeflowError::Business(cs::msg_no_pending(&host.task_name)))
+            }
+        };
+        let pending = cs::pending_members(&inst.tasks, &host);
+        if pending.is_empty() {
+            return Err(JeeflowError::Business(cs::msg_no_pending(&host.task_name)));
+        }
+
+        // ── 判据全过，以下才允许写 ──
+        // 名册为空的成员行（理论档）：响应给 null（逐字照 java），账本给空串——
+        // 成员行由本栈按人建单，恒有一枚 actor_ids，走不到这一支。
+        let mut revoked_names: Vec<String> = Vec::with_capacity(pending.len());
+        let mut revoked_json: Vec<Json> = Vec::with_capacity(pending.len());
+        for m in &pending {
+            let actor = m.actor_ids.first().cloned();
+            revoked_names.push(actor.clone().unwrap_or_default());
+            revoked_json.push(match actor {
+                Some(a) => Json::String(a),
+                None => Json::Null,
+            });
+            let mut row = m.clone();
+            let _ = row.abandon();
+            row.update_user = Some(operator.clone());
+            self.repo.update_task(&row)?;
+        }
+        let mut host = host;
+        let round = cs::last_round(&host);
+        cs::append_revoke_history(
+            &mut host,
+            &operator,
+            &revoked_names,
+            round,
+            &reason,
+        );
+        self.repo.update_task(&host)?;
+
+        Ok(json!({"revoked": pending.len(), "actors": revoked_json}))
     }
 
     fn process_task_detail(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
@@ -1697,6 +1965,24 @@ impl JeeflowFacade {
                             });
                             if let Some(obj) = vo.as_object_mut() {
                                 obj.insert("task_model".into(), tm);
+                            }
+                            // 动态会签投影（issues/247，spec 06 §2.7）：征询主办行的
+                            // `ext.dynamicCountersign` 从成员行**现算**、不落新存储；
+                            // 无成员行 ⇒ 不写这一枚键（前端据此不渲染置灰态）。
+                            // ⚠️ 行集合按仓储真相现取（同 `collect_context` 那条注释）——
+                            // 投影读的正是"parent＝本行且同节点同名"这批成员行的状态。
+                            if node.dynamic_countersign {
+                                let rows = self.repo.find_history_tasks(inst.instance_id)?;
+                                if let Some(dc) =
+                                    jeeflow_core::collect::build_projection(&rows, &task)
+                                {
+                                    if let Some(obj) = t_ext.as_object_mut() {
+                                        obj.insert(
+                                            "dynamicCountersign".into(),
+                                            json_value_to_serde(&dc),
+                                        );
+                                    }
+                                }
                             }
                             break;
                         }
@@ -5875,9 +6161,13 @@ mod tests {
     // issues/115 §3-8：门面第 47 个 action `processTask/removeTaskActor` 入账，条数与名单一起前进
     // （owner 2026-10-01 拍 A：条数断言随代次前进）。这格是 manifest↔分派表的一致性门禁：
     // 名单漏记 ⇒ 该 action 不在覆盖内；分派表漏记 ⇒ 落 unknown 分支当场红。
+    //
+    // issues/246＋247（spec 06 §processTask/recall／§processTask/revokeDynamicCountersign，
+    // 2026-11-03 立法）再前进两枚 ⇒ 47→49。**只在表尾追加、既有 47 枚一字未动**，
+    // 与上面那条"条数随代次前进"的既定口径同形（不是放宽判据，是判据跟着规范长大）。
 
     #[tokio::test]
-    async fn test_all_47_actions_dispatchable() {
+    async fn test_all_49_actions_dispatchable() {
         let facade = make_facade();
         let actions = vec![
             "processDefine/page", "processDefine/detail", "processDefine/startAndExecute",
@@ -5895,6 +6185,8 @@ mod tests {
             "processTask/candidatePage", "processTask/surrogate",
             "processTask/addCandidate", "processTask/transfer", "processTask/latest",
             "processTask/removeTaskActor",
+            // issues/246 已办撤回 ＋ issues/247 撤回动态会签（表尾追加，上面 47 枚逐字未动）
+            "processTask/recall", "processTask/revokeDynamicCountersign",
             "processDesign/page", "processDesign/detail",
             "processDesign/save", "processDesign/update",
             "processDesign/updateDefine", "processDesign/remove",
@@ -5904,8 +6196,9 @@ mod tests {
             "processSurrogate/update", "processSurrogate/detail",
             "processSurrogate/remove",
         ];
-        assert_eq!(actions.len(), 47,
-            "Should have exactly 47 actions (issues/115 §3-8 added processTask/removeTaskActor)");
+        assert_eq!(actions.len(), 49,
+            "Should have exactly 49 actions (issues/115 §3-8 加了 removeTaskActor＝47；\
+             issues/246＋247 加了 recall/revokeDynamicCountersign＝49)");
         // All actions should return a response (not panic)
         for action in &actions {
             let resp = facade.flow(action, &HashMap::new()).await;

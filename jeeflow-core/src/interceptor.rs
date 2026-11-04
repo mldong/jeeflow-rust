@@ -295,6 +295,8 @@ mod tests {
             properties: std::collections::HashMap::new(),
             reapply_mode: crate::reapply::ReapplyMode::Normal,
             allow_add_sign: false,
+            allow_recall: false,
+            dynamic_countersign: false,
             add_sign_max_rounds: 0,
         };
         let mut args = FlowData::new();
@@ -369,6 +371,8 @@ mod tests {
             display_name: "D1".into(), properties: HashMap::new(),
             reapply_mode: crate::reapply::ReapplyMode::Normal,
             allow_add_sign: false,
+            allow_recall: false,
+            dynamic_countersign: false,
             add_sign_max_rounds: 0,
         });
         let r = filter_args_by_node_permission(&args, &model, "dec1");
@@ -380,6 +384,8 @@ mod tests {
             display_name: "T-free".into(), properties: HashMap::new(),
             reapply_mode: crate::reapply::ReapplyMode::Normal,
             allow_add_sign: false,
+            allow_recall: false,
+            dynamic_countersign: false,
             add_sign_max_rounds: 0,
         });
         let r = filter_args_by_node_permission(&args, &model, "t_free");
@@ -395,6 +401,8 @@ mod tests {
             display_name: "T-ro".into(), properties: props,
             reapply_mode: crate::reapply::ReapplyMode::Normal,
             allow_add_sign: false,
+            allow_recall: false,
+            dynamic_countersign: false,
             add_sign_max_rounds: 0,
         });
         let r = filter_args_by_node_permission(&args, &model, "t_ro");

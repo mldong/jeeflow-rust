@@ -54,10 +54,11 @@ pub fn msg_max_rounds(node_name: &str, max: i64) -> String {
     format!("节点[{}]的加签轮次已达上限 {}，本次提交被拒绝", node_name, max)
 }
 
-fn bad_allow(node_name: &str, raw: &str) -> JeeflowError {
+/// 配置非法文案：键名跟着入参走（java `parseAllow` 的 `"节点[" + nodeName + "]的 " + keyName + " 配置非法: " + v`）。
+fn bad_allow_key(node_name: &str, key_name: &str, raw: &str) -> JeeflowError {
     JeeflowError::Business(format!(
         "节点[{}]的 {} 配置非法: {}",
-        node_name, PROP_ALLOW_ADD_SIGN, raw
+        node_name, key_name, raw
     ))
 }
 
@@ -74,7 +75,26 @@ fn bad_max_rounds(node_name: &str, raw: &str, suffix: &str) -> JeeflowError {
 
 /// 解析 `allowAddSign`：缺省 false；非法值**必须**报配置错误，不得静默当缺省
 /// （校验纪律照本栈 `reapply::ReapplyMode::parse` 的先例，文案照 java `parseAllow`）。
+///
+/// 键名固定成本函数写死的那一枚；`allowRecall`／`dynamicCountersign` 两档走
+/// [`parse_allow_keyed`]（java 侧同一个 `parseAllow` 收 `keyName` 参数，错误文案里的
+/// 键名跟着换 ⇒ 三档同一把尺子，不发明第二种文案）。
 pub fn parse_allow(value: Option<&JsonValue>, node_name: &str) -> JeeflowResult<bool> {
+    parse_allow_keyed(value, node_name, PROP_ALLOW_ADD_SIGN)
+}
+
+/// 布尔开关的通用解析档（**同一把尺子**，只有错误文案里的键名跟着 `key_name` 走）：
+/// 缺省 false；布尔原样取；串档 trim 后 `true`/`false` 不分大小写；空串＝缺省；
+/// 其余档（其它串／数字／数组／对象）报配置错误，**不得静默当缺省**。
+///
+/// 对齐 java `AddSignSupport.parseAllow(Object, String, String)`——java 的注释就写明
+/// "allowAddSign/allowRecall 同尺"，本栈三档（`allowAddSign`／`allowRecall`／
+/// `dynamicCountersign`）全部收口到这里。
+pub fn parse_allow_keyed(
+    value: Option<&JsonValue>,
+    node_name: &str,
+    key_name: &str,
+) -> JeeflowResult<bool> {
     let raw = match value {
         None | Some(JsonValue::Null) => return Ok(false),
         Some(JsonValue::Bool(b)) => return Ok(*b),
@@ -93,7 +113,7 @@ pub fn parse_allow(value: Option<&JsonValue>, node_name: &str) -> JeeflowResult<
     if raw.eq_ignore_ascii_case("false") {
         return Ok(false);
     }
-    Err(bad_allow(node_name, &raw))
+    Err(bad_allow_key(node_name, key_name, &raw))
 }
 
 /// 解析 `addSignMaxRounds`：缺省 0＝不限；非整数或负数报配置错误（同样不得静默当缺省）。
@@ -168,7 +188,12 @@ pub fn operators(args: &FlowData) -> Vec<String> {
 }
 
 /// `tf_nextNodeOperator` 是否"给了"（判据与 java 同尺：非 null 且标量档非纯空白）。
-fn next_node_present(args: &FlowData) -> bool {
+///
+/// issues/247 起这是**互斥判据的唯一实现**，三个调用点共用：后加签写入口
+/// [`validate_submission`]、门面动态会签发起分流、以及门面闸门对成员行携带拉人的判据。
+/// 抬成 public 而不是在门面重写一份——"不另造第二把尺子"（php 那边留了第三份同判据实现，
+/// 本栈收在一处）。
+pub fn next_node_present(args: &FlowData) -> bool {
     match args.get(NEXT_NODE_OPERATOR) {
         None | Some(JsonValue::Null) => false,
         Some(JsonValue::Str(s)) => !s.trim().is_empty(),
@@ -227,7 +252,8 @@ pub fn has_doing_on_node(instance: &ProcessInstance, node_name: &str) -> bool {
 }
 
 /// 废弃本节点未完成的加签任务（拒绝／退回发起人时调用，不留孤儿待办）。
-/// 只对开了 `allowAddSign` 的节点动手——会签节点的兄弟任务由既有会签腿管，不在此扩面。
+/// 只对开了 `allowAddSign` **或** `dynamicCountersign` 的节点动手（issues/247：征询成员行同属
+/// 本节点 DOING，实例撤回/退回路径一并清场）；会签节点的兄弟任务由既有会签腿管，不在此扩面。
 ///
 /// 返回实际废弃的行 id，由调用方把改过的行逐条写回仓储（本栈聚合根与仓储行是两份拷贝）。
 pub fn abandon_doing_on_node(
@@ -237,7 +263,9 @@ pub fn abandon_doing_on_node(
     operator: &str,
 ) -> Vec<i64> {
     let allowed = match model.get_node(node_name) {
-        Some(n) => n.node_type == NodeType::Task && n.allow_add_sign,
+        Some(n) => {
+            n.node_type == NodeType::Task && (n.allow_add_sign || n.dynamic_countersign)
+        }
         None => false,
     };
     if !allowed {
