@@ -287,16 +287,90 @@ pub trait IdGenerator: Send + Sync {
 // ═══════════════════════════════════════════════════════
 
 pub trait ActionPermissionProvider: Send + Sync {
+    /// action → 权限码集合（**OR 语义**：任一持有即有权）。
+    ///
+    /// **空集合 = 放行**（登录即可，spec/06 §2.6；与 go 的 `nil`／java 的 `null` 同一档，
+    /// 本栈签名是 `Vec<String>` 拿不到 `null`，故以"空＝放行"承载——集成方判据是
+    /// `!codes.is_empty()` 才去校验）。
     fn permission_codes(&self, action: &str) -> Vec<String>;
 }
 
-/// Default implementation: wf:{action / → :}
+/// issues/248（权限码表归引擎、八栈统一）rust 腿。
+///
+/// 语义权威＝jeeflow-java `com.mldong.jeeflow.spi.DefaultActionPermissionProvider`
+/// （`OR_RULES` 7 条／`NO_PERM_ACTIONS` 11 条），本表与其**逐条一致**；go 腿的同款见
+/// `jeeflow-go/spi/action_permission.go`。改这张表必须八栈同批改，否则跨栈读出两套码。
+///
+/// 为什么表放在引擎里而不是各集成壳自备：现读十壳各抄一份
+/// （go 三壳 `wf_permission.go`／python 三壳 `wf_permission.py`／nestjs `wf-permission.ts`／
+/// laravel `WfPermission.php`／salvo `wf_permission.rs`／csharp `WfEndpoints.cs`），
+/// 新 action 或粒度调整要改十处＋引擎，"只用引擎、自写集成层"的客户还会读出两套码。
+///
+/// 用静态数组而不是 [`std::collections::HashMap`]：本 crate 零第三方依赖且表只有个位数条目，
+/// 线性查表的成本可忽略，还能保住"表顺序＝java 侧书写顺序"这条可读性；不需要 `lazy_static`／
+/// `OnceLock` 之类的额外依赖。
+const OR_RULES: &[(&str, &[&str])] = &[
+    // boot3 注解 OR 语义的 action（任选其一即有权）
+    (
+        "processDefine/detail",
+        &["wf:processDefine:detail", "wf:processDesign:listByType"],
+    ),
+    (
+        "processDefine/startAndExecute",
+        &["wf:processDefine:startAndExecute", "wf:processDesign:listByType"],
+    ),
+    (
+        "processDefine/getLastByName",
+        &[
+            "wf:processDefine:detail",
+            "wf:processDesign:listByType",
+            "wf:processDefine:getLastByName",
+        ],
+    ),
+    (
+        "processTask/candidatePage",
+        &["wf:processTask:execute", "wf:processTask:candidatePage"],
+    ),
+    ("processTask/jumpAbleTaskNameList", &["wf:processTask:execute"]),
+    // issues/246／247 两枚新 action 定 B 案（owner 2026-11-04）：**复用"办理"这枚码**，
+    // 不另建 sys_menu 按钮种子。判据是既有惯例——transfer／removeTaskActor／candidatePage／latest
+    // 都没有按钮行，candidatePage／jumpAbleTaskNameList 就是走本表复用 execute；而撤回／撤会签的
+    // 主体按引擎判据本来就必然是该行参与者（＝有办理权的人），拆独立码实际给不出去。
+    ("processTask/recall", &["wf:processTask:execute"]),
+    ("processTask/revokeDynamicCountersign", &["wf:processTask:execute"]),
+];
+
+/// 放行清单（登录即可、不配权限码）——对齐 java `NO_PERM_ACTIONS`。
+/// 统计三条是 issues/103 的收口成果（普通用户分析页曾被默认规则 `wf:processInstance:stats:*` 拦住）。
+const NO_PERM_ACTIONS: &[&str] = &[
+    "processInstance/detail",
+    "processInstance/highLight",
+    "processInstance/approvalRecord",
+    "processInstance/getAssigneeTextData",
+    "processInstance/bizData",
+    "processTask/detail",
+    "processTask/addCandidate",
+    "processTask/latest",
+    "processInstance/stats/overview",
+    "processInstance/stats/trend",
+    "processInstance/stats/group",
+];
+
+/// 引擎内置默认件：放行 → OR → 默认派生 `wf:{action 的 / 换 :}`。
+///
+/// java 的 `permissionCodes(null)` 返回 `null` 那一档在本栈**结构性不可达**
+/// （入参是 `&str`，非空类型），无需照抄。
 pub struct DefaultActionPermissionProvider;
 
 impl ActionPermissionProvider for DefaultActionPermissionProvider {
     fn permission_codes(&self, action: &str) -> Vec<String> {
-        let code = format!("wf:{}", action.replace('/', ":"));
-        vec![code]
+        if NO_PERM_ACTIONS.contains(&action) {
+            return Vec::new(); // 放行：空集合＝登录即可
+        }
+        if let Some((_, codes)) = OR_RULES.iter().find(|(a, _)| *a == action) {
+            return codes.iter().map(|c| c.to_string()).collect(); // OR 语义
+        }
+        vec![format!("wf:{}", action.replace('/', ":"))] // 默认派生
     }
 }
 
@@ -389,4 +463,157 @@ pub trait CustomNodeHandler: Send + Sync {
 
 pub trait ProcessEventListener: Send + Sync {
     fn on_event(&self, event: &crate::event::ProcessEvent);
+}
+
+// ═══════════════════════════════════════════════════════
+// 测试
+// ═══════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 内置默认件的便捷出口（等价于宿主不注册时 `ServiceContext` 回落的那一件）。
+    fn perm(action: &str) -> Vec<String> {
+        DefaultActionPermissionProvider.permission_codes(action)
+    }
+
+    /// 期望值构造器：把 java 侧的 `String[]` 字面量形状一比一搬过来。
+    fn want(codes: &[&str]) -> Vec<String> {
+        codes.iter().map(|c| c.to_string()).collect()
+    }
+
+    /// 正向＋负向：默认派生 `wf:{action 的 / 换 :}`。
+    /// 断言的是"与 java 逐条一致"，不是"与这份实现一致"——改这张表必须同时改 java，否则本卡必红。
+    #[test]
+    fn test_i248_default_derivation() {
+        assert_eq!(perm("processDesign/save"), want(&["wf:processDesign:save"]));
+        // 没配进表的 action 一律派生，不得被误放行（java `defaultRuleStillApplies` 同两枚）
+        assert_eq!(perm("processDefine/deploy"), want(&["wf:processDefine:deploy"]));
+        assert_eq!(
+            perm("processInstance/updateCCStatus"),
+            want(&["wf:processInstance:updateCCStatus"])
+        );
+        // 三段 action 的 '/' 是**全量**替换（java 的 `replace` 语义），不是只换第一枚
+        assert_eq!(
+            perm("processInstance/stats/notInList"),
+            want(&["wf:processInstance:stats:notInList"])
+        );
+    }
+
+    /// OR 族：表 7 条逐条钉住（顺序＝java `OR_RULES` 的书写顺序）。
+    #[test]
+    fn test_i248_or_rules_match_java() {
+        assert_eq!(
+            perm("processDefine/detail"),
+            want(&["wf:processDefine:detail", "wf:processDesign:listByType"])
+        );
+        assert_eq!(
+            perm("processDefine/startAndExecute"),
+            want(&["wf:processDefine:startAndExecute", "wf:processDesign:listByType"])
+        );
+        assert_eq!(
+            perm("processDefine/getLastByName"),
+            want(&[
+                "wf:processDefine:detail",
+                "wf:processDesign:listByType",
+                "wf:processDefine:getLastByName"
+            ])
+        );
+        assert_eq!(
+            perm("processTask/candidatePage"),
+            want(&["wf:processTask:execute", "wf:processTask:candidatePage"])
+        );
+        assert_eq!(
+            perm("processTask/jumpAbleTaskNameList"),
+            want(&["wf:processTask:execute"])
+        );
+        assert_eq!(
+            perm("processTask/recall"),
+            want(&["wf:processTask:execute"])
+        );
+        assert_eq!(
+            perm("processTask/revokeDynamicCountersign"),
+            want(&["wf:processTask:execute"])
+        );
+    }
+
+    /// 放行族：11 条全部返回**空集合**（空＝登录即可；含 issues/103 的统计三条）。
+    #[test]
+    fn test_i248_no_perm_actions_are_empty() {
+        for action in NO_PERM_ACTIONS.iter().copied() {
+            assert!(
+                perm(action).is_empty(),
+                "action {} 应放行（空集合＝登录即可），实得 {:?}",
+                action,
+                perm(action)
+            );
+        }
+        // 统计三条单列（issues/103：普通用户分析页曾被默认规则 wf:processInstance:stats:* 拦住）
+        for action in [
+            "processInstance/stats/overview",
+            "processInstance/stats/trend",
+            "processInstance/stats/group",
+        ] {
+            assert!(perm(action).is_empty(), "统计 action {} 应放行", action);
+        }
+    }
+
+    /// issues/246／247 两枚新 action 的 B 案粒度（owner 2026-11-04 拍）：**恰为** execute 一枚，
+    /// 不派生成 `wf:processTask:recall`／`wf:processTask:revokeDynamicCountersign`（那是 A 案，
+    /// 普通角色会因为没 `sys_menu` 种子行而 403）。
+    ///
+    /// 反向哨兵同钉在这里：没进两张表的 action 必须仍走默认派生——否则"整族都被塞进 execute"
+    /// 这类错法会被本测试放过。
+    #[test]
+    fn test_i248_new_actions_ride_execute_code() {
+        for action in ["processTask/recall", "processTask/revokeDynamicCountersign"] {
+            assert_eq!(
+                perm(action),
+                want(&["wf:processTask:execute"]),
+                "{} 须复用「办理」这枚码",
+                action
+            );
+        }
+        assert_eq!(perm("processTask/transfer"), want(&["wf:processTask:transfer"]));
+        assert_eq!(
+            perm("processTask/removeTaskActor"),
+            want(&["wf:processTask:removeTaskActor"])
+        );
+    }
+
+    /// 形状锚：两张表的条目数与 java 钉死（`OR_RULES` 7 条／`NO_PERM_ACTIONS` 11 条）。
+    /// 这不是"会漂的读数"，而是跨栈契约的形状——加一条规则要八栈同批改。
+    #[test]
+    fn test_i248_table_shapes_match_java() {
+        assert_eq!(OR_RULES.len(), 7, "OR 规则条数应为 7（对齐 java OR_RULES）");
+        assert_eq!(
+            NO_PERM_ACTIONS.len(),
+            11,
+            "放行清单条数应为 11（含统计三条，对齐 java NO_PERM_ACTIONS）"
+        );
+        // 两表不得有交集，也不得有重复项（否则条目数会"凑对"而语义走偏）
+        for (action, codes) in OR_RULES {
+            assert!(
+                !NO_PERM_ACTIONS.contains(action),
+                "{} 同时出现在 OR 表与放行清单",
+                action
+            );
+            assert!(!codes.is_empty(), "{} 的 OR 码不得为空", action);
+        }
+        let mut or_actions: Vec<&str> = OR_RULES.iter().map(|(a, _)| *a).collect();
+        or_actions.sort_unstable();
+        let mut no_perm_actions: Vec<&str> = NO_PERM_ACTIONS.to_vec();
+        no_perm_actions.sort_unstable();
+        assert_eq!(
+            or_actions.windows(2).filter(|w| w[0] == w[1]).count(),
+            0,
+            "OR 表内 action 重复"
+        );
+        assert_eq!(
+            no_perm_actions.windows(2).filter(|w| w[0] == w[1]).count(),
+            0,
+            "放行清单内 action 重复"
+        );
+    }
 }
