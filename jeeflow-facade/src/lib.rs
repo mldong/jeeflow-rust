@@ -345,6 +345,9 @@ fn task_row_to_json(r: &TaskRow) -> Json {
         "ext": Json::Object(ext),
         "instance_ext": Json::Object(instance_ext),
         "instance_create_time": r.instance_create_time,
+        // issues/250：所属流程实例的状态（整数或 null）——待办/已办共用本转换，两个列表都带；
+        // 出口层 to_camel 落成契约键 instanceState。
+        "instance_state": r.instance_state,
         "version": r.define_version,
         "task_form_data": form_data_of_map(&parse_json_map(r.variable.as_deref()), TASK_FORM_DATA_PREFIX),
     })
@@ -3727,6 +3730,26 @@ mod tests {
     use super::*;
     use jeeflow_core::id_gen::AtomicIdGenerator;
     use jeeflow_core::memory::MemoryRepository;
+
+    /// issues/250：taskRow 出口必须带 instance_state，且出口层把它落成契约键 instanceState。
+    /// 本仓模型/内存仓/sqlx 投影在 HEAD 就已有 instance_state（本轮只补门面出口这一行），
+    /// 故这里直接钉那一行：有值出整数、缺值键仍在且为 null（不造 0——0 不是合法状态）。
+    #[test]
+    fn issue250_task_row_carries_instance_state() {
+        let mut r = TaskRow::default();
+        r.instance_state = Some(20);
+        let j = task_row_to_json(&r);
+        assert_eq!(
+            j.get("instance_state").and_then(|v| v.as_i64()),
+            Some(20),
+            "task_row_to_json 必须投出 instance_state=20"
+        );
+        assert_eq!(to_camel("instance_state"), "instanceState");
+
+        let empty = task_row_to_json(&TaskRow::default());
+        let v = empty.get("instance_state").expect("键必须恒在（两仓同答案要求缺值出 null）");
+        assert!(v.is_null(), "缺值必须是 null，不得造 0，实得 {v}");
+    }
 
     fn make_facade() -> JeeflowFacade {
         let repo = Arc::new(MemoryRepository::new());
