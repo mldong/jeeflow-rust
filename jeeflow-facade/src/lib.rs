@@ -320,10 +320,41 @@ fn project_task_ext(
     out
 }
 
+/// issues/251 布尔宽收（serde_json 侧）：对齐 java `Boolean.parseBoolean(String.valueOf(v))`——
+/// JSON bool 直取；字符串大小写不敏感 "true"→true、其余→false；其他类型→false。
+/// 盖章写入的恒为 bool，宽收只为存量脏值兜底。
+fn lenient_bool_serde(v: &Json) -> bool {
+    match v {
+        Json::Bool(b) => *b,
+        Json::String(s) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// issues/251 布尔宽收（core `JsonValue` 侧，detail 的 tasks 列表用）：与 [`lenient_bool_serde`] 同口径。
+fn lenient_bool_core(v: &JsonValue) -> bool {
+    match v {
+        JsonValue::Bool(b) => *b,
+        JsonValue::Str(s) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
 fn task_row_to_json(r: &TaskRow) -> Json {
     let instance_ext = parse_json_map(r.instance_variable.as_deref());
-    let ext = project_task_ext(parse_json_map(r.variable.as_deref()), instance_ext.clone());
-    json!({
+    let row_vars = parse_json_map(r.variable.as_deref());
+    let ext = project_task_ext(row_vars.clone(), instance_ext.clone());
+    // issues/251：已办（非 DOING）行才把办理时盖的 allowRecall 快照搬到顶层。取数必须落在
+    // project_task_ext 回退**之前**的原始行变量上（回退会把实例变量合进来，污染快照来源）；
+    // 缺键＝不出字段，DOING 行永不投。顶层 snake 键经出口 to_camel 落成契约键 allowRecall。
+    let allow_recall = if r.task_state == TaskState::Doing.code() {
+        None
+    } else {
+        row_vars
+            .get(jeeflow_core::recall::KEY_ALLOW_RECALL)
+            .map(lenient_bool_serde)
+    };
+    let mut out = json!({
         "id": r.id,
         "process_instance_id": r.process_instance_id,
         "task_name": r.task_name,
@@ -349,8 +380,14 @@ fn task_row_to_json(r: &TaskRow) -> Json {
         // 出口层 to_camel 落成契约键 instanceState。
         "instance_state": r.instance_state,
         "version": r.define_version,
-        "task_form_data": form_data_of_map(&parse_json_map(r.variable.as_deref()), TASK_FORM_DATA_PREFIX),
-    })
+        "task_form_data": form_data_of_map(&row_vars, TASK_FORM_DATA_PREFIX),
+    });
+    if let Some(b) = allow_recall {
+        out.as_object_mut()
+            .unwrap()
+            .insert("allow_recall".to_string(), Json::Bool(b));
+    }
+    out
 }
 
 fn instance_row_to_json(r: &InstanceRow) -> Json {
@@ -1226,6 +1263,19 @@ impl JeeflowFacade {
             }
             if let Some(obj) = vo.as_object_mut() {
                 obj.insert("ext".into(), ext);
+            }
+            // issues/251：detail 的 tasks 列表与已办列表同形——非 DOING 行才把办理时盖的
+            // allowRecall 快照搬到顶层（缺键不出字段，DOING 行永不投）；出口 to_camel 落 allowRecall。
+            if !doing {
+                if let Some(b) = t
+                    .variables
+                    .get(jeeflow_core::recall::KEY_ALLOW_RECALL)
+                    .map(lenient_bool_core)
+                {
+                    if let Some(obj) = vo.as_object_mut() {
+                        obj.insert("allow_recall".into(), Json::Bool(b));
+                    }
+                }
             }
             if doing {
                 active.push(vo.clone());
@@ -3749,6 +3799,99 @@ mod tests {
         let empty = task_row_to_json(&TaskRow::default());
         let v = empty.get("instance_state").expect("键必须恒在（两仓同答案要求缺值出 null）");
         assert!(v.is_null(), "缺值必须是 null，不得造 0，实得 {v}");
+    }
+
+    /// issues/251：已办行出口把办理时盖的 `tf_allowRecall` 快照搬到顶层 `allowRecall`。
+    /// 承重判据：①非 DOING 才投、DOING 永不投；②缺键不出字段（与 false 是两档）；
+    /// ③默认 false 也出键（盖章恒写键）；④取数在 project_task_ext 回退**之前**的原始行变量上
+    /// （实例变量里有键、行变量里没有 ⇒ 不投）；⑤布尔宽收对齐 java Boolean.parseBoolean；
+    /// ⑥顶层 snake 键经出口 to_camel 落成契约键 allowRecall。
+    #[test]
+    fn issue251_task_row_projects_allow_recall_snapshot() {
+        let finished = TaskState::Finished.code();
+        let doing = TaskState::Doing.code();
+
+        // ①＋⑥ 已办＋true：出顶层 allow_recall=true，出口落 allowRecall=true
+        let mut r = TaskRow::default();
+        r.task_state = finished;
+        r.variable = Some(r#"{"tf_allowRecall":true}"#.to_string());
+        let j = task_row_to_json(&r);
+        assert_eq!(
+            j.get("allow_recall").and_then(|v| v.as_bool()),
+            Some(true),
+            "已办行 tf_allowRecall=true 必须投出顶层 allow_recall=true"
+        );
+        assert_eq!(to_camel("allow_recall"), "allowRecall");
+        let exit = transform_output(j);
+        assert_eq!(
+            exit.get("allowRecall").and_then(|v| v.as_bool()),
+            Some(true),
+            "出口 to_camel 后契约键必须是 allowRecall=true，实得 {exit}"
+        );
+        assert!(exit.get("allow_recall").is_none(), "snake 原键不得残留在出口");
+
+        // ③ 已办＋false：默认 false 也出键（缺键与 false 是两档）
+        let mut r = TaskRow::default();
+        r.task_state = finished;
+        r.variable = Some(r#"{"tf_allowRecall":false}"#.to_string());
+        let j = task_row_to_json(&r);
+        assert_eq!(
+            j.get("allow_recall").and_then(|v| v.as_bool()),
+            Some(false),
+            "已办行 tf_allowRecall=false 必须投出 allow_recall=false（默认 false 也有键）"
+        );
+
+        // ② 已办＋缺键：不出字段
+        let mut r = TaskRow::default();
+        r.task_state = finished;
+        r.variable = Some(r#"{"f_title":"无快照的存量行"}"#.to_string());
+        let j = task_row_to_json(&r);
+        assert!(
+            j.get("allow_recall").is_none(),
+            "行变量缺 tf_allowRecall ⇒ 不得造字段，实得 {j}"
+        );
+
+        // ① DOING＋有键：永不投
+        let mut r = TaskRow::default();
+        r.task_state = doing;
+        r.variable = Some(r#"{"tf_allowRecall":true}"#.to_string());
+        let j = task_row_to_json(&r);
+        assert!(
+            j.get("allow_recall").is_none(),
+            "DOING 行即便有 tf_allowRecall 也永不投，实得 {j}"
+        );
+
+        // ④ 取数在回退前：行变量只剩控制键（触发 project_task_ext 回退实例变量），
+        //    实例变量里虽有 tf_allowRecall=true，但原始行变量没有 ⇒ 不投。
+        let mut r = TaskRow::default();
+        r.task_state = finished;
+        r.variable = Some(r#"{"isFirstTaskNode":false}"#.to_string());
+        r.instance_variable = Some(r#"{"tf_allowRecall":true}"#.to_string());
+        let j = task_row_to_json(&r);
+        assert!(
+            j.get("allow_recall").is_none(),
+            "allowRecall 必须取自原始行变量、不得吃 ext 回退进来的实例变量，实得 {j}"
+        );
+
+        // ⑤ 布尔宽收（存量脏值兜底）：字符串大小写不敏感 "true"→true，其余→false；非 bool/字符串→false
+        for (raw, want) in [
+            (r#"{"tf_allowRecall":"TRUE"}"#, true),
+            (r#"{"tf_allowRecall":"true"}"#, true),
+            (r#"{"tf_allowRecall":"false"}"#, false),
+            (r#"{"tf_allowRecall":"maybe"}"#, false),
+            (r#"{"tf_allowRecall":1}"#, false),
+            (r#"{"tf_allowRecall":null}"#, false),
+        ] {
+            let mut r = TaskRow::default();
+            r.task_state = finished;
+            r.variable = Some(raw.to_string());
+            let j = task_row_to_json(&r);
+            assert_eq!(
+                j.get("allow_recall").and_then(|v| v.as_bool()),
+                Some(want),
+                "宽收口径对齐 java Boolean.parseBoolean：{raw} 应得 {want}"
+            );
+        }
     }
 
     fn make_facade() -> JeeflowFacade {

@@ -21,7 +21,7 @@
 //! 不必为它们各开一档判据；已废弃(99)／已撤回(30) 行既不拦也不重复废弃。
 
 use crate::error::{JeeflowError, JeeflowResult};
-use crate::json::JsonValue;
+use crate::json::{FlowData, JsonValue};
 use crate::model::{current_time_str, ProcessTask, TaskState};
 use crate::parser::{NodeModel, NodeType, ProcessModel};
 
@@ -39,6 +39,11 @@ pub const PROP_ALLOW_RECALL: &str = "allowRecall";
 /// ⇒ 从历史记录可一步跳到唯一活待办。`tf_` 前缀使退回复活的血缘腿天然剔掉它
 /// （见 `engine.rs::rollback_to_parent` 里 `k.starts_with("tf_")` 那一支）。
 pub const KEY_RECALL_HISTORY: &str = "tf_recallHistory";
+
+/// issues/251 快照键：办理时把**当前节点**的 `allowRecall` 开关值盖进执行 args（`tf_` 前缀
+/// ⇒ 只落任务行、不传播进实例变量），查询出口据此把已办行的顶层 `allowRecall` 搬出来。
+/// 语义是"办理那一刻的开关快照"，与撤回校验现读的定义解耦（定义漂移为设计内）。
+pub const KEY_ALLOW_RECALL: &str = "tf_allowRecall";
 
 /// 逐字判据文案（spec 06 §processTask/recall 失败文案表；跨栈统一，一个字不许改）。
 pub fn msg_window(task_name: &str) -> String {
@@ -85,6 +90,20 @@ pub fn msg_first_task_forbidden(node_name: &str) -> String {
 /// 形状与 `add_sign::validate_model` 同族。
 pub fn node_enabled(node: Option<&NodeModel>) -> bool {
     matches!(node, Some(n) if n.node_type == NodeType::Task && n.allow_recall)
+}
+
+/// issues/251 办理时盖章：把当前节点的 `allowRecall` 开关值以 [`KEY_ALLOW_RECALL`] 写进执行 args。
+///
+/// 守卫＝"当前节点是 Task 节点才盖"，值＝开关 `true`/`false`——**默认 false 也要盖键**（缺键与
+/// false 在出口是两档：缺键不出字段、false 出 `allowRecall:false`）。调用位在过滤字段权限之后、
+/// `complete_task` 之前；`tf_` 前缀使这枚键只落任务行变量、不传播进实例变量（见 `model::complete_task`
+/// 只并 `f_`）。出口只搬运已办（非 DOING）行的这枚快照，撤回校验本身仍以现读定义为权威。
+pub fn stamp_allow_recall(args: &mut FlowData, node: Option<&NodeModel>) {
+    if let Some(n) = node {
+        if n.node_type == NodeType::Task {
+            args.insert(KEY_ALLOW_RECALL.to_string(), JsonValue::Bool(n.allow_recall));
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════

@@ -1311,7 +1311,9 @@ impl JeeflowEngineImpl {
         // issues/183（audit8 R17）：本次提交先过**入口**字段权限过滤再入变量——只读/隐藏
         // f_ 字段被剔除后既进不了实例变量（complete_task 的 f_ 合并）也进不了 exec.args，
         // 下游未声明该字段权限的节点无从把它写进业务表（java 同位 JeeflowEngineImpl.java:264）。
-        let task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
+        let mut task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
+        // issues/251：办理时盖当前节点的 allowRecall 快照（过滤之后、merge 之前；tf_ 只落任务行不传播进实例）。
+        crate::recall::stamp_allow_recall(&mut task_args, model.get_node(&task.task_name));
         let mut full_args = instance.variables.clone();
         full_args.merge(&task_args);
         self.add_user_info(&mut full_args, operator);
@@ -1726,8 +1728,10 @@ impl JeeflowEngineImpl {
                 operator, apply_task.task_id
             )));
         }
-        let task_args =
+        let mut task_args =
             crate::interceptor::filter_args_by_node_permission(args, &model, &apply_task.task_name);
+        // issues/251：重提直返那一拍也是办理入口，同样盖当前节点 allowRecall 快照（申请节点恒 false 也盖键）。
+        crate::recall::stamp_allow_recall(&mut task_args, model.get_node(&apply_task.task_name));
         // 后加签写入口校验（同 `execute_task_locked` 的 5.2）：**重提直返那一拍也是"办理"的一个入口**，
         // 不能留第五道口子——java 那边它与其余入口共用 `prepareExecution`
         // （`JeeflowEngineImpl.java:391` 就调 `prepareExecution`，`:449` 的 `validateSubmission` 一并覆盖）。
@@ -1960,7 +1964,9 @@ impl JeeflowEngineImpl {
         // resume 语义对齐 Go mergeVars(args, inst.Variables)：实例已持久化变量为底、
         // 本次提交覆盖（详见 execute_task_async 注释，L3 S11-B）。
         // issues/183（audit8 R17）：同 execute_task_sync 的入口字段权限过滤（java 同位 :264）。
-        let task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
+        let mut task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
+        // issues/251：跳转/退回腿也是办理入口，盖当前节点 allowRecall 快照（过滤之后、merge 之前）。
+        crate::recall::stamp_allow_recall(&mut task_args, model.get_node(&task.task_name));
         let mut full_args = instance.variables.clone();
         full_args.merge(&task_args);
         self.add_user_info(&mut full_args, operator);
@@ -2108,7 +2114,9 @@ impl JeeflowEngineImpl {
 
         // resume 语义对齐 Go mergeVars（同 execute_task_async，三路径保持一致）。
         // issues/183（audit8 R17）：同 execute_task_sync 的入口字段权限过滤（java 同位 :264）。
-        let task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
+        let mut task_args = crate::interceptor::filter_args_by_node_permission(args, &model, &task.task_name);
+        // issues/251：退结束腿也是办理入口，盖当前节点 allowRecall 快照（过滤之后、merge 之前）。
+        crate::recall::stamp_allow_recall(&mut task_args, model.get_node(&task.task_name));
         let mut full_args = instance.variables.clone();
         full_args.merge(&task_args);
         self.add_user_info(&mut full_args, operator);
