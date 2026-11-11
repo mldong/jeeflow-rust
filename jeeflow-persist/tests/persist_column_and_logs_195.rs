@@ -202,6 +202,8 @@ fn test_195_meta_leg_verbatim_only_after_r78_jia() {
 /// `false` 腿就会重新收下驼峰键而红。
 #[test]
 fn test_195_strict_column_switch_is_inert_three_legs_identical() {
+    // 三腿全等比的是整行（含审计时间列）：不取锁会被邻格注入时钟串改某一腿的时间而假红。
+    let _guard = clock::lock_scope();
     let mut rows: Vec<(String, HashMap<String, JsonValue>)> = Vec::new();
     for (label, strict) in [("不传开关", None), ("传 false", Some(false)), ("传 true", Some(true))] {
         let writer = Arc::new(InMemoryTableWriter::new());
