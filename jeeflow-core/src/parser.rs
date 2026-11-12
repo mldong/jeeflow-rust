@@ -8,6 +8,7 @@ use crate::error::{JeeflowError, JeeflowResult};
 use crate::add_sign;
 use crate::collect;
 use crate::recall;
+use crate::task_type;
 use crate::reapply::{self, ReapplyMode};
 use std::collections::HashMap;
 
@@ -549,6 +550,10 @@ impl ModelParser {
         recall::validate_model(&model)?;
         // 动态会签三条禁配（spec/02 §4.4，issues/247）：双开／会签节点／申请节点。
         collect::validate_model(&model)?;
+        // 节点级协办禁配（spec/02 §4.4，issues/252）：协办档只由运行期 processTask/aidant
+        // 派生（issues/253），节点上配 1 ＝ snaker 原义的"流程悬挂"陷阱（办结不驱动、跳转同闸），
+        // 解析期就拦。其余不可识别值仍静默回落主办，不扩成 fail-fast（issues/245 口径）。
+        task_type::validate_model(&model)?;
 
         Ok(model)
     }
