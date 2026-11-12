@@ -298,7 +298,7 @@ pub trait ActionPermissionProvider: Send + Sync {
 /// issues/248（权限码表归引擎、八栈统一）rust 腿。
 ///
 /// 语义权威＝jeeflow-java `com.mldong.jeeflow.spi.DefaultActionPermissionProvider`
-/// （`OR_RULES` 7 条／`NO_PERM_ACTIONS` 11 条），本表与其**逐条一致**；go 腿的同款见
+/// （`OR_RULES` 8 条／`NO_PERM_ACTIONS` 11 条），本表与其**逐条一致**；go 腿的同款见
 /// `jeeflow-go/spi/action_permission.go`。改这张表必须八栈同批改，否则跨栈读出两套码。
 ///
 /// 为什么表放在引擎里而不是各集成壳自备：现读十壳各抄一份
@@ -338,6 +338,9 @@ const OR_RULES: &[(&str, &[&str])] = &[
     // 主体按引擎判据本来就必然是该行参与者（＝有办理权的人），拆独立码实际给不出去。
     ("processTask/recall", &["wf:processTask:execute"]),
     ("processTask/revokeDynamicCountersign", &["wf:processTask:execute"]),
+    // issues/253 动态协办：照 246/247 B 案惯例复用"办理"这枚码，不建按钮种子行——
+    // 派生协办的主体按引擎判据本来就必然是主办行名册内的人（＝有办理权的人）。
+    ("processTask/aidant", &["wf:processTask:execute"]),
 ];
 
 /// 放行清单（登录即可、不配权限码）——对齐 java `NO_PERM_ACTIONS`。
@@ -501,7 +504,7 @@ mod tests {
         );
     }
 
-    /// OR 族：表 7 条逐条钉住（顺序＝java `OR_RULES` 的书写顺序）。
+    /// OR 族：表 8 条逐条钉住（顺序＝java `OR_RULES` 的书写顺序）。
     #[test]
     fn test_i248_or_rules_match_java() {
         assert_eq!(
@@ -582,11 +585,11 @@ mod tests {
         );
     }
 
-    /// 形状锚：两张表的条目数与 java 钉死（`OR_RULES` 7 条／`NO_PERM_ACTIONS` 11 条）。
+    /// 形状锚：两张表的条目数与 java 钉死（`OR_RULES` 8 条／`NO_PERM_ACTIONS` 11 条）。
     /// 这不是"会漂的读数"，而是跨栈契约的形状——加一条规则要八栈同批改。
     #[test]
     fn test_i248_table_shapes_match_java() {
-        assert_eq!(OR_RULES.len(), 7, "OR 规则条数应为 7（对齐 java OR_RULES）");
+        assert_eq!(OR_RULES.len(), 8, "OR 规则条数应为 8（对齐 java OR_RULES；issues/253 协办 +1）");
         assert_eq!(
             NO_PERM_ACTIONS.len(),
             11,

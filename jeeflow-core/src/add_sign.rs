@@ -245,10 +245,14 @@ pub fn validate_submission(
 /// merged 判据三档里的第二档：**先判这个**（顺序不可反）——给了人却本节点还有兄弟待办时
 /// 建单那一条仍在同圈，两档都落空才放行出边。
 pub fn has_doing_on_node(instance: &ProcessInstance, node_name: &str) -> bool {
-    instance
-        .tasks
-        .iter()
-        .any(|t| t.task_name == node_name && t.task_state == TaskState::Doing.code())
+    // issues/253：协办行（task_type=1）不算"兄弟待办"——它不驱动流程、不是接力链的一环，
+    // 算进来会让 waitCompletion=false 的主办在加签/征询节点上被协办行挡住推进（spec/04
+    // 「缺省 false 主办可随时推进」）。协办行的等待由 [`crate::aidant::gate_wait`] 单独裁决。
+    instance.tasks.iter().any(|t| {
+        t.task_name == node_name
+            && t.task_state == TaskState::Doing.code()
+            && !crate::aidant::is_aidant_row(t)
+    })
 }
 
 /// 废弃本节点未完成的加签任务（拒绝／退回发起人时调用，不留孤儿待办）。

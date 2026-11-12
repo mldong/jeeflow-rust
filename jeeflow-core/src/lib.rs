@@ -26,6 +26,7 @@ pub mod reapply;
 pub mod add_sign;
 pub mod recall;
 pub mod collect;
+pub mod aidant;
 pub mod task_type;
 #[cfg(any(test, feature = "dev-flows"))]
 pub mod flowsdir;

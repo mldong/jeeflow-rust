@@ -597,6 +597,17 @@ fn arg_actor_ids(args: &HashMap<String, Json>) -> Vec<String> {
     normalize_actors(&raw)
 }
 
+/// `waitCompletion` 入参解析（issues/253）：缺省 false（spec/06「选填 bool，缺省 false」）。
+/// 布尔与 "true"/"false" 字符串两形都认（前端 JSON 与表单串两种来源）；其余值按缺省 false
+/// 处理——契约只定义了 bool 档，不为非法值新造文案（协办六行之外不加第七行）。
+fn parse_wait_completion(value: Option<&Json>) -> bool {
+    match value {
+        Some(Json::Bool(b)) => *b,
+        Some(Json::String(s)) => s.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
 /// 主键类参数**另判一档**（spec 06 §2.11 末段）：`processTaskId` 没给／给了 `0` 或负数
 /// ⇒ 响亮报错，不得拿 `''`/`0` 当 id 往下落库（归属值可有可无，主键没给就是调用方写错了）。
 /// 错误信封沿用本仓既有的"缺参数"文案（§2.11 硬要求③：不新造错误码/文案）；
@@ -946,6 +957,7 @@ impl JeeflowFacade {
             "processTask/removeTaskActor" => self.process_task_remove_actor(args),
             "processTask/recall" => self.process_task_recall(args),
             "processTask/revokeDynamicCountersign" => self.process_task_revoke_countersign(args),
+            "processTask/aidant" => self.process_task_aidant(args),
             "processTask/latest" => self.process_task_latest(args),
 
             // ═══ processDesign (9) ═══
@@ -1725,6 +1737,29 @@ impl JeeflowFacade {
         }))
     }
 
+    /// 动态协办（issues/253，spec/06 §processTask/aidant）：**判据与落库全在引擎**
+    /// （[`JeeflowEngineImpl::aidant_task_sync`]），门面只做参数归一与信封包装（与 recall 同分工）。
+    ///
+    /// ⚠️ `operator` **硬必填**，不走"空串回落 user1"缺省档（与 recall/transfer/withdraw 同口径）。
+    /// `actorIds` 逗号串与数组两形共用 §2.11 归一单点（[`arg_actor_ids`]），空 ⇒ 逐字「actorIds 必填」；
+    /// `waitCompletion` 选填 bool，缺省 false＝主办不等协办办结即可推进。成功 `data → null`（spec/06）。
+    /// **位序照 java taskAidant：operator 空判在前、主键缺失判在后、actorIds 空判第三。**
+    fn process_task_aidant(&self, args: &HashMap<String, Json>) -> JeeflowResult<Json> {
+        let operator = require_non_empty(args, "operator", "operator 必填")?;
+        let task_id = arg_id(args, &["processTaskId"])?
+            .ok_or(JeeflowError::Business("processTaskId 缺失".into()))?;
+        let actor_ids = arg_actor_ids(args);
+        if actor_ids.is_empty() {
+            return Err(JeeflowError::Business(
+                jeeflow_core::aidant::MSG_NO_ACTORS.to_string()));
+        }
+        let reason = arg_str_or(args, "reason", "");
+        let wait_completion = parse_wait_completion(args.get("waitCompletion"));
+        self.engine
+            .aidant_task_sync(task_id, &actor_ids, &reason, wait_completion, &operator)?;
+        Ok(Json::Null)
+    }
+
     /// 动态会签四腿共用的上下文装载：主办行 → 实例 → 定义 → 模型 → 节点。
     ///
     /// `None`＝"本行不在征询面内"（实例/定义查不到、节点不是任务节点、或没开
@@ -2034,6 +2069,19 @@ impl JeeflowFacade {
                                             "dynamicCountersign".into(),
                                             json_value_to_serde(&dc),
                                         );
+                                    }
+                                }
+                            }
+                            // 动态协办投影（issues/253，spec/06 §2.7）：主办行 ext.aidant 从
+                            // task_parent_id＋task_type=1 现算、不落新存储。**无节点开关**——协办档
+                            // 只由运行期派生，任何任务节点都可能有；无协办行 ⇒ 不写这一枚键。
+                            {
+                                let rows = self.repo.find_history_tasks(inst.instance_id)?;
+                                if let Some(ad) =
+                                    jeeflow_core::aidant::build_projection(&rows, &task)
+                                {
+                                    if let Some(obj) = t_ext.as_object_mut() {
+                                        obj.insert("aidant".into(), json_value_to_serde(&ad));
                                     }
                                 }
                             }
@@ -6333,7 +6381,7 @@ mod tests {
     // 与上面那条"条数随代次前进"的既定口径同形（不是放宽判据，是判据跟着规范长大）。
 
     #[tokio::test]
-    async fn test_all_49_actions_dispatchable() {
+    async fn test_all_50_actions_dispatchable() {
         let facade = make_facade();
         let actions = vec![
             "processDefine/page", "processDefine/detail", "processDefine/startAndExecute",
@@ -6353,6 +6401,8 @@ mod tests {
             "processTask/removeTaskActor",
             // issues/246 已办撤回 ＋ issues/247 撤回动态会签（表尾追加，上面 47 枚逐字未动）
             "processTask/recall", "processTask/revokeDynamicCountersign",
+            // issues/253 动态协办（表尾追加，上面 49 枚逐字未动）
+            "processTask/aidant",
             "processDesign/page", "processDesign/detail",
             "processDesign/save", "processDesign/update",
             "processDesign/updateDefine", "processDesign/remove",
@@ -6362,9 +6412,9 @@ mod tests {
             "processSurrogate/update", "processSurrogate/detail",
             "processSurrogate/remove",
         ];
-        assert_eq!(actions.len(), 49,
-            "Should have exactly 49 actions (issues/115 §3-8 加了 removeTaskActor＝47；\
-             issues/246＋247 加了 recall/revokeDynamicCountersign＝49)");
+        assert_eq!(actions.len(), 50,
+            "Should have exactly 50 actions (issues/115 §3-8 加了 removeTaskActor＝47；\
+             issues/246＋247 加了 recall/revokeDynamicCountersign＝49；issues/253 加了 aidant＝50)");
         // All actions should return a response (not panic)
         for action in &actions {
             let resp = facade.flow(action, &HashMap::new()).await;

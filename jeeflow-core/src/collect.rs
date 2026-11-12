@@ -140,13 +140,23 @@ pub fn member_rows(tasks: &[ProcessTask], host: &ProcessTask) -> Vec<ProcessTask
     }
     tasks
         .iter()
-        .filter(|t| t.parent_task_id == Some(host.task_id) && t.task_name == host.task_name)
+        .filter(|t| {
+            t.parent_task_id == Some(host.task_id)
+                && t.task_name == host.task_name
+                // issues/253：协办行（task_type=1）也满足 parent＋同节点同名，但它属另一族
+                // ——征询收齐闸只数征询成员行（task_type=0），两闸各数各的（spec/04「与征询并存」）。
+                && !crate::aidant::is_aidant_row(t)
+        })
         .cloned()
         .collect()
 }
 
 /// 成员行判定：parent 指向**同节点同名**行（issues/247 §成员行建单规则；"成员行禁带拉人参数"的判据）。
+/// issues/253：协办行（task_type=1）不是征询成员行——两族靠 task_type 分辨。
 pub fn is_member_row(tasks: &[ProcessTask], row: &ProcessTask) -> bool {
+    if crate::aidant::is_aidant_row(row) {
+        return false;
+    }
     match row.parent_task_id {
         None | Some(0) => false,
         Some(parent) => tasks

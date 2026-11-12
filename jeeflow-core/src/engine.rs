@@ -919,6 +919,9 @@ impl JeeflowEngineImpl {
     /// Only abandons tasks with task_name == node_id and state == DOING.
     /// The just-completed task is already FINISHED so won't be affected.
     fn abandon_countersign_remaining(&self, exec: &mut Execution, node_id: &str) -> JeeflowResult<()> {
+        // issues/253：协办行先走自己的清场腿（废弃＋往主办行账本记废弃），再清剩余会签行——
+        // 顺序不能反，先被下面循环置 99 的协办行就记不上账了。
+        self.abandon_aidant_on_leave(&mut exec.process_instance, node_id, &exec.operator)?;
         let mut abandoned = Vec::new();
         for task in &mut exec.process_instance.tasks {
             if task.task_name == node_id && task.task_state == TaskState::Doing.code() {
@@ -929,6 +932,20 @@ impl JeeflowEngineImpl {
         // Persist abandoned tasks to repo
         for t in &abandoned {
             self.repo().update_task(t)?;
+        }
+        Ok(())
+    }
+
+    /// issues/253：离开节点时清场未办结协办行（废弃＋账本记废弃）并逐条落库。
+    /// 本栈聚合根与仓储行是两份拷贝，[`crate::aidant::abandon_pending_on_node`] 只改聚合，
+    /// 改过的行（被废弃协办行＋记账主办行）须由本方法写回仓储（与 recall 废弃腿同纪律）。
+    fn abandon_aidant_on_leave(&self, instance: &mut ProcessInstance, node_id: &str, operator: &str)
+        -> JeeflowResult<()> {
+        let changed = crate::aidant::abandon_pending_on_node(instance, node_id, operator);
+        for id in changed {
+            if let Some(t) = instance.tasks.iter().find(|t| t.task_id == id) {
+                self.repo().update_task(t)?;
+            }
         }
         Ok(())
     }
@@ -1332,6 +1349,11 @@ impl JeeflowEngineImpl {
         // 加签人只认当次请求，这是 `tf_*` 跨请求复活那一族的第二道防线。
         add_sign::validate_submission(&model, &task, &task_args, operator)?;
 
+        // issues/253 等待闸：waitCompletion=true 的主办行办结前判"不存在 DOING 协办行"，
+        // 未齐 ⇒ 逐字文案报错、零写入。必须排在 complete_task 之前（裸跑无回滚）。
+        // 协办行自身不受本闸约束（它办结本来就不驱动流程）；缺省 false 原样放行。
+        crate::aidant::gate_wait(&instance.tasks, &task)?;
+
         // 5.5. Inject countersignDisagreeFlag if submitType==20 (issues/94)
         let submit_type = full_args.get_i64("submitType")
             .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
@@ -1371,6 +1393,17 @@ impl JeeflowEngineImpl {
         self.notify_task_outcome(outcome,
                                  instance.instance_id, task_id, operator, submit_type);
 
+        // issues/253 推进闸：协办行（task_type=1）办结**不产生执行对象、不跑输出变迁/会签闸**——
+        // 只完成任务行（上面 complete_task／update_task／fire 码 5/6 已做），落库后返回空的新任务表。
+        // 参照 snaker「协办任务完成不产生执行对象」；主办行办结才驱动流程。
+        if crate::aidant::is_aidant_row(&task) {
+            let mut exec = Execution::new(instance, model, define, operator, full_args);
+            exec.process_task = Some(task.clone());
+            self.persist_tasks(&mut exec)?;
+            self.repo().update_instance(&exec.process_instance)?;
+            return Ok(exec.new_tasks);
+        }
+
         // 8. Find the node for this task
         let node = model.get_node(&task.task_name).cloned();
 
@@ -1398,8 +1431,10 @@ impl JeeflowEngineImpl {
             let node_id = &node_ref.id;
 
             // Pre-compute same-node task counts (avoid borrow conflict with abandon)
+            // issues/253：会签合并判据**显式排除协办行（task_type=1）**——snaker 按同节点同名行全算
+            // 会把协办行误当表决票挡住合并（spec/04「不计入会签合并计数」）。票齐即推进。
             let node_task_counts: Vec<(bool, i32)> = exec.process_instance.tasks.iter()
-                .filter(|t| &t.task_name == node_id)
+                .filter(|t| &t.task_name == node_id && !crate::aidant::is_aidant_row(t))
                 .map(|t| (t.is_finished(), t.task_state))
                 .collect();
             let total = node_task_counts.len();
@@ -1541,6 +1576,11 @@ impl JeeflowEngineImpl {
         // and countersign tasks once the gate is merged (issues/94 fall-through).
         // 后加签档不放行时同样跳过这一支（令牌停留本节点）。
         if run_out_edges {
+            // issues/253：离开节点（放行出边）⇒ 未办结协办行随废弃腿清场（废弃＋账本记废弃）。
+            // 会签档已在 abandon_countersign_remaining 先清过一遍，幂等不重复记账。
+            if let Some(n) = node.as_ref() {
+                self.abandon_aidant_on_leave(&mut exec.process_instance, &n.id, operator)?;
+            }
             if let Some(node) = node {
                 let next_nodes: Vec<NodeModel> = exec.process_model.get_output_edges(&node.id)
                     .iter()
@@ -1912,6 +1952,13 @@ impl JeeflowEngineImpl {
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
 
+        // issues/253 推进闸：协办行跳转/退回/退发起人同样不驱动流程（两路同闸，照 snaker）——
+        // 委托 execute_task_locked 的协办早退腿（只办结自己那一行），且必须排在血缘/目标守卫之前，
+        // 免得协办行被守卫的文案误拦。
+        if task.is_doing() && crate::aidant::is_aidant_row(&task) {
+            return self.execute_task_locked(task_id, operator, args);
+        }
+
         // 「退回修改、重提直返」：带标记的申请待办不得借跳转/血缘回退/再次退回改道
         // （java `executeAndJumpTask`／`executeAndJumpToFirstTaskNode` 同款守卫，文案逐字取它）。
         // 必须排在下面所有状态变更之前——本栈宿主没注册事务模板时是裸跑，晚一步就留下半截事实。
@@ -1981,6 +2028,10 @@ impl JeeflowEngineImpl {
         // 同一口径。排在任何状态变更之前，报错时零写入。
         add_sign::validate_submission(&model, &task, &task_args, operator)?;
 
+        // issues/253 等待闸：waitCompletion=true 的主办行跳转/退回前判"无 DOING 协办行"，
+        // 未齐报错零写入（排在 complete_task 之前，与 execute_task_locked 同口径）。
+        crate::aidant::gate_wait(&instance.tasks, &task)?;
+
         // issues/243 甲案：「退回上一步」（nodeName 空 ⇒ 血缘腿）的两道守卫（20010007／20010008）
         // 上提到下面 `complete_task`（办结当前行并 update_task 落库）**之前**——内存仓储无回滚，
         // 守卫后置时报错那次调用结束后"当前待办凭空消失且没有复活行"。与后加签写入口四判据
@@ -2033,6 +2084,10 @@ impl JeeflowEngineImpl {
 
         let mut exec = Execution::new(instance, model, define, operator, full_args);
         exec.process_task = Some(task.clone());
+
+        // issues/253：跳转/退回/退发起人离开本节点 ⇒ 未办结协办行随废弃腿清场（账本记废弃），
+        // 排在下面各 mode 的建单/复活之前（与 java executeAndJumpTask 那一刀同位）。
+        self.abandon_aidant_on_leave(&mut exec.process_instance, &task.task_name, operator)?;
 
         match mode {
             JumpTarget::Node(name) => {
@@ -2098,6 +2153,11 @@ impl JeeflowEngineImpl {
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
 
+        // issues/253 推进闸：协办行拒绝同样不驱动流程（任何 submitType 都只办结自己那一行）
+        if task.is_doing() && crate::aidant::is_aidant_row(&task) {
+            return self.execute_task_locked(task_id, operator, args);
+        }
+
         // 「退回修改、重提直返」：带标记的申请待办不得被"拒绝"直接推到结束
         // （java `executeAndJumpToEnd` 同款守卫，文案逐字取它）。
         crate::reapply::reject_marked_applicant(&task, "拒绝")?;
@@ -2131,6 +2191,9 @@ impl JeeflowEngineImpl {
         // 同一口径。排在任何状态变更之前，报错时零写入。
         add_sign::validate_submission(&model, &task, &task_args, operator)?;
 
+        // issues/253 等待闸：waitCompletion=true 的主办行拒绝前判"无 DOING 协办行"，未齐报错零写入。
+        crate::aidant::gate_wait(&instance.tasks, &task)?;
+
         // Inject countersignDisagreeFlag if submitType==20 (issues/94 round 2)
         let submit_type = full_args.get_i64("submitType")
             .or_else(|| full_args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
@@ -2149,6 +2212,10 @@ impl JeeflowEngineImpl {
         if let Some(t) = instance.tasks.iter().find(|t| t.task_id == task_id) {
             self.repo().update_task(t)?;
         }
+
+        // issues/253：离开节点先清场未办结协办行（废弃＋账本记废弃），再走后加签既有废弃腿与
+        // 下面 abandon_all_doing——顺序不能反，先被置 99 的协办行就记不上账了。
+        self.abandon_aidant_on_leave(&mut instance, &task.task_name, operator)?;
 
         // 拒绝结束：本节点未完成的**加签**任务一并废弃，不留孤儿待办（spec/04 · 后加签）。
         // 位置与窄口径都对齐 java `executeAndJumpToEnd` 里 `AddSignSupport.abandonDoingOnNode`
@@ -2509,6 +2576,130 @@ impl JeeflowEngineImpl {
         // 落库后的真实 taskId 随 new_tasks 带回；聚合根副本还给借用者。
         self.persist_tasks(&mut exec)?;
         *instance = exec.process_instance.clone();
+        Ok(exec.new_tasks.clone())
+    }
+
+    // ═══ issues/253 · 动态协办（aidant）派生 ═══
+
+    /// 动态协办（异步入口，签名与其余办理入口同族）：经 [`Self::in_tx`] 出事务包裹。
+    pub async fn aidant_task_async(&self, task_id: i64, actor_ids: &[String], reason: &str,
+                                   wait_completion: bool, operator: &str)
+        -> JeeflowResult<Vec<ProcessTask>> {
+        self.in_tx(|| self.aidant_task_sync(task_id, actor_ids, reason, wait_completion, operator))
+    }
+
+    /// 同步内核（不自行包裹）：同实例串行化，与 [`Self::execute_task_sync`] 同一把按实例的互斥锁。
+    pub fn aidant_task_sync(&self, task_id: i64, actor_ids: &[String], reason: &str,
+                            wait_completion: bool, operator: &str)
+        -> JeeflowResult<Vec<ProcessTask>> {
+        let lock = self.instance_lock(task_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.aidant_task_locked(task_id, actor_ids, reason, wait_completion, operator)
+    }
+
+    /// 动态协办（issues/253，spec/04 · 动态协办）：主办把"这活"交给别人干——按人派生
+    /// task_type=1 协办子行，**主办行原样保留 DOING**，节点推进仍由主办行办结触发。
+    ///
+    /// 判据全部排在任何状态变更之前（报错即零写入，位序逐字照 java `aidantTask`）：
+    /// 任务存在 → 禁递归 → 主办行 DOING → actorIds 归一非空 → 名册鉴权（auto/admin 例外）→
+    /// 逐人去重。建单形状照征询成员行腿（[`Self::create_collect_member_rows`]：同节点同名、
+    /// parent＝主办行、expire_time 同尺、分支归属继承），另落 task_type=1／performType=Normal；
+    /// 委托并入＋落库＋fire 码 3 走 [`Self::persist_tasks`] 既有收口，不新增事件码。
+    fn aidant_task_locked(&self, task_id: i64, actor_ids: &[String], reason: &str,
+                          wait_completion: bool, operator: &str)
+        -> JeeflowResult<Vec<ProcessTask>> {
+        use crate::aidant;
+        // ── 判据 1：任务存在 ──
+        let host = self.repo().find_task_by_id(task_id)?
+            .ok_or_else(|| JeeflowError::Business(aidant::MSG_TASK_NOT_FOUND.to_string()))?;
+        // ── 判据 2：禁递归（协办行不能再派生）──
+        if aidant::is_aidant_row(&host) {
+            return Err(JeeflowError::Business(aidant::MSG_NO_RECURSION.to_string()));
+        }
+        // ── 判据 3：主办行 DOING ──
+        if !host.is_doing() {
+            return Err(JeeflowError::Business(aidant::MSG_NOT_DOING.to_string()));
+        }
+        // ── 判据 4：actorIds 归一非空（§2.11 单点）──
+        let actors = crate::model::normalize_actors(actor_ids);
+        if actors.is_empty() {
+            return Err(JeeflowError::Business(aidant::MSG_NO_ACTORS.to_string()));
+        }
+        // ── 判据 5：名册鉴权（按任务行 actor_ids，与 recall/transfer 同源；auto/admin 例外）──
+        let privileged = operator.eq_ignore_ascii_case("flow.auto")
+            || operator.eq_ignore_ascii_case("flow.admin");
+        if !privileged && !host.actor_ids.iter().any(|a| a == operator) {
+            return Err(JeeflowError::Business(aidant::MSG_NO_PERMISSION.to_string()));
+        }
+        let mut instance = self.repo().find_instance_by_id(host.process_instance_id)?
+            .ok_or_else(|| JeeflowError::Business("流程实例不存在".to_string()))?;
+        instance.tasks = self.repo().find_history_tasks(instance.instance_id)?;
+        let define = self.repo().find_define_by_id(instance.define_id)?
+            .ok_or_else(|| JeeflowError::Business("流程定义不存在".to_string()))?;
+        let model = ModelParser::parse(&define.content_str())?;
+        let node = match model.get_node(&host.task_name) {
+            Some(n) if n.node_type == NodeType::Task => n.clone(),
+            _ => return Err(JeeflowError::Business(aidant::MSG_NOT_DOING.to_string())),
+        };
+        // ── 判据 6：逐人去重（该人已有本主办行下未办结协办行）──
+        let existing = aidant::aidant_rows(&instance.tasks, &host);
+        for actor in &actors {
+            for t in &existing {
+                if t.is_doing() && t.actor_ids.iter().any(|a| a == actor) {
+                    return Err(JeeflowError::Business(aidant::MSG_DUPLICATE.to_string()));
+                }
+            }
+        }
+        // ══ 判据全过，以下才允许写 ══
+        let round = aidant::last_round(&host) + 1;
+        let expr = crate::expire_time::expire_expr_of(&node);
+        let agg_start = instance.tasks.len();
+        let mut created: Vec<ProcessTask> = Vec::with_capacity(actors.len());
+        for actor in &actors {
+            let mut child = instance.create_task(
+                &node.id, &node.display_name, std::slice::from_ref(actor), operator,
+                TaskType::Assistant, PerformType::Normal, node.form_key(), Some(host.task_id));
+            if !reason.is_empty() {
+                child.variables.insert_str(aidant::AIDANT_REASON, reason);
+            }
+            // 新任务两份拷贝都要写戳（聚合根 push 的是克隆——issues/131 同款教训）
+            if let Some(t) = instance.tasks.last_mut() {
+                if !reason.is_empty() {
+                    t.variables.insert_str(aidant::AIDANT_REASON, reason);
+                }
+            }
+            created.push(child);
+        }
+        stamp_expire(&mut created, &mut instance.tasks, expr.as_deref(), &instance.variables);
+        // 分支归属：与每一次普通建单同一条腿（照征询成员行）；root 传 0 由 persist_tasks 回填
+        let scopes = crate::reapply::build_scopes(Some(&host), &model, &node.id, 0);
+        if !scopes.is_empty() {
+            for t in created.iter_mut() {
+                crate::reapply::put_scopes(t, &scopes);
+            }
+            for t in instance.tasks.iter_mut().skip(agg_start) {
+                crate::reapply::put_scopes(t, &scopes);
+            }
+        }
+        // 等待闸开关＋账本落主办行（聚合内那份；主办不办结，variables 合并序保证账本活到办结后）。
+        // ⚠️ 严禁覆写任务 actor_id/operator 列（转办那条 ⚠️ 同尺）：进行中任务该列恒无值是家族不变量，
+        // 派生协办不改主办行的办理人归属，审计由 update_user＋账本 operator 承载。
+        if let Some(h) = instance.tasks.iter_mut().find(|t| t.task_id == task_id) {
+            h.variables.insert(aidant::AIDANT_WAIT.to_string(), JsonValue::Bool(wait_completion));
+            aidant::append_aidant_history(h, operator, &actors, round, reason);
+            h.update_user = Some(operator.to_string());
+            h.update_time = Some(current_time_str());
+        }
+        let mut exec = Execution::new(instance, model, define, operator, FlowData::new());
+        exec.process_task = Some(host.clone());
+        exec.new_tasks = created;
+        // 建单落库唯一收口（save_task＋参与者＋委托并入＋isFirstTaskNode＋fire 码 3）
+        self.persist_tasks(&mut exec)?;
+        // 主办行账本落盘（聚合根与仓储行两份拷贝，少这一刀账本就丢）
+        if let Some(h) = exec.process_instance.tasks.iter().find(|t| t.task_id == task_id) {
+            self.repo().update_task(h)?;
+        }
+        self.repo().update_instance(&exec.process_instance)?;
         Ok(exec.new_tasks.clone())
     }
 }
