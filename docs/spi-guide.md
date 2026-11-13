@@ -16,7 +16,7 @@
 | `ExpressionEvaluator` | 条件表达式求值（decision 节点 / 边） | 内置求值器 |
 | `TransactionTemplate` | 事务边界 | 无（仓储自带事务时可缺省） |
 | `IdGenerator` | 雪花 ID 生成 | `DefaultIdGenerator` / `AtomicIdGenerator`（测试） |
-| `ActionPermissionProvider` | action 级权限校验（mldong 框架权限码映射点，spec/06 §2.6） | 内置 `DefaultActionPermissionProvider`（放行 11 条 → OR 表 7 条 → 默认派生 `wf:{action 的 / → :}`，与 java 参考实现逐条一致；**空集合＝放行**） |
+| `ActionPermissionProvider` | action 级权限校验（mldong 框架权限码映射点，spec/06 §2.6） | 内置 `DefaultActionPermissionProvider`（放行 11 条 → OR 表 8 条 → 默认派生 `wf:{action 的 / → :}`，与 java 参考实现逐条一致；**空集合＝放行**） |
 | `FlowInterceptor` | 流程节点拦截器（**前置 / 后置两条独立通道**，见下节） | 后置：persist 写库件（`jeeflow-persist`）；前置：无内置件，宿主自挂 |
 | `BizDataReader` | 业务数据读取（persist 回查） | 无 |
 | `AssignmentHandler` | 参与人处理器（`assignmentHandler` 节点属性路由） | 内置 7 个（Applicant / DeptLeader×main / TaskRoleAssignee 等） |
