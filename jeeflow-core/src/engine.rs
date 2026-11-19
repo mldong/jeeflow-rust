@@ -490,6 +490,8 @@ impl JeeflowEngineImpl {
 
                 // Persist
                 self.repo().update_instance(&exec.process_instance)?;
+                // 实例终态 ⇒ 取消该实例 pending 提醒/自动行（CALLBACK 表示既成事实，不取消）
+                self.cancel_instance_time_actions(exec.process_instance.instance_id)?;
 
                 // Fire event（2 PROCESS_INSTANCE_END）：实例 state 落库为终态之后 fire，
                 // 载荷带落库后的 `state` 整数（规范 11 §11.3 码 2「直传载荷键」）。
@@ -998,6 +1000,104 @@ impl JeeflowEngineImpl {
     /// 立即提交（autocommit，无显式事务）。故 TASK_START 必须在 `save_task` 之后 fire——
     /// 监听器 `find_task(source_id)` 此时才查得到该任务。若在 create 阶段 fire（id=0/未落库），
     /// 监听器 find_task 查空 → 静默 return → TODO 待办丢失（messagePage 恒空）。
+    // ─── 任务时限动作（spec 04 · 零 schema）────────────────────────────────
+
+    fn time_action_sink(&self) -> Option<&Arc<dyn crate::spi::TimeActionSink>> {
+        self.ctx.time_action_sink.as_ref()
+    }
+
+    fn cancel_task_time_actions(&self, task_id: i64) -> JeeflowResult<()> {
+        match self.time_action_sink() {
+            Some(sink) => sink.cancel_task_time_actions(task_id),
+            None => Ok(()),
+        }
+    }
+
+    fn cancel_instance_time_actions(&self, instance_id: i64) -> JeeflowResult<()> {
+        match self.time_action_sink() {
+            Some(sink) => sink.cancel_instance_time_actions(instance_id),
+            None => Ok(()),
+        }
+    }
+
+    /// 建单侧动作行：autoExecute=Y 且有有效到期时间 ⇒ AUTO_COMPLETE；有效 reminderTime ⇒ 首条 REMIND。
+    fn schedule_time_actions(&self, model: &crate::parser::ProcessModel,
+                             instance: &ProcessInstance, task: &ProcessTask,
+                             allow: bool) -> JeeflowResult<()> {
+        let Some(sink) = self.time_action_sink() else { return Ok(()) };
+        if !allow || task.task_id == 0 || task.task_state != TaskState::Doing.code() {
+            return Ok(());
+        }
+        if task.task_type == TaskType::Assistant.code() {
+            return Ok(());
+        }
+        // 征询成员行带内部标记，不继承时限动作（spec 02 §4.5 生效范围）
+        if task.variables.get_str("_wfNoTimeAction") == Some("1") {
+            return Ok(());
+        }
+        let Some(node) = model.get_node(&task.task_name) else { return Ok(()) };
+        if node.prop_str("autoExecute").as_deref() == Some("Y") {
+            match task.expire_time.as_deref().and_then(epoch_millis_of) {
+                Some(due) => sink.insert_time_action(&crate::spi::TimeAction {
+                    action_type: "AUTO_COMPLETE".into(),
+                    due_at: due,
+                    instance_id: task.process_instance_id,
+                    task_id: task.task_id,
+                    node_key: node.id.clone(),
+                    occurrence_no: 0,
+                    idempotency_key: format!("wf:auto:{}:0", task.task_id),
+                })?,
+                None => eprintln!(
+                    "[jeeflow] 时限配置诊断 task={} node={} autoExecute=Y 但无有效到期时间",
+                    task.task_id, node.id),
+            }
+        }
+        if let Some(raw) = node.prop_str("reminderTime") {
+            if !raw.trim().is_empty() {
+                match first_reminder_time(&raw, &instance.variables,
+                                          task.create_time.as_deref().unwrap_or("")) {
+                    Some(due) => sink.insert_time_action(&crate::spi::TimeAction {
+                        action_type: "REMIND".into(),
+                        due_at: due,
+                        instance_id: task.process_instance_id,
+                        task_id: task.task_id,
+                        node_key: node.id.clone(),
+                        occurrence_no: 1,
+                        idempotency_key: format!("wf:remind:{}:1", task.task_id),
+                    })?,
+                    None => eprintln!(
+                        "[jeeflow] 时限配置诊断 task={} node={} reminderTime={} 解析不出",
+                        task.task_id, node.id, raw),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 完成回调（TASK_COMPLETE 事实）插 CALLBACK 行（dueAt=now）。
+    fn insert_callback_action(&self, node: &crate::parser::NodeModel,
+                              task: &ProcessTask) -> JeeflowResult<()> {
+        let Some(sink) = self.time_action_sink() else { return Ok(()) };
+        let name = node.prop_str("callback").unwrap_or_default();
+        if name.trim().is_empty() || task.task_id == 0 {
+            return Ok(());
+        }
+        let due = epoch_millis_of(&crate::clock::current_time_str())
+            .unwrap_or_else(|| std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0));
+        sink.insert_time_action(&crate::spi::TimeAction {
+            action_type: "CALLBACK".into(),
+            due_at: due,
+            instance_id: task.process_instance_id,
+            task_id: task.task_id,
+            node_key: node.id.clone(),
+            occurrence_no: 0,
+            idempotency_key: format!("wf:callback:{}:0", task.task_id),
+        })
+    }
+
     fn persist_tasks(&self, exec: &mut Execution) -> JeeflowResult<()> {
         let instance_id = exec.process_instance.instance_id;
         let process_name = self.surrogate_process_name(exec);
@@ -1036,6 +1136,9 @@ impl JeeflowEngineImpl {
             if crate::reapply::fill_root_self(task) {
                 self.repo().update_task(task)?;
             }
+            // 时限动作建行（spec 04 · 写路径）：协办行（task_type=1）与征询成员行
+            // （带 _wfNoTimeAction 标记）由 schedule_time_actions 内部排除。
+            self.schedule_time_actions(&exec.process_model, &exec.process_instance, task, true)?;
             // Save actors（集合已含代理人，与任务同批落库）
             if !task.actor_ids.is_empty() {
                 self.repo().add_task_actor(task.task_id, &task.actor_ids)?;
@@ -1292,7 +1395,10 @@ impl JeeflowEngineImpl {
             a
         };
         let args = &args;
-        // 1. Load task (sync)
+        // 1. 实例级事务排他（spec 04 · 并发保护）：先锁再读，堵"读后锁前"的二次推进窗口
+        if let Some(pre) = self.repo().find_task_by_id(task_id)? {
+            self.repo().lock_instance(pre.process_instance_id)?;
+        }
         let task = self.repo().find_task_by_id(task_id)?
             .ok_or(JeeflowError::TaskNotFound(task_id))?;
 
@@ -1377,6 +1483,14 @@ impl JeeflowEngineImpl {
         // 7. Persist task update (sync)
         if let Some(t) = instance.tasks.iter().find(|t| t.task_id == task_id) {
             self.repo().update_task(t)?;
+        }
+        // 时限动作联动（spec 04 · 写路径）：任务离开 DOING ⇒ 取消该任务 pending 提醒/自动行；
+        // 完成（TASK_COMPLETE 事实）且有 callback 配置 ⇒ 同事务插 CALLBACK 行。
+        self.cancel_task_time_actions(task_id)?;
+        if !Self::is_reject_submit_type(submit_type) {
+            if let Some(node) = model.get_node(&task.task_name) {
+                self.insert_callback_action(node, &task)?;
+            }
         }
 
         // 7.5 Fire 任务结果事件：任务行 state→已完成（20）**落库之后** fire
@@ -2244,6 +2358,7 @@ impl JeeflowEngineImpl {
         instance.abandon_all_doing();
 
         self.repo().update_instance(&instance)?;
+        self.cancel_instance_time_actions(instance.instance_id)?;
 
         // Abandon all doing tasks
         for task in &instance.tasks {
@@ -2541,12 +2656,14 @@ impl JeeflowEngineImpl {
                 &node_id, &node.display_name, std::slice::from_ref(actor), operator,
                 task_type, perform_type, node.form_key(), Some(host.task_id));
             member.variables.insert_i64(add_sign::round_key(&node_id), round);
+            member.variables.insert_str("_wfNoTimeAction", "1");
             if !reason.is_empty() {
                 member.variables.insert_str(crate::collect::KEY_ADD_SIGN_REASON, reason);
             }
             // 新任务两份拷贝都要写戳（聚合根 push 的是克隆——issues/131 同款教训）。
             if let Some(t) = instance.tasks.last_mut() {
                 t.variables.insert_i64(add_sign::round_key(&node_id), round);
+                t.variables.insert_str("_wfNoTimeAction", "1");
                 if !reason.is_empty() {
                     t.variables.insert_str(crate::collect::KEY_ADD_SIGN_REASON, reason);
                 }
@@ -7528,5 +7645,326 @@ mod node_level_interceptor_r91_tests {
         engine.fire_pre_interceptors(&mut ex).unwrap();
         assert_eq!(vec!["A:apply".to_string(), "C:apply".to_string()], tags(&sink),
             "未声明时应回落到引擎级两条数组（后置／前置各一条）");
+    }
+}
+
+
+// ═══ 任务时限动作的时间解析（spec 02 §4.5）══════════════════════════════════
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    // Howard Hinnant civil_from_days 的逆变换（与 clock::format_unix_utc 同一算法族）
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// "yyyy-MM-dd HH:mm:ss" → UTC 毫秒（无 chrono，core 零依赖）。
+fn epoch_millis_of(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let mo: i64 = s.get(5..7)?.parse().ok()?;
+    let d: i64 = s.get(8..10)?.parse().ok()?;
+    let h: i64 = s.get(11..13)?.parse().ok()?;
+    let mi: i64 = s.get(14..16)?.parse().ok()?;
+    let se: i64 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    let days = days_from_civil(y, mo, d);
+    Some(((days * 86400 + h * 3600 + mi * 60 + se)) * 1000)
+}
+
+/// 首次提醒时刻：变量/相对/绝对走既有 process_time（锚点＝任务创建时刻），再补严格 HH:mm。
+fn first_reminder_time(expr: &str, args: &FlowData, create_time: &str) -> Option<i64> {
+    if expr.trim().is_empty() || create_time.is_empty() {
+        return None;
+    }
+    if let Some(t) = crate::expire_time::process_time_in(Some(expr), args, create_time, create_time) {
+        return epoch_millis_of(&t);
+    }
+    // 严格 HH:mm：任务创建日当天，已早于创建时刻取次日
+    let b = expr.as_bytes();
+    if b.len() == 5 && b[2] == b':' {
+        let hh = expr.get(0..2)?.parse::<i64>().ok()?;
+        let mm = expr.get(3..5)?.parse::<i64>().ok()?;
+        if hh <= 23 && mm <= 59 && expr.chars().enumerate().all(|(i, c)| i == 2 || c.is_ascii_digit()) {
+            let day = create_time.get(0..10)?;
+            let today = format!("{} {:02}:{:02}:00", day, hh, mm);
+            if today.as_str() >= create_time {
+                return epoch_millis_of(&today);
+            }
+            let y: i64 = day.get(0..4)?.parse().ok()?;
+            let mo: i64 = day.get(5..7)?.parse().ok()?;
+            let d: i64 = day.get(8..10)?.parse().ok()?;
+            let next = crate::clock::format_unix_utc(
+                (days_from_civil(y, mo, d) + 1) * 86400 + hh * 3600 + mm * 60);
+            return epoch_millis_of(&next);
+        }
+    }
+    None
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 任务时限动作 T0（spec 04 · 任务时限动作；工作流时限方案 §8 的引擎侧判据）
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod time_limit_action_tests {
+    use super::*;
+    use crate::context::ServiceContext;
+    use crate::id_gen::AtomicIdGenerator;
+    use crate::memory::MemoryRepository;
+    use crate::model::{ProcessDefine, SubmitType};
+    use crate::spi::{ProcessRepository, TimeAction, TimeActionSink};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Sink {
+        actions: Mutex<Vec<TimeAction>>,
+        cancelled_tasks: Mutex<Vec<i64>>,
+        cancelled_instances: Mutex<Vec<i64>>,
+    }
+
+    impl TimeActionSink for Sink {
+        fn insert_time_action(&self, action: &TimeAction) -> JeeflowResult<()> {
+            self.actions.lock().unwrap().push(action.clone());
+            Ok(())
+        }
+        fn cancel_task_time_actions(&self, task_id: i64) -> JeeflowResult<()> {
+            self.cancelled_tasks.lock().unwrap().push(task_id);
+            Ok(())
+        }
+        fn cancel_instance_time_actions(&self, instance_id: i64) -> JeeflowResult<()> {
+            self.cancelled_instances.lock().unwrap().push(instance_id);
+            Ok(())
+        }
+    }
+
+    impl Sink {
+        fn of_type(&self, t: &str) -> Vec<TimeAction> {
+            self.actions.lock().unwrap().iter().filter(|a| a.action_type == t).cloned().collect()
+        }
+    }
+
+    /// review 节点的 properties 串（入参为空时给基础属性）。
+    fn review_props(props: &str) -> String {
+        let mut parts = vec![r#""form": "f""#.to_string()];
+        if !props.contains("assignee") { parts.push(r#""assignee": "userA""#.into()); }
+        if !props.contains("taskType") { parts.push(r#""taskType": 0"#.into()); }
+        if !props.contains("performType") { parts.push(r#""performType": 0"#.into()); }
+        if !props.trim().is_empty() { parts.push(props.to_string()); }
+        parts.join(", ")
+    }
+
+    fn flow(props: &str) -> Vec<u8> {
+        let base = review_props(props);
+        format!(
+            "{{\n\
+            \"name\": \"tl-{}\",\n\
+            \"displayName\": \"时限夹具\",\n\
+            \"type\": \"approval\",\n\
+            \"nodes\": [\n\
+                {{\"id\": \"start\", \"type\": \"snaker:start\", \"text\": {{\"value\": \"开始\"}}}},\n\
+                {{\"id\": \"apply\", \"type\": \"snaker:task\", \"text\": {{\"value\": \"申请\"}}, \"properties\": {{\"form\": \"af\", \"taskType\": 0, \"performType\": 0, \"assignee\": \"applicant\"}}}},\n\
+                {{\"id\": \"review\", \"type\": \"snaker:task\", \"text\": {{\"value\": \"审批\"}}, \"properties\": {{ {base} }}}},\n\
+                {{\"id\": \"end\", \"type\": \"snaker:end\", \"text\": {{\"value\": \"结束\"}}}}\n\
+            ],\n\
+            \"edges\": [\n\
+                {{\"id\": \"e1\", \"sourceNodeId\": \"start\", \"targetNodeId\": \"apply\"}},\n\
+                {{\"id\": \"e2\", \"sourceNodeId\": \"apply\", \"targetNodeId\": \"review\"}},\n\
+                {{\"id\": \"e3\", \"sourceNodeId\": \"review\", \"targetNodeId\": \"end\"}}\n\
+            ]\n\
+        }}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        )
+        .as_bytes()
+        .to_vec()
+    }
+
+    fn engine_with(sink: Arc<Sink>, props: &str) -> (JeeflowEngineImpl, Arc<MemoryRepository>, i64) {
+        let repo = Arc::new(MemoryRepository::new());
+        let ctx = ServiceContext::new()
+            .with_repository(repo.clone() as Arc<dyn ProcessRepository>)
+            .with_id_generator(Arc::new(AtomicIdGenerator::new(1)))
+            .with_time_action_sink(sink as Arc<dyn TimeActionSink>);
+        let engine = JeeflowEngineImpl::new(ctx);
+        let mut define = ProcessDefine {
+            id: 0,
+            name: format!("tl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()),
+            display_name: "时限夹具".into(),
+            define_type: "approval".into(),
+            state: 1,
+            content: flow(props),
+            version: 1,
+            create_time: None,
+            create_user: None,
+            update_time: None,
+            update_user: None,
+        };
+        repo.save_define(&mut define).unwrap();
+        (engine, repo, define.id)
+    }
+
+    fn start_review(engine: &JeeflowEngineImpl, repo: &MemoryRepository, define_id: i64)
+        -> (ProcessInstance, Vec<ProcessTask>) {
+        let inst = engine.start_sync(define_id, "applicant", &FlowData::new()).unwrap();
+        for t in repo.find_doing_tasks(inst.instance_id, &[]).unwrap() {
+            if t.task_name == "apply" {
+                let mut args = FlowData::new();
+                args.insert_i64("submitType", SubmitType::Apply.code() as i64);
+                engine.execute_task_sync(t.task_id, "applicant", &args).unwrap();
+            }
+        }
+        let rows = repo
+            .find_doing_tasks(inst.instance_id, &[])
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.task_name == "review")
+            .collect();
+        (repo.find_instance_by_id(inst.instance_id).unwrap().unwrap(), rows)
+    }
+
+    fn submit(code: SubmitType) -> FlowData {
+        let mut a = FlowData::new();
+        a.insert_i64("submitType", code.code() as i64);
+        a
+    }
+
+    #[test]
+    fn auto_and_reminder_on_create() {
+        let sink = Arc::new(Sink::default());
+        let (engine, repo, def) = engine_with(
+            sink.clone(),
+            r#""expireTime": "2h", "autoExecute": "Y", "reminderTime": "30m""#);
+        let (inst, rows) = start_review(&engine, &repo, def);
+        assert_eq!(rows.len(), 1);
+        let review = &rows[0];
+        let autos = sink.of_type("AUTO_COMPLETE");
+        let reminds = sink.of_type("REMIND");
+        assert_eq!(autos.len(), 1);
+        assert_eq!(reminds.len(), 1);
+        assert_eq!(autos[0].idempotency_key, format!("wf:auto:{}:0", review.task_id));
+        assert_eq!(reminds[0].idempotency_key, format!("wf:remind:{}:1", review.task_id));
+        assert_eq!(reminds[0].occurrence_no, 1);
+        assert_eq!(autos[0].task_id, review.task_id);
+        assert_eq!(autos[0].instance_id, inst.instance_id);
+        let create = epoch_millis_of(review.create_time.as_deref().unwrap()).unwrap();
+        assert_eq!(reminds[0].due_at, create + 30 * 60 * 1000);
+        assert_eq!(autos[0].due_at, create + 2 * 3600 * 1000);
+    }
+
+    #[test]
+    fn not_configured_creates_no_action() {
+        let sink = Arc::new(Sink::default());
+        let (engine, repo, def) = engine_with(sink.clone(), "");
+        start_review(&engine, &repo, def);
+        assert!(sink.actions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_execute_only_exact_y() {
+        for v in ["N", "n", "y", "true"] {
+            let sink = Arc::new(Sink::default());
+            let (engine, repo, def) = engine_with(
+                sink.clone(),
+                &format!(r#""expireTime": "2h", "autoExecute": "{}""#, v));
+            start_review(&engine, &repo, def);
+            assert!(sink.of_type("AUTO_COMPLETE").is_empty(), "autoExecute={v} 不得开启");
+        }
+    }
+
+    #[test]
+    fn invalid_reminder_does_not_break_flow() {
+        let sink = Arc::new(Sink::default());
+        let (engine, repo, def) = engine_with(sink.clone(), r#""reminderTime": "2.5h""#);
+        let (_inst, rows) = start_review(&engine, &repo, def);
+        assert_eq!(rows.len(), 1);
+        assert!(sink.of_type("REMIND").is_empty());
+    }
+
+    #[test]
+    fn parallel_countersign_every_member() {
+        let sink = Arc::new(Sink::default());
+        let (engine, repo, def) = engine_with(
+            sink.clone(),
+            r#""assignee": "userA,userB", "performType": 1, "countersignType": "PARALLEL", "reminderTime": "1h""#);
+        let (_inst, rows) = start_review(&engine, &repo, def);
+        assert_eq!(rows.len(), 2);
+        let ids: Vec<i64> = sink.of_type("REMIND").iter().map(|a| a.task_id).collect();
+        for r in &rows {
+            assert!(ids.contains(&r.task_id), "成员 {} 缺提醒行", r.task_id);
+        }
+    }
+
+    #[test]
+    fn sequential_advance_gets_action() {
+        let sink = Arc::new(Sink::default());
+        let (engine, repo, def) = engine_with(
+            sink.clone(),
+            r#""assignee": "userA,userB", "performType": 1, "countersignType": "SEQUENTIAL", "expireTime": "2h", "autoExecute": "Y""#);
+        let (inst, rows) = start_review(&engine, &repo, def);
+        let first = &rows[0];
+        assert!(sink.of_type("AUTO_COMPLETE").iter().any(|a| a.task_id == first.task_id));
+        engine.execute_task_sync(first.task_id, "userA", &submit(SubmitType::Agree)).unwrap();
+        let nxt: Vec<ProcessTask> = repo
+            .find_doing_tasks(inst.instance_id, &[])
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.task_name == "review" && t.task_id != first.task_id)
+            .collect();
+        assert_eq!(nxt.len(), 1, "串行会签应推进出下一位");
+        assert!(
+            sink.of_type("AUTO_COMPLETE").iter().any(|a| a.task_id == nxt[0].task_id),
+            "推进出的下一位缺自动办理行");
+        assert!(sink.cancelled_tasks.lock().unwrap().contains(&first.task_id));
+    }
+
+    #[test]
+    fn aidant_row_inherits_no_action() {
+        let sink = Arc::new(Sink::default());
+        let (engine, repo, def) = engine_with(
+            sink.clone(),
+            r#""expireTime": "2h", "autoExecute": "Y", "reminderTime": "1h""#);
+        let (_inst, rows) = start_review(&engine, &repo, def);
+        let before = sink.actions.lock().unwrap().len();
+        engine
+            .aidant_task_sync(rows[0].task_id, &["aid1".to_string()], "", false, "userA")
+            .unwrap();
+        assert_eq!(sink.actions.lock().unwrap().len(), before, "协办行不得继承时限动作");
+    }
+
+    #[test]
+    fn callback_on_complete_only() {
+        let sink = Arc::new(Sink::default());
+        let (engine, repo, def) = engine_with(sink.clone(), r#""callback": "demoHandler""#);
+        let (_inst, rows) = start_review(&engine, &repo, def);
+        engine.execute_task_sync(rows[0].task_id, "userA", &submit(SubmitType::Agree)).unwrap();
+        let cbs = sink.of_type("CALLBACK");
+        assert_eq!(cbs.len(), 1);
+        assert_eq!(cbs[0].idempotency_key, format!("wf:callback:{}:0", rows[0].task_id));
+        assert!(sink.cancelled_tasks.lock().unwrap().contains(&rows[0].task_id));
+
+        let sink2 = Arc::new(Sink::default());
+        let (engine2, repo2, def2) = engine_with(sink2.clone(), r#""callback": "demoHandler""#);
+        let (_i2, rows2) = start_review(&engine2, &repo2, def2);
+        engine2
+            .execute_and_jump_to_end_sync(rows2[0].task_id, "userA", &submit(SubmitType::Reject))
+            .unwrap();
+        assert!(sink2.of_type("CALLBACK").is_empty(), "退回不得触发完成回调");
+    }
+
+    #[test]
+    fn instance_terminal_cancels_actions() {
+        let sink = Arc::new(Sink::default());
+        let (engine, repo, def) = engine_with(sink.clone(), r#""reminderTime": "1h""#);
+        let (inst, rows) = start_review(&engine, &repo, def);
+        engine.execute_task_sync(rows[0].task_id, "userA", &submit(SubmitType::Agree)).unwrap();
+        assert!(sink.cancelled_instances.lock().unwrap().contains(&inst.instance_id));
     }
 }

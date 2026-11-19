@@ -24,6 +24,8 @@ pub struct ServiceContext {
     pub id_generator: Option<Arc<dyn IdGenerator>>,
     pub action_permission_provider: Option<Arc<dyn ActionPermissionProvider>>,
     pub biz_data_reader: Option<Arc<dyn BizDataReader>>,
+    /// 时限动作凭证（spec 04）；未注入＝全部时限动作静默跳过。
+    pub time_action_sink: Option<Arc<dyn TimeActionSink>>,
     /// Assignment handlers by registration name (Java FQCN).
     pub assignment_handlers: HashMap<String, Arc<dyn AssignmentHandler>>,
     /// Decision handlers by name.
@@ -86,6 +88,7 @@ impl ServiceContext {
             id_generator: None,
             action_permission_provider: None,
             biz_data_reader: None,
+            time_action_sink: None,
             assignment_handlers: HashMap::new(),
             decision_handlers: HashMap::new(),
             custom_handlers: HashMap::new(),
@@ -163,6 +166,11 @@ impl ServiceContext {
 
     pub fn with_action_permission_provider(mut self, app: Arc<dyn ActionPermissionProvider>) -> Self {
         self.action_permission_provider = Some(app);
+        self
+    }
+
+    pub fn with_time_action_sink(mut self, sink: Arc<dyn TimeActionSink>) -> Self {
+        self.time_action_sink = Some(sink);
         self
     }
 

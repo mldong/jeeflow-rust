@@ -688,6 +688,19 @@ async fn select_task_actor_ids(exec: SqlxExec<'_>, task_id: i64) -> JeeflowResul
 }
 
 impl ProcessRepository for SqlxRepository {
+    fn lock_instance(&self, instance_id: i64) -> JeeflowResult<()> {
+        // 实例级事务排他（spec 04 · 并发保护）：实例行 SELECT … FOR UPDATE，
+        // 事务内走同源连接（TX_SLOT），锁随最外层提交/回滚释放。
+        self.with_exec(|mut exec| self.block_on(async {
+            sqlx::query("SELECT id FROM wf_process_instance WHERE id = ? FOR UPDATE")
+                .bind(instance_id)
+                .fetch_optional(exec.reborrow())
+                .await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
+            Ok(())
+        }))
+    }
+
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>> {
         self.with_exec(|mut exec| self.block_on(async {
             let row = sqlx::query(

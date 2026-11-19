@@ -13,6 +13,12 @@ use std::collections::HashMap;
 // ═══════════════════════════════════════════════════════
 
 pub trait ProcessRepository: Send + Sync {
+    /// 实例级事务排他（spec 04 · 并发保护）：数据库仓储覆盖为实例行锁；
+    /// 未覆盖＝等价单进程互斥（引擎实例锁）。
+    fn lock_instance(&self, _instance_id: i64) -> JeeflowResult<()> {
+        Ok(())
+    }
+
     // ═══ Define operations ═══
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>>;
     fn save_define(&self, define: &mut ProcessDefine) -> JeeflowResult<()>;
@@ -619,4 +625,26 @@ mod tests {
             "放行清单内 action 重复"
         );
     }
+}
+
+
+/// 任务时限动作凭证（spec 04 · 任务时限动作）：due_at 用 UTC 毫秒。
+#[derive(Debug, Clone)]
+pub struct TimeAction {
+    pub action_type: String,
+    pub due_at: i64,
+    pub instance_id: i64,
+    pub task_id: i64,
+    pub node_key: String,
+    pub occurrence_no: i32,
+    pub idempotency_key: String,
+}
+
+/// 时限动作凭证仓储侧实现（集成层按框架执行队列实现，引擎在业务事务内回调）。
+/// 未注册实现时引擎侧全部时限动作静默跳过。取消只清 REMIND/AUTO_COMPLETE，
+/// CALLBACK 表达既成事实、不随失效取消。
+pub trait TimeActionSink: Send + Sync {
+    fn insert_time_action(&self, action: &TimeAction) -> JeeflowResult<()>;
+    fn cancel_task_time_actions(&self, task_id: i64) -> JeeflowResult<()>;
+    fn cancel_instance_time_actions(&self, instance_id: i64) -> JeeflowResult<()>;
 }
