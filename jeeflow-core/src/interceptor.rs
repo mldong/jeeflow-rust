@@ -130,11 +130,15 @@ impl AssignmentHandler for DeptMainLeaderAssignmentHandler {
 }
 
 /// 6. FormFieldAssigneeHandler — assignee from form field value (variable name = node id).
+///
+/// 三档查找＝issues/48 的契约：`f_<id>` → 裸名 → `_NN` 去后缀后查**裸名 base**。
+/// 第三档只查 base 裸名，`f_<base>` 是 [`find_form_user_field_value`]（issues/254 新类）的扩面。
 pub struct FormFieldAssigneeHandler;
 
 impl AssignmentHandler for FormFieldAssigneeHandler {
     fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
-        // 对齐 Go findFieldValue / Java：f_ 前缀优先、裸名兜底（issues/71 跨语言顺序）。
+        // 对齐 Go findFieldValue / Java：f_ 前缀优先、裸名兜底（issues/71 跨语言顺序），
+        // 再去编号后缀（issues/255 补齐——此档此前只有 rust／moon 两语言缺）。
         // 引擎 resume 已把 instance.variables 并入 exec.args（见 engine.rs），
         // 故发起时提交的 f_<nodeId> 在此可达（L3 S11-B）。
         if let Some(node) = &exec.current_node {
@@ -144,6 +148,11 @@ impl AssignmentHandler for FormFieldAssigneeHandler {
             }
             if let Some(val) = exec.args.get_str(&node.id) {
                 return Ok(val.to_string());
+            }
+            if let Some(base) = number_suffix_base(&node.id) {
+                if let Some(val) = exec.args.get_str(&base) {
+                    return Ok(val.to_string());
+                }
             }
         }
         Ok(String::new())
@@ -731,6 +740,26 @@ mod form_user_tests {
         let legacy = FormFieldAssigneeHandler
             .assign(&exec("manager#userId", args(&[("f_userId", "emp")]))).unwrap();
         assert_eq!(legacy, "", "老类没有 # 档 ⇒ 同一入参应读不到");
+    }
+
+    /// issues/255：老类的第三档＝`_NN` 去后缀后查**裸名 base**（补齐前 rust 只有两档）。
+    #[test]
+    fn legacy_handler_number_suffix_tier() {
+        let legacy = |node: &str, a: FlowData| {
+            FormFieldAssigneeHandler.assign(&exec(node, a)).unwrap()
+        };
+        // 正向：task_01 ＋ 变量 task ⇒ 命中 base
+        assert_eq!(legacy("task_01", args(&[("task", "userA,userB")])), "userA,userB");
+        // 惰性量词的最早可切点：a_b_01 的 base 是 a_b，不是 a
+        assert_eq!(legacy("a_b_01", args(&[("a", "userX"), ("a_b", "userC")])), "userC");
+        // 优先级：f_<nodeId> → 裸名 → base 裸名
+        assert_eq!(legacy("task_01", args(&[("f_task_01", "u1"), ("task_01", "u2"), ("task", "u3")])), "u1");
+        assert_eq!(legacy("task_01", args(&[("task_01", "u2"), ("task", "u3")])), "u2");
+        // 反向：尾锚非数字／base 为空都不命中
+        assert_eq!(legacy("task_01x", args(&[("task", "u3")])), "");
+        assert_eq!(legacy("_01", args(&[("", "u3")])), "");
+        // 第三档只查裸名：f_<base> 是 issues/254 新类的扩面，老类不许跟着扩
+        assert_eq!(legacy("task_02", args(&[("f_task", "u3")])), "");
     }
 
     #[test]
