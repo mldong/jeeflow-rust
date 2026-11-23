@@ -187,6 +187,22 @@ impl HandlerRegistry {
             group: "built-in".into(),
         });
 
+        self.handlers.push(HandlerMeta {
+            handler_type: ah.into(),
+            class_name: "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler".into(),
+            display_name: "表单指定用户所属部门经理".into(),
+            order: 70,
+            group: "built-in".into(),
+        });
+
+        self.handlers.push(HandlerMeta {
+            handler_type: ah.into(),
+            class_name: "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler".into(),
+            display_name: "表单指定用户所属部门分管领导".into(),
+            order: 80,
+            group: "built-in".into(),
+        });
+
         // Default ActionPermissionProvider
         self.handlers.push(HandlerMeta {
             handler_type: "ActionPermissionProvider".into(),
@@ -296,7 +312,7 @@ mod tests {
     fn test_handler_registry() {
         let reg = HandlerRegistry::new();
         let handlers = reg.list_handlers("AssignmentHandler");
-        assert_eq!(handlers.len(), 7);
+        assert_eq!(handlers.len(), 9);
         // First should be OperatorAssignmentHandler (order=-9999)
         assert_eq!(handlers[0].order, -9999);
         assert!(handlers[0].class_name.contains("OperatorAssignmentHandler"));
@@ -332,6 +348,6 @@ mod tests {
             group: "custom".into(),
         });
         let handlers = reg.list_handlers("AssignmentHandler");
-        assert_eq!(handlers.len(), 8); // 7 built-in + 1 custom
+        assert_eq!(handlers.len(), 10); // 9 built-in + 1 custom
     }
 }
