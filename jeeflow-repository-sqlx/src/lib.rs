@@ -451,6 +451,11 @@ const TASK_MAIN_COLS: &[&str] = &["id", "task_name", "display_name", "task_type"
 const PI_TASK_COLS: &[&str] = &["process_define_id", "state", "operator", "business_no"];
 const PD_COLS: &[&str] = &["name", "display_name", "version"];
 
+// issues/257：子流程定义查询。SQL 文本显式保留 state 列但不作为 WHERE 条件；
+// 缺省版本与显式版本都按 version/id 降序，显式版本再由 WHERE 精确收口。
+const SUB_PROCESS_DEFINE_LATEST_SQL: &str = "SELECT id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user FROM wf_process_define WHERE name = ? ORDER BY version DESC, id DESC LIMIT 1";
+const SUB_PROCESS_DEFINE_EXACT_SQL: &str = "SELECT id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user FROM wf_process_define WHERE name = ? AND version = ? ORDER BY version DESC, id DESC LIMIT 1";
+
 /// define/design 表无别名 → 裸列名（仅 t.*）
 fn resolve_bare_col<'a>(cols: &'a [&'a str]) -> impl Fn(&str, &str) -> Option<String> + 'a {
     move |alias, column| {
@@ -711,6 +716,44 @@ impl ProcessRepository for SqlxRepository {
             .await
             .map_err(|e| JeeflowError::Internal(e.to_string()))?;
 
+            Ok(row.map(|r| ProcessDefine {
+                id: r.get("id"),
+                name: r.get("name"),
+                display_name: r.get("display_name"),
+                define_type: r.get("type"),
+                state: r.get("state"),
+                content: r.get::<Vec<u8>, _>("content"),
+                version: r.get("version"),
+                create_time: get_opt_datetime(&r, "create_time"),
+                create_user: r.get("create_user"),
+                update_time: get_opt_datetime(&r, "update_time"),
+                update_user: r.get("update_user"),
+            }))
+        }))
+    }
+
+    fn find_define_by_name_and_version(
+        &self,
+        name: &str,
+        version: Option<i32>,
+    ) -> JeeflowResult<Option<ProcessDefine>> {
+        if name.trim().is_empty() {
+            return Ok(None);
+        }
+        self.with_exec(|mut exec| self.block_on(async {
+            // issues/257：与顶层按 id 启动同口径，不额外过滤 state；缺省版本取
+            // version desc、id desc 最新一条，显式版本精确匹配。
+            let sql = if version.is_some() {
+                SUB_PROCESS_DEFINE_EXACT_SQL
+            } else {
+                SUB_PROCESS_DEFINE_LATEST_SQL
+            };
+            let mut query = sqlx::query(sql).bind(name);
+            if let Some(version) = version {
+                query = query.bind(version);
+            }
+            let row = query.fetch_optional(exec.reborrow()).await
+                .map_err(|e| JeeflowError::Internal(e.to_string()))?;
             Ok(row.map(|r| ProcessDefine {
                 id: r.get("id"),
                 name: r.get("name"),
@@ -1864,6 +1907,19 @@ impl ProcessExtRepository for SqlxRepository {
 
 #[cfg(test)]
 mod tests {
+    /// issues/257 定向 SQL 契约：不连 DB，钉住选版顺序与“无额外 state 过滤”。
+    #[test]
+    fn i257_sub_process_define_lookup_sql_contract() {
+        for sql in [SUB_PROCESS_DEFINE_LATEST_SQL, SUB_PROCESS_DEFINE_EXACT_SQL] {
+            assert!(sql.contains("ORDER BY version DESC, id DESC LIMIT 1"));
+            let where_clause = sql.split(" WHERE ").nth(1).unwrap()
+                .split(" ORDER BY ").next().unwrap();
+            assert!(!where_clause.contains("state"), "子流程查询不得额外过滤 state: {sql}");
+        }
+        assert!(SUB_PROCESS_DEFINE_LATEST_SQL.contains("WHERE name = ? ORDER BY"));
+        assert!(SUB_PROCESS_DEFINE_EXACT_SQL.contains("WHERE name = ? AND version = ? ORDER BY"));
+    }
+
     #[test]
     fn test_page_bounds_defaults() {
         let q = PageQuery::new(0, 0);

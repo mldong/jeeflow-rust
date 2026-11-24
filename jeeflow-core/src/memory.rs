@@ -199,6 +199,21 @@ impl ProcessRepository for MemoryRepository {
         Ok(defines.get(&define_id).cloned())
     }
 
+    fn find_define_by_name_and_version(
+        &self,
+        name: &str,
+        version: Option<i32>,
+    ) -> JeeflowResult<Option<ProcessDefine>> {
+        if name.trim().is_empty() {
+            return Ok(None);
+        }
+        let defines = self.defines.lock().unwrap();
+        Ok(defines.values()
+            .filter(|d| d.name == name && version.map(|v| d.version == v).unwrap_or(true))
+            .max_by(|a, b| (a.version, a.id).cmp(&(b.version, b.id)))
+            .cloned())
+    }
+
     fn save_define(&self, define: &mut ProcessDefine) -> JeeflowResult<()> {
         if define.id == 0 { define.id = self.next_id(); }
         let mut defines = self.defines.lock().unwrap();

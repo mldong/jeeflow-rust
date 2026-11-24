@@ -29,8 +29,11 @@ pub struct Execution {
     pub args: FlowData,
     pub operator: String,
     pub is_merged: bool,
-    /// New tasks created during this execution step.
+    /// New tasks created during this execution step and not yet persisted by this execution.
     pub new_tasks: Vec<ProcessTask>,
+    /// 已由嵌套执行链（例如子流程办结回父）持久化的任务，只参与结果返回，
+    /// **不得再进入 `persist_tasks`**，否则会重复 INSERT/重复 fire TASK_START（issues/257）。
+    pub persisted_tasks: Vec<ProcessTask>,
     /// Whether the instance was finished/rejected during this step.
     pub instance_finished: bool,
     /// Gate variables for countersign expression evaluation (nrOfInstances, etc.)
@@ -57,6 +60,33 @@ enum JumpTarget<'a> {
     RollbackLineage,
 }
 
+/// 子流程 operator 取真实触发人；当前执行为 auto/admin 时回退父实例 operator。
+fn real_operator(operator: &str, parent: &ProcessInstance) -> String {
+    if operator.eq_ignore_ascii_case("flow.auto") || operator.eq_ignore_ascii_case("flow.admin") {
+        parent.operator.clone()
+    } else {
+        operator.to_string()
+    }
+}
+
+/// 子流程复制父业务参数并剥除父提交/路由上下文（issues/257 裁决 D）。
+fn child_args(parent_args: &FlowData) -> FlowData {
+    let mut args = parent_args.clone();
+    args.remove("submitType");
+    args.remove("f_nextNodeOperator");
+    args.remove("tf_nextNodeOperator");
+    args.remove("_branchCtx");
+    args.remove("_reapplyContext");
+    let transient: Vec<String> = args.iter()
+        .filter(|(k, _)| k.starts_with("tf_"))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in transient {
+        args.remove(&key);
+    }
+    args
+}
+
 impl Execution {
     pub fn new(instance: ProcessInstance, model: ProcessModel,
                define: ProcessDefine, operator: &str, args: FlowData) -> Self {
@@ -71,10 +101,34 @@ impl Execution {
             operator: operator.to_string(),
             is_merged: false,
             new_tasks: Vec::new(),
+            persisted_tasks: Vec::new(),
             instance_finished: false,
             gate_vars: FlowData::new(),
             add_sign_operators: Vec::new(),
         }
+    }
+
+    /// 登记已落库任务（嵌套子流程腿专用），按 task_id 去重。
+    pub fn add_persisted_tasks(&mut self, tasks: impl IntoIterator<Item = ProcessTask>) {
+        for task in tasks {
+            if task.task_id == 0 {
+                continue;
+            }
+            if !self.persisted_tasks.iter().any(|t| t.task_id == task.task_id) {
+                self.persisted_tasks.push(task);
+            }
+        }
+    }
+
+    /// 本次动作返回的任务：未落库的新任务＋嵌套腿已落库任务，按 task_id 去重。
+    pub fn result_tasks(&self) -> Vec<ProcessTask> {
+        let mut out = self.new_tasks.clone();
+        for task in &self.persisted_tasks {
+            if !out.iter().any(|t| t.task_id == task.task_id) {
+                out.push(task.clone());
+            }
+        }
+        out
     }
 }
 
@@ -479,23 +533,58 @@ impl JeeflowEngineImpl {
             NodeType::End => {
                 self.fire_pre_interceptors(exec)?;
 
-                // Check if instance should finish or reject
+                // issues/257：当前聚合根优先，合并仓储中尚未进入聚合的 DOING 任务。
+                // 会签合并/拒绝刚改掉的兄弟任务尚未落库，只查仓储会误判成进行中。
+                let mut active: Vec<ProcessTask> = exec.process_instance.get_doing_tasks()
+                    .into_iter().cloned().collect();
+                let known_ids: Vec<i64> = exec.process_instance.tasks.iter().map(|t| t.task_id).collect();
+                for task in self.repo().find_doing_tasks(exec.process_instance.instance_id, &[])? {
+                    if !known_ids.contains(&task.task_id) {
+                        active.push(task);
+                    }
+                }
+                if active.iter().any(|t| TaskType::from_code(t.task_type) != TaskType::Assistant) {
+                    return Err(JeeflowError::Business("存在未完成的主办任务,请确认.".to_string()));
+                }
+                let active_ids: Vec<i64> = active.iter().map(|t| t.task_id).collect();
+                for task in active {
+                    let mut args = exec.args.clone();
+                    args.insert_i64("submitType", SubmitType::Agree.code());
+                    // 当前 End 可能正持有本实例的进程内互斥锁；协办自动办结必须走
+                    // 内部核，不能经公开入口再次获取同一把非重入锁（issues/257）。
+                    self.execute_task_locked(task.task_id, "flow.auto", &args)?;
+                }
+                if !active_ids.is_empty() {
+                    let refreshed = self.repo().find_instance_by_id(exec.process_instance.instance_id)?
+                        .ok_or(JeeflowError::InstanceNotFound(exec.process_instance.instance_id))?;
+                    for task in refreshed.tasks {
+                        let index = exec.process_instance.tasks.iter()
+                            .position(|t| t.task_id == task.task_id);
+                        if active_ids.contains(&task.task_id) || index.is_none() {
+                            match index {
+                                Some(i) => exec.process_instance.tasks[i] = task,
+                                None => exec.process_instance.tasks.push(task),
+                            }
+                        }
+                    }
+                    let mut variables = refreshed.variables;
+                    variables.merge(&exec.process_instance.variables);
+                    exec.process_instance.variables = variables;
+                }
+
+                let submit_type = exec.args.get_i64("submitType")
+                    .or_else(|| exec.args.get_str("submitType").and_then(|s| s.parse::<i64>().ok()));
                 let has_reject_var = exec.args.get_str("reject").map(|v| v == "true").unwrap_or(false);
-                if has_reject_var {
+                if has_reject_var || submit_type == Some(SubmitType::Reject.code()) {
                     exec.process_instance.reject();
                 } else {
                     exec.process_instance.finish();
                 }
                 exec.instance_finished = true;
 
-                // Persist
+                // 终态先落库，再播事件；随后才回父推进，保证子 END 事件先于父后继 TASK_START。
                 self.repo().update_instance(&exec.process_instance)?;
-                // 实例终态 ⇒ 取消该实例 pending 提醒/自动行（CALLBACK 表示既成事实，不取消）
                 self.cancel_instance_time_actions(exec.process_instance.instance_id)?;
-
-                // Fire event（2 PROCESS_INSTANCE_END）：实例 state 落库为终态之后 fire，
-                // 载荷带落库后的 `state` 整数（规范 11 §11.3 码 2「直传载荷键」）。
-                // 办结与拒绝**共用这一支**、规范名不拆（§11.6），下游按 state 分。
                 let mut data = FlowData::new();
                 data.insert_i64("instanceId", exec.process_instance.instance_id);
                 data.insert_i64("state", exec.process_instance.state as i64);
@@ -504,18 +593,144 @@ impl JeeflowEngineImpl {
                 ProcessPublisher::notify(&event, &self.ctx.event_listeners);
 
                 self.fire_post_interceptors(exec)?;
+                let resumed = self.resume_parent_after_end(&exec.process_instance, &exec.operator)?;
+                exec.add_persisted_tasks(resumed);
             }
             NodeType::SubProcess => {
-                // Start sub-process
-                if let Some(_sub_define_name) = node.sub_process_name() {
-                    // Look up define by name — would need find_define_by_name
-                    // For now, create a simplified sub-process
-                    let _sub_args = FlowData::new();
-                    // Sub-process handling is complex; simplified for now
-                }
+                self.start_sub_process(exec, node)?;
             }
         }
 
+        Ok(())
+    }
+
+    /// 子流程启动腿（issues/257 裁决 A/D）。
+    ///
+    /// 子实例与其初始任务全部由自己的执行链落库、发事件；这里只把**已持久化**任务
+    /// 登记到父 execution 的结果集，绝不放进 `new_tasks` 再走一次父级 `persist_tasks`。
+    fn start_sub_process(&self, exec: &mut Execution, node: &NodeModel) -> JeeflowResult<()> {
+        let sub = node.sub_process_model();
+        let define = self.require_sub_process_define(&sub)?;
+        let parent_id = exec.process_instance.instance_id;
+        let parent_node_name = node.id.clone();
+        let operator = real_operator(&exec.operator, &exec.process_instance);
+        let child_args = child_args(&exec.args);
+        let parent_tasks_before: Vec<i64> = self.repo()
+            .find_doing_tasks(parent_id, &[])?.into_iter().map(|t| t.task_id).collect();
+        // 子流程可能同步办结并回父；嵌套前先持久化父聚合，后续重读才不会覆盖
+        // 本次拦截器/自定义节点刚写入但尚未显式保存的变量与任务状态。
+        self.repo().update_instance(&exec.process_instance)?;
+
+        let child = self.start_with_parent_sync(
+            define.id, &operator, &child_args, parent_id, &parent_node_name)?;
+        let mut persisted = self.apply_initial_tasks(
+            child.instance_id, &operator, &child_args)?;
+        persisted.extend(self.repo().find_doing_tasks(child.instance_id, &[])?);
+        for task in self.repo().find_doing_tasks(parent_id, &[])? {
+            if !parent_tasks_before.contains(&task.task_id) {
+                persisted.push(task);
+            }
+        }
+        exec.add_persisted_tasks(persisted);
+
+        // 子流程可能已同步办结并回父推进；父聚合必须取仓储最新副本，否则外层收尾
+        // 会把父变量/状态写回旧快照。父后继任务已由回父腿落库，这里只刷新副本。
+        exec.process_instance = self.repo().find_instance_by_id(parent_id)?
+            .ok_or(JeeflowError::InstanceNotFound(parent_id))?;
+        Ok(())
+    }
+
+    /// 顶层 `startAndExecute` 与子流程共用的初始 DOING 快照自办腿。
+    ///
+    /// 顺序固定：逐任务 `add_task_actor(applicant)` → `submitType=0` → `flow.auto` 办理。
+    /// 无 apply 的流程同样自办首任务；`f_nextNodeOperator` 仅在发起自办时转成
+    /// `tf_nextNodeOperator`，与既有门面契约一致。
+    pub fn apply_initial_tasks(
+        &self,
+        instance_id: i64,
+        applicant: &str,
+        args: &FlowData,
+    ) -> JeeflowResult<Vec<ProcessTask>> {
+        let tasks = self.repo().find_doing_tasks(instance_id, &[])?;
+        let mut created = Vec::new();
+        for task in tasks {
+            self.repo().add_task_actor(task.task_id, &[applicant.to_string()])?;
+            let mut apply_args = args.clone();
+            apply_args.insert_i64("submitType", SubmitType::Apply.code());
+            if let Some(next) = apply_args.get("f_nextNodeOperator").cloned() {
+                apply_args.insert("tf_nextNodeOperator".to_string(), next);
+            }
+            created.extend(self.execute_task_sync(task.task_id, "flow.auto", &apply_args)?);
+        }
+        Ok(created)
+    }
+
+    /// 子流程终态落库并播 END 后回父一次（issues/257）。
+    ///
+    /// 父任务只使用父定义/父模型与父持久化变量；不把子任务并入父聚合，也不复用子的
+    /// `submitType/tf_*`。父节点不存在或已不是 SubProcess 时静默结束回父腿（同 Java）。
+    fn resume_parent_after_end(
+        &self,
+        child: &ProcessInstance,
+        operator: &str,
+    ) -> JeeflowResult<Vec<ProcessTask>> {
+        let Some(parent_id) = child.parent_id else { return Ok(Vec::new()) };
+        let Some(mut parent) = self.repo().find_instance_by_id(parent_id)? else {
+            return Ok(Vec::new());
+        };
+        let Some(define) = self.repo().find_define_by_id(parent.define_id)? else {
+            return Ok(Vec::new());
+        };
+        let model = ModelParser::parse(&define.content_str())?;
+        let Some(parent_node_name) = child.parent_node_name.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Some(parent_node) = model.get_node(parent_node_name).cloned() else {
+            return Ok(Vec::new());
+        };
+        if parent_node.node_type != NodeType::SubProcess {
+            return Ok(Vec::new());
+        }
+
+        let operator = real_operator(operator, child);
+        let mut parent_exec = Execution::new(
+            parent.clone(), model, define, &operator, parent.variables.clone());
+        parent_exec.current_node = Some(parent_node.clone());
+        let next_nodes: Vec<NodeModel> = parent_exec.process_model
+            .get_output_edges(&parent_node.id).iter()
+            .filter_map(|e| target_node_or_warn(&parent_exec.process_model, &parent_node.id, e))
+            .collect();
+        self.fire_pre_interceptors(&mut parent_exec)?;
+        for next in next_nodes {
+            self.execute_node(&mut parent_exec, &next)?;
+        }
+        self.fire_post_interceptors(&mut parent_exec)?;
+        self.persist_tasks(&mut parent_exec)?;
+        parent = parent_exec.process_instance.clone();
+        self.repo().update_instance(&parent)?;
+        Ok(parent_exec.result_tasks())
+    }
+
+    fn require_sub_process_define(&self, sub: &SubProcessModel)
+        -> JeeflowResult<ProcessDefine> {
+        self.repo().find_define_by_name_and_version(&sub.process_name, sub.version)?
+            .ok_or_else(|| JeeflowError::SubProcessDefineNotFound(sub.process_name.clone()))
+    }
+
+    /// 当前任务的所有直接出边子流程目标做只读预检（issues/257）。
+    /// 必须排在任务办结/状态写入之前，内存仓无回滚时才能保证缺失定义零写入。
+    fn validate_sub_process_targets(
+        &self,
+        model: &ProcessModel,
+        current: &NodeModel,
+    ) -> JeeflowResult<()> {
+        for edge in model.get_output_edges(&current.id) {
+            if let Some(target) = model.get_target_node(edge) {
+                if target.node_type == NodeType::SubProcess {
+                    self.require_sub_process_define(&target.sub_process_model())?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1426,6 +1641,10 @@ impl JeeflowEngineImpl {
         let define = self.repo().find_define_by_id(instance.define_id)?
             .ok_or(JeeflowError::DefineNotFound(instance.define_id))?;
         let model = ModelParser::parse(&define.content_str())?;
+        // issues/257：直接出边的子流程定义缺失必须在当前任务办结前报错（内存零写入）。
+        if let Some(current) = model.get_node(&task.task_name) {
+            self.validate_sub_process_targets(&model, current)?;
+        }
 
         // 4. Build args + user info (sync)
         // resume 语义对齐 Go mergeVars(args, inst.Variables)：以实例已持久化变量为底、
@@ -1515,7 +1734,7 @@ impl JeeflowEngineImpl {
             exec.process_task = Some(task.clone());
             self.persist_tasks(&mut exec)?;
             self.repo().update_instance(&exec.process_instance)?;
-            return Ok(exec.new_tasks);
+            return Ok(exec.result_tasks());
         }
 
         // 8. Find the node for this task
@@ -1607,7 +1826,7 @@ impl JeeflowEngineImpl {
                     // Persist + return (no edge follow)
                     self.persist_tasks(&mut exec)?;
                     self.repo().update_instance(&exec.process_instance)?;
-                    return Ok(exec.new_tasks);
+                    return Ok(exec.result_tasks());
                 } else {
                     // Last person → merged, fall through to 10b
                     self.abandon_countersign_remaining(&mut exec, node_id)?;
@@ -1642,7 +1861,7 @@ impl JeeflowEngineImpl {
                         // Not merged → return without following edges
                         self.persist_tasks(&mut exec)?;
                         self.repo().update_instance(&exec.process_instance)?;
-                        return Ok(exec.new_tasks);
+                        return Ok(exec.result_tasks());
                     }
                 } else {
                     // No condition (or ONE_VOTE_VETO without veto hit) → all must finish
@@ -1655,7 +1874,7 @@ impl JeeflowEngineImpl {
                         // Not all finished → return without following edges
                         self.persist_tasks(&mut exec)?;
                         self.repo().update_instance(&exec.process_instance)?;
-                        return Ok(exec.new_tasks);
+                        return Ok(exec.result_tasks());
                     }
                 }
             }
@@ -1727,7 +1946,7 @@ impl JeeflowEngineImpl {
         self.persist_tasks(&mut exec)?;
         self.repo().update_instance(&exec.process_instance)?;
 
-        Ok(exec.new_tasks)
+        Ok(exec.result_tasks())
     }
 
     // ═══ 后加签（可重复）· 推进闸与同节点续建（基准 java `handler/impl/AddSignHandler`）═══
@@ -1951,7 +2170,7 @@ impl JeeflowEngineImpl {
 
         self.persist_tasks(&mut exec)?;
         self.repo().update_instance(&exec.process_instance)?;
-        Ok(exec.new_tasks)
+        Ok(exec.result_tasks())
     }
 
     /// `submitType=6` 的直返落点（提交入口在完成来源任务后调用）：在原实例里给**发起人**
@@ -2091,6 +2310,9 @@ impl JeeflowEngineImpl {
         let define = self.repo().find_define_by_id(instance.define_id)?
             .ok_or(JeeflowError::DefineNotFound(instance.define_id))?;
         let model = ModelParser::parse(&define.content_str())?;
+        if let Some(current) = model.get_node(&task.task_name) {
+            self.validate_sub_process_targets(&model, current)?;
+        }
 
         // audit8 R86（issues/209 §3.2）：跳转目标节点名**在任何状态变更前**校验。
         // 六栈（java/go/py/node/php/csharp）的报错点在 prepare 之后，靠外层事务回滚兜住
@@ -2245,7 +2467,7 @@ impl JeeflowEngineImpl {
         self.persist_tasks(&mut exec)?;
         self.repo().update_instance(&exec.process_instance)?;
 
-        Ok(exec.new_tasks)
+        Ok(exec.result_tasks())
     }
 
     /// Async execute and jump to end (reject)（签名保留）。
@@ -2285,6 +2507,9 @@ impl JeeflowEngineImpl {
         // issues/183（audit8 R17）：本入口原不解析 model（`let _define` 丢弃）；入口字段权限
         // 过滤需要当前节点的 `properties.field`，补解析（对齐 java 该入口也走 prepareExecution 的形状）。
         let model = ModelParser::parse(&define.content_str())?;
+        if let Some(current) = model.get_node(&task.task_name) {
+            self.validate_sub_process_targets(&model, current)?;
+        }
 
         // resume 语义对齐 Go mergeVars（同 execute_task_async，三路径保持一致）。
         // issues/183（audit8 R17）：同 execute_task_sync 的入口字段权限过滤（java 同位 :264）。
@@ -2353,31 +2578,40 @@ impl JeeflowEngineImpl {
         self.notify_task_outcome(ProcessEventType::TaskReject,
                                  instance.instance_id, task_id, operator, submit_type);
 
-        // Reject the instance
-        instance.reject();
-        instance.abandon_all_doing();
-
-        self.repo().update_instance(&instance)?;
-        self.cancel_instance_time_actions(instance.instance_id)?;
-
-        // Abandon all doing tasks
-        for task in &instance.tasks {
-            if task.task_state == TaskState::Doing.code() {
-                self.repo().update_task(task)?;
+        // issues/257：拒绝也复用 End 节点收口（与 Java executeAndJumpToEnd 一致），
+        // 从而共享“未完成主办任务拦截／协办自动办结／终态落库后播 END／回父一次”。
+        let end = model.nodes.iter()
+            .find(|n| n.node_type == NodeType::End)
+            .cloned();
+        let mut end_args = full_args.clone();
+        end_args.insert_i64("submitType", SubmitType::Reject.code());
+        let mut exec = Execution::new(instance, model, define, operator, end_args);
+        exec.process_task = Some(task.clone());
+        if let Some(end) = end {
+            self.execute_node(&mut exec, &end)?;
+        } else {
+            // 无 End 节点的非法/历史定义保留旧拒绝形状，避免把拒绝动作静默变成 no-op。
+            let doing: Vec<ProcessTask> = exec.process_instance.get_doing_tasks()
+                .into_iter().cloned().collect();
+            exec.process_instance.reject();
+            exec.process_instance.abandon_all_doing();
+            self.repo().update_instance(&exec.process_instance)?;
+            self.cancel_instance_time_actions(exec.process_instance.instance_id)?;
+            for doing in doing {
+                self.repo().update_task(&doing)?;
             }
+            let mut data = FlowData::new();
+            data.insert_i64("instanceId", exec.process_instance.instance_id);
+            data.insert_i64("state", exec.process_instance.state as i64);
+            let event = ProcessEvent::new(ProcessEventType::ProcessInstanceEnd,
+                                         exec.process_instance.instance_id).with_data(data);
+            ProcessPublisher::notify(&event, &self.ctx.event_listeners);
+            exec.add_persisted_tasks(self.resume_parent_after_end(
+                &exec.process_instance, operator)?);
         }
-
-        // Fire event（合并派：驳回=办结，同 finish 路径 fire ProcessInstanceEnd；
-        // issues/104 §2.3 兑现缺口——execute_and_jump_to_end_async 此前漏 fire）
-        // 载荷带落库后的 state（规范 11 §11.3 码 2），本路径为已拒绝 45。
-        let mut data = FlowData::new();
-        data.insert_i64("instanceId", instance.instance_id);
-        data.insert_i64("state", instance.state as i64);
-        let event = ProcessEvent::new(ProcessEventType::ProcessInstanceEnd,
-                                     instance.instance_id).with_data(data);
-        ProcessPublisher::notify(&event, &self.ctx.event_listeners);
-
-        Ok(Vec::new())
+        self.persist_tasks(&mut exec)?;
+        self.repo().update_instance(&exec.process_instance)?;
+        Ok(exec.result_tasks())
     }
 
     /// Async execute and jump to first task node (return to initiator)（签名保留）。
@@ -4408,16 +4642,16 @@ mod tests {
     #[tokio::test]
     async fn test_c29_jump_flag_injection() {
         let (engine, repo) = make_compliance_engine();
-        let flow = load_flow("13-countersign-one-vote-veto");
+        let flow = load_flow("01-simple");
         let did = save_define(&repo, "cs-jump-flag", &flow);
         let iid = start_and_apply(&engine, &repo, did).await;
         let tasks = repo.find_doing_tasks(iid, &[]).unwrap();
-        let userA_task = tasks.into_iter().find(|t| t.actor_ids.contains(&"userA".to_string())).unwrap();
+        let userA_task = tasks.into_iter().find(|t| t.actor_ids.contains(&"leader".to_string())).unwrap();
 
         // Execute via jump_to_end with submitType=20
         let mut args = FlowData::new();
         args.insert_i64("submitType", 20);
-        engine.execute_and_jump_to_end_async(userA_task.task_id, "userA", &args).await.unwrap();
+        engine.execute_and_jump_to_end_async(userA_task.task_id, "leader", &args).await.unwrap();
 
         // Instance should be rejected (state=45)
         let inst = repo.find_instance_by_id(iid).unwrap().unwrap();

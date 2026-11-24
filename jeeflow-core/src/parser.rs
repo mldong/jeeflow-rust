@@ -83,18 +83,25 @@ impl ProcessModel {
         false
     }
 
-    /// 能否退回到 `parent_id` 所在节点——照 mldong-boot2 `NodeModel.canRejected` 的形状：
-    /// 自 current 的入边递归回溯，只穿越 fork/join/start 三类节点，其余节点即"上一步"本身。
-    /// 与 boot2 同样不带 visited 集（保持语义一致；纯任务节点组成的回环理论上会无限回溯，
-    /// 那是 boot2 继承来的性质，不在这里悄悄改掉判据）。
+    /// 能否退回到 `parent_id` 所在节点——照 Java `NodeModel.canRejected` 的形状：
+    /// 自 current 的入边递归回溯，只穿越 fork/join/start/subprocess 四类节点，其余节点即
+    /// "上一步"本身。父节点为会签任务时不可退；子流程边界不可穿越（issues/257 裁决 B）。
+    /// 与 Java 同样不带 visited 集（纯任务节点组成的回环理论上会无限回溯，保持基准语义）。
     pub fn can_rejected(&self, current_id: &str, parent_id: &str) -> bool {
+        if self.get_node(parent_id).map(|n| {
+            n.node_type == NodeType::SubProcess
+                || (n.node_type == NodeType::Task && n.is_countersign())
+        }).unwrap_or(false) {
+            return false;
+        }
         for edge in self.get_input_edges(current_id) {
             let source = &edge.source_node_id;
             if source == parent_id {
                 return true;
             }
             match self.get_node(source) {
-                Some(n) if matches!(n.node_type, NodeType::Fork | NodeType::Join | NodeType::Start) => continue,
+                Some(n) if matches!(n.node_type,
+                    NodeType::Fork | NodeType::Join | NodeType::Start | NodeType::SubProcess) => continue,
                 Some(_) => {
                     if self.can_rejected(source, parent_id) {
                         return true;
@@ -128,7 +135,7 @@ pub enum NodeType {
     SubProcess,
     /// 类型表里没有的档（issues/142 A 批：把旧 `_ => Custom` 兜底臂拆出来的那一半）。
     ///
-    /// 存在的理由：兜底臂把**任何**未知串（含 `snaker:Custom`／`subProcess` 这类拼错大小写、
+    /// 存在的理由：兜底臂把**任何**未知串（含 `snaker:Custom`／`SUBPROCESS` 这类拼写变体、
     /// 含 `snaker:custom` 本身）一律收成 Custom，而 spec/02 §6.1 把 custom 定性成**记录类**
     /// 之后，"兜底臂 = Custom"就等于"未知节点一律按记录类处理"——正是 §6.1 禁止的形状①
     /// （当任务类建 DOING 行）与 G4 义务 2 点名要防的静默分叉。
@@ -162,13 +169,8 @@ impl NodeType {
     /// 2. **custom 是显式一档**（issues/142 A 批要求拆开的那件事的另一半）：
     ///      只有 `snaker:custom` / `custom` 才是记录类节点，其余未命中一律 Unknown。
     ///
-    /// ⚠️ **子流程的大写两档（`subProcess`／`wfSubProcess`，java
-    /// `Configuration.java:49-52` 注册的真别名）本轮**故意**不落 SubProcess**，
-    /// 与 spec/02 义务 3 暂时分叉。理由不是省事：本栈的 SubProcess 执行腿
-    /// （`engine.rs:442`）目前是**空壳**（只取属性、既不建子实例也不推进），
-    /// 把这两档现在并过去，等于把"记一条 WARNING 后跳过"换成"一声不吭地吞掉节点"
-    /// ——义务 3 的别名要和子流程真实现**同一批**落，否则是在扩大静默面。
-    /// 挂账见 issues/141 G4 待办（补 SubProcess 实现时一并收别名）。
+    /// 子流程三档（`subprocess`／`subProcess`／`wfSubProcess`）同值，均落
+    /// [`NodeType::SubProcess`]（issues/257 与 Java `Configuration` 对齐）。
     ///
     /// 与 java 的一处**有意**差异：java 在解析期就把未知节点**丢掉**（`continue`），
     /// 本栈把节点留在模型里、标成 `Unknown`，由执行腿跳过。两条路的**可观测结果相同**
@@ -185,7 +187,7 @@ impl NodeType {
             "join" => NodeType::Join,
             "end" => NodeType::End,
             "custom" => NodeType::Custom,
-            "subprocess" => NodeType::SubProcess,
+            "subprocess" | "subProcess" | "wfSubProcess" => NodeType::SubProcess,
             _ => NodeType::Unknown,
         }
     }
@@ -208,6 +210,20 @@ impl NodeType {
 // ═══════════════════════════════════════════════════════
 // Node model
 // ═══════════════════════════════════════════════════════
+
+/// 子流程节点模型（issues/257 裁决 A）。
+///
+/// Rust 的流程模型统一由 [`NodeModel`] 承载，因此本结构是子流程节点的专用解析视图，
+/// 不另起一套执行模型。`form` 只保留设计器配置，不参与定义查找。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubProcessModel {
+    /// 目标定义名：`processName` → `properties.name` → 节点 `id`。
+    pub process_name: String,
+    /// 显式版本；缺省/null 时按 version desc、id desc 取最新定义。
+    pub version: Option<i32>,
+    /// 设计器表单配置，仅供回显/扩展使用。
+    pub form: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct NodeModel {
@@ -361,9 +377,23 @@ impl NodeModel {
         perms
     }
 
-    /// Sub-process define name.
-    pub fn sub_process_name(&self) -> Option<String> {
-        self.prop_str("subProcessName")
+    /// 子流程专用模型视图（issues/257）。
+    ///
+    /// 旧键 `subProcessName` 已删除，不再作为兼容分叉；空白的 `processName`/`name`
+    /// 视为缺省并继续回落。版本接受 JSON 数字或数字串，null/缺省为 `None`。
+    pub fn sub_process_model(&self) -> SubProcessModel {
+        let process_name = self.prop_str("processName")
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.prop_str("name").filter(|s| !s.trim().is_empty()))
+            .unwrap_or_else(|| self.id.clone());
+        let version = self.properties.get("version")
+            .and_then(JsonValue::as_i64)
+            .and_then(|v| i32::try_from(v).ok());
+        SubProcessModel {
+            process_name,
+            version,
+            form: self.form_key(),
+        }
     }
 
     /// Is this node a countersign?
@@ -879,6 +909,8 @@ mod tests {
             ("snaker:end", NodeType::End), ("end", NodeType::End),
             ("snaker:custom", NodeType::Custom), ("custom", NodeType::Custom),
             ("snaker:subprocess", NodeType::SubProcess), ("subprocess", NodeType::SubProcess),
+            ("snaker:subProcess", NodeType::SubProcess), ("subProcess", NodeType::SubProcess),
+            ("snaker:wfSubProcess", NodeType::SubProcess), ("wfSubProcess", NodeType::SubProcess),
         ];
         for (raw, want) in cases {
             assert_eq!(NodeType::from_snaker_type(raw), want, "类型串 {raw} 应落 {want:?}");
@@ -890,15 +922,12 @@ mod tests {
     /// 一律"按记录类处理"，而 custom 已经定性成记录类（spec/02 §6.1）⇒ 那是把
     /// "认不出来"当成"认得、而且是记录类"，静默分叉。现在它们落 Unknown。
     ///
-    /// ⚠️ 后三个串（`subProcess`／`snaker:subProcess`／`wfSubProcess`）在 java 是**真别名**，
-    /// 本栈暂落 Unknown 属**有意分叉**，理由与销账条件写在 [`NodeType::from_snaker_type`]
-    /// 的那段"子流程大写两档故意不落 SubProcess"里（本栈 SubProcess 执行腿还是空壳）。
-    /// 这一档**不是**"归一化已完成"的判据，别照它推断大小写归一的状态。
+    /// 子流程三个真别名已落 SubProcess（issues/257），其余拼错/未知串仍落 Unknown。
+    /// 这一档**不是**"大小写归一已完成"的判据。
     #[test]
     fn test_i142_unknown_type_is_not_custom_anymore() {
         for raw in ["snaker:Custom", "snaker:TASK", "SUBPROCESS", "Process",
-                    "snaker:approve", "custom2", "", "snaker:",
-                    "subProcess", "snaker:subProcess", "wfSubProcess"] {
+                    "snaker:approve", "custom2", "", "snaker:"] {
             let got = NodeType::from_snaker_type(raw);
             assert_eq!(got, NodeType::Unknown, "未知串 {raw:?} 必须落 Unknown，实得 {got:?}");
             assert_ne!(got, NodeType::Custom, "未知串 {raw:?} 绝不能再被兜底臂当成记录类");

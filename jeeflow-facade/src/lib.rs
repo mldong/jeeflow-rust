@@ -1113,25 +1113,10 @@ impl JeeflowFacade {
             }
         }
 
-        // 对齐 Java/boot2：自动完成申请节点（assignee=applicant → 发起人）
-        let tasks = self.repo.find_doing_tasks(instance.instance_id, &[])?;
-        for task in &tasks {
-            let _ = self.repo.add_task_actor(task.task_id, &[operator.clone()]);
-            flow_data.insert_i64("submitType", 0); // Apply
-            // f_nextNodeOperator → tf_nextNodeOperator（若有）。
-            // issues/142 B 批 · spec 06 §2.11 表第三行：这一支**原样透传值**（数组形态也要转出去），
-            // 拆形与判据收在引擎消费腿 `parse_actor_ids` 那一枚单点里。旧写法 `get_str` 只认字符串
-            // ⇒ 前端 UserSelect(multiple) 提交的数组在这里整条被静默丢弃（与普查点名的
-            // "消费腿用 get_str＝数组形态整条失效"同一形状，只是长在发起腿上）。
-            if let Some(next_op) = flow_data.get("f_nextNodeOperator").cloned() {
-                flow_data.insert("tf_nextNodeOperator".to_string(), next_op);
-            }
-            // issues/176：spec 04:60-62——apply 节点由 flow.auto 代执行（operator 列=flow.auto，
-            // 不进发起人已办）；u_* 由发起腿留下、引擎对 flow.auto 跳过注入（对齐 boot2 :317）
-            let _ = self
-                .engine
-                .execute_task_sync(task.task_id, "flow.auto", &flow_data)?;
-        }
+        // 对齐 Java/boot2：自动完成初始 DOING 快照（assignee=applicant → 发起人）。
+        // issues/257：与子流程复用核心同一腿，逐任务 add actor → submitType=0 → flow.auto；
+        // 不再在门面另抄一份自办逻辑。
+        let _ = self.engine.apply_initial_tasks(instance.instance_id, &operator, &flow_data)?;
 
         Ok(json!({ "process_instance_id": instance.instance_id }))
     }

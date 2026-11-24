@@ -21,6 +21,41 @@ pub trait ProcessRepository: Send + Sync {
 
     // ═══ Define operations ═══
     fn find_define_by_id(&self, define_id: i64) -> JeeflowResult<Option<ProcessDefine>>;
+    /// 按定义名＋版本查子流程目标（issues/257 裁决 A）。
+    ///
+    /// `version=None` 取 version desc、id desc 最新一条；显式版本精确匹配。
+    /// 与顶层按 id 启动保持一致，**不额外过滤 state**。默认实现复用 `page_defines`，
+    /// 未覆写的第三方仓储保持源码兼容；自带内存/sqlx 仓覆写为直接查询。
+    fn find_define_by_name_and_version(
+        &self,
+        name: &str,
+        version: Option<i32>,
+    ) -> JeeflowResult<Option<ProcessDefine>> {
+        if name.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut query = PageQuery::new(1, i64::MAX / 4);
+        query.filters.push(QueryFilter {
+            alias: "t".into(),
+            op: FilterOp::Eq,
+            column: "name".into(),
+            value: name.to_string(),
+        });
+        if let Some(version) = version {
+            query.filters.push(QueryFilter {
+                alias: "t".into(),
+                op: FilterOp::Eq,
+                column: "version".into(),
+                value: version.to_string(),
+            });
+        }
+        let row = self.page_defines(&query)?.rows.into_iter()
+            .max_by(|a, b| (a.version, a.id).cmp(&(b.version, b.id)));
+        match row {
+            Some(row) => self.find_define_by_id(row.id),
+            None => Ok(None),
+        }
+    }
     fn save_define(&self, define: &mut ProcessDefine) -> JeeflowResult<()>;
     fn update_define(&self, define: &ProcessDefine) -> JeeflowResult<()>;
     fn update_define_state(&self, define_id: i64, state: i32) -> JeeflowResult<()>;

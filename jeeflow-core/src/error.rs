@@ -7,6 +7,10 @@ use std::fmt;
 /// Business failure = 99999999 (spec/06 §2.1).
 pub const ERR_BUSINESS: i64 = 99999999;
 
+/// issues/257 子流程定义缺失的内部错误码（对齐 Java `WfErrEnum.NOT_FOUND_PROCESS_DEFINE`）。
+/// 对外仍走本栈统一业务信封 [`ERR_BUSINESS`]；内部码供引擎/日志侧判别，不拼进 msg。
+pub const ERR_SUB_PROCESS_DEFINE_NOT_FOUND: i64 = 20010002;
+
 /// 内部错误对外只说这一句（issues/137 §3-1 · spec/06 §2.12，八栈同一串**逐字**，不许改措辞）。
 /// 对应 java `JeeflowFacade.INTERNAL_FAILURE_MSG`；原文只进日志与错误链（[`JeeflowError::detail`]）。
 pub const INTERNAL_FAILURE_MSG: &str = "流程处理失败";
@@ -19,6 +23,9 @@ pub enum JeeflowError {
     UnknownAction(String),
     /// Process definition not found
     DefineNotFound(i64),
+    /// 子流程定义不存在（issues/257）：payload 是目标流程名，msg 逐字为
+    /// 「子流程{processName}定义不存在」。
+    SubProcessDefineNotFound(String),
     /// Process instance not found
     InstanceNotFound(i64),
     /// Task not found
@@ -69,6 +76,15 @@ impl JeeflowError {
         ERR_BUSINESS
     }
 
+    /// 引擎内部错误码；没有内部码的变体返回 `None`。该值不替代对外的
+    /// [`Self::code`]（统一 99999999），仅供日志/编排侧定位具体契约错误。
+    pub fn internal_code(&self) -> Option<i64> {
+        match self {
+            JeeflowError::SubProcessDefineNotFound(_) => Some(ERR_SUB_PROCESS_DEFINE_NOT_FOUND),
+            _ => None,
+        }
+    }
+
     /// issues/139：解析类失败的唯一构造口——对外 msg 用基准逐字原文，底层原文只上错误链。
     ///
     /// `msg` 会**原样**成为门面出口的 `msg`（见 [`Self::message`]），调用方负责给它基准文案。
@@ -90,6 +106,7 @@ impl JeeflowError {
             JeeflowError::Business(msg) => msg.clone(),
             JeeflowError::UnknownAction(a) => format!("未知 action: {}", a),
             JeeflowError::DefineNotFound(id) => format!("流程定义不存在: {}", id),
+            JeeflowError::SubProcessDefineNotFound(name) => format!("子流程{}定义不存在", name),
             JeeflowError::InstanceNotFound(id) => format!("流程实例不存在: {}", id),
             JeeflowError::TaskNotFound(id) => format!("任务不存在: {}", id),
             JeeflowError::PermissionDenied(msg) => format!("权限不足: {}", msg),

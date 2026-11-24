@@ -123,7 +123,7 @@ cargo test --workspace                # T0 内存仓（CI 同款，SKIP_MYSQL=1�
 SKIP_MYSQL=0 cargo test --workspace --features mysql-smoke   # T1 本地 160 MySQL 冒烟
 ```
 
-与 Java 版共享同一套流程 JSON 驱动测试（本仓 `flows/` 副本，15 个共享 fixture，
+与 Java 版共享同一套流程 JSON 驱动测试（本仓 `flows/` 副本，全部共享 fixture，
 含会签/一票否决/比例场景；唯一编辑源在 `jeeflow-java` 仓，`flowsdir` 在维护者机器上执行时精确镜像进本仓，单语言用户下载即用）。
 
 ## 演示服务
