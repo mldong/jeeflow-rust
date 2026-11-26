@@ -1,7 +1,7 @@
 //! jeeflow-core: Workflow engine core — zero external dependencies.
 //!
 //! This crate implements the DDD aggregate root, state machine, engine orchestration,
-//! 8 node types, 5 built-in handlers, 7 assignment handlers, event system,
+//! 8 node types, 5 built-in handlers, 11 assignment handlers, event system,
 //! metadata registries, and service locator — all with zero third-party crate dependencies.
 
 pub mod error;

@@ -128,7 +128,7 @@ impl HandlerRegistry {
     }
 
     fn register_built_in(&mut self) {
-        // 7 built-in AssignmentHandlers (registration name = Java FQCN)
+        // 11 built-in AssignmentHandlers (registration name = Java FQCN)
         let ah = "AssignmentHandler";
 
         self.handlers.push(HandlerMeta {
@@ -200,6 +200,22 @@ impl HandlerRegistry {
             class_name: "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler".into(),
             display_name: "表单指定用户所属部门分管领导".into(),
             order: 80,
+            group: "built-in".into(),
+        });
+
+        self.handlers.push(HandlerMeta {
+            handler_type: ah.into(),
+            class_name: "com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler".into(),
+            display_name: "表单指定部门负责人".into(),
+            order: 90,
+            group: "built-in".into(),
+        });
+
+        self.handlers.push(HandlerMeta {
+            handler_type: ah.into(),
+            class_name: "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler".into(),
+            display_name: "表单指定部门分管领导".into(),
+            order: 100,
             group: "built-in".into(),
         });
 
@@ -312,7 +328,7 @@ mod tests {
     fn test_handler_registry() {
         let reg = HandlerRegistry::new();
         let handlers = reg.list_handlers("AssignmentHandler");
-        assert_eq!(handlers.len(), 9);
+        assert_eq!(handlers.len(), 11);
         // First should be OperatorAssignmentHandler (order=-9999)
         assert_eq!(handlers[0].order, -9999);
         assert!(handlers[0].class_name.contains("OperatorAssignmentHandler"));
@@ -348,6 +364,6 @@ mod tests {
             group: "custom".into(),
         });
         let handlers = reg.list_handlers("AssignmentHandler");
-        assert_eq!(handlers.len(), 10); // 9 built-in + 1 custom
+        assert_eq!(handlers.len(), 12); // 11 built-in + 1 custom
     }
 }

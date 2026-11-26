@@ -19,7 +19,7 @@
 | `ActionPermissionProvider` | action 级权限校验（mldong 框架权限码映射点，spec/06 §2.6） | 内置 `DefaultActionPermissionProvider`（放行 11 条 → OR 表 8 条 → 默认派生 `wf:{action 的 / → :}`，与 java 参考实现逐条一致；**空集合＝放行**） |
 | `FlowInterceptor` | 流程节点拦截器（**前置 / 后置两条独立通道**，见下节） | 后置：persist 写库件（`jeeflow-persist`）；前置：无内置件，宿主自挂 |
 | `BizDataReader` | 业务数据读取（persist 回查） | 无 |
-| `AssignmentHandler` | 参与人处理器（`assignmentHandler` 节点属性路由） | 内置 7 个（Applicant / DeptLeader×main / TaskRoleAssignee 等） |
+| `AssignmentHandler` | 参与人处理器（`assignmentHandler` 节点属性路由） | 内置 11 个（含表单指定用户／部门的部门负责人、分管领导处理器） |
 | `DecisionHandler` | 决策处理器 | 内置 |
 | `CandidateHandler` | 候选人处理器 | 内置 |
 | `ProcessEventListener` | 流程事件监听（完成 / 拒绝 / 废弃） | 无 |
@@ -75,13 +75,16 @@ impl UserProvider for MyUserProvider {
 
 ## 组织取人（AssignmentHandler）
 
-节点属性 `"assignmentHandler": "ApplicantDeptLeader"` 路由到对应 handler。
-内置 7 个（1.0.5 全实装，空结果跳过节点——对齐 Java 语义）：
+节点属性 `assignmentHandler` 使用 Java 类全限定名路由到对应 handler。
+内置 11 个（空结果跳过节点——对齐 Java 语义）：
 
-- `Applicant` 发起人
-- `ApplicantDeptLeader` / `ApplicantDeptMainLeader` 发起人部门（主）经理
-- `TaskRoleAssignee` 任务角色
-- `FormFieldAssignee` 表单字段取人（`f_` 前缀优先匹配，裸名回落，`_NN` 后缀去后缀——对齐 Go/Java）
+- `OperatorAssignmentHandler` 发起人
+- `ApplicantDeptLeaderAssignmentHandler` / `ApplicantDeptMainLeaderAssignmentHandler` 发起人部门负责人／分管领导
+- `DeptLeaderAssignmentHandler` / `DeptMainLeaderAssignmentHandler` 当前用户部门负责人／分管领导
+- `TaskRoleAssigneeHandler` 任务角色
+- `FormFieldAssigneeHandler` 表单字段取人（`f_` 前缀优先匹配，裸名回落，`_NN` 后缀去后缀——对齐 Go/Java）
+- `FormUserDeptLeaderAssignmentHandler` / `FormUserDeptMainLeaderAssignmentHandler` 表单指定用户所属部门负责人／分管领导（issues/254）
+- `FormDeptLeaderAssignmentHandler` / `FormDeptMainLeaderAssignmentHandler` 表单指定 1–N 个部门的负责人／分管领导（issues/258）
 - 抄送 `f_ccActors` 数组/字符串双形态解析（`parse_cc_actors`，对齐 Go facade.go:203）
 
 自定义 handler 实现 `AssignmentHandler` trait 后注册进 `HandlerRegistry`
