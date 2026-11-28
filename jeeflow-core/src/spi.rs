@@ -262,6 +262,17 @@ pub trait OrgUserProvider: Send + Sync {
 }
 
 // ═══════════════════════════════════════════════════════
+// IPostUserProvider — issues/259（可选，独立于 OrgUserProvider）
+// ═══════════════════════════════════════════════════════
+
+/// 岗位成员查询 SPI。输入只接受岗位编码，不接受岗位 ID。
+///
+/// 未注册时两枚岗位参与者处理器均返回空结果；岗位不存在或无成员时实现方应返回空列表。
+pub trait PostUserProvider: Send + Sync {
+    fn find_by_post(&self, post_code: &str) -> JeeflowResult<Vec<String>>;
+}
+
+// ═══════════════════════════════════════════════════════
 // IUserSearchProvider — spec/06 §4.3/§6 (v1.2.0)
 // ═══════════════════════════════════════════════════════
 

@@ -17,6 +17,8 @@ pub struct ServiceContext {
     pub ext_repository: Option<Arc<dyn ProcessExtRepository>>,
     pub user_provider: Option<Arc<dyn UserProvider>>,
     pub org_user_provider: Option<Arc<dyn OrgUserProvider>>,
+    /// 岗位成员查询（issues/259，可选）；未注册时岗位 handler 返回空结果。
+    pub post_user_provider: Option<Arc<dyn PostUserProvider>>,
     pub user_search_provider: Option<Arc<dyn UserSearchProvider>>,
     pub json_provider: Option<Arc<dyn JsonProvider>>,
     pub expression_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
@@ -81,6 +83,7 @@ impl ServiceContext {
             ext_repository: None,
             user_provider: None,
             org_user_provider: None,
+            post_user_provider: None,
             user_search_provider: None,
             json_provider: None,
             expression_evaluator: None,
@@ -129,6 +132,12 @@ impl ServiceContext {
 
     pub fn with_org_user_provider(mut self, oup: Arc<dyn OrgUserProvider>) -> Self {
         self.org_user_provider = Some(oup);
+        self
+    }
+
+    /// 注册可选岗位成员 Provider（issues/259）。不注册时岗位 handler 返回空结果。
+    pub fn with_post_user_provider(mut self, pup: Arc<dyn PostUserProvider>) -> Self {
+        self.post_user_provider = Some(pup);
         self
     }
 

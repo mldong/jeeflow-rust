@@ -128,7 +128,7 @@ impl HandlerRegistry {
     }
 
     fn register_built_in(&mut self) {
-        // 11 built-in AssignmentHandlers (registration name = Java FQCN)
+        // 13 built-in AssignmentHandlers (registration name = Java FQCN)
         let ah = "AssignmentHandler";
 
         self.handlers.push(HandlerMeta {
@@ -189,6 +189,14 @@ impl HandlerRegistry {
 
         self.handlers.push(HandlerMeta {
             handler_type: ah.into(),
+            class_name: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskPostAssigneeHandler".into(),
+            display_name: "根据任务节点唯一编码关联岗位分配参与者".into(),
+            order: 65,
+            group: "built-in".into(),
+        });
+
+        self.handlers.push(HandlerMeta {
+            handler_type: ah.into(),
             class_name: "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler".into(),
             display_name: "表单指定用户所属部门经理".into(),
             order: 70,
@@ -216,6 +224,14 @@ impl HandlerRegistry {
             class_name: "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler".into(),
             display_name: "表单指定部门分管领导".into(),
             order: 100,
+            group: "built-in".into(),
+        });
+
+        self.handlers.push(HandlerMeta {
+            handler_type: ah.into(),
+            class_name: "com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler".into(),
+            display_name: "表单指定岗位分配参与者".into(),
+            order: 110,
             group: "built-in".into(),
         });
 
@@ -328,10 +344,37 @@ mod tests {
     fn test_handler_registry() {
         let reg = HandlerRegistry::new();
         let handlers = reg.list_handlers("AssignmentHandler");
-        assert_eq!(handlers.len(), 11);
+        assert_eq!(handlers.len(), 13);
         // First should be OperatorAssignmentHandler (order=-9999)
         assert_eq!(handlers[0].order, -9999);
         assert!(handlers[0].class_name.contains("OperatorAssignmentHandler"));
+    }
+
+    #[test]
+    fn test_i259_post_builtin_rows_and_order() {
+        let reg = HandlerRegistry::new();
+        let handlers = reg.list_handlers("AssignmentHandler");
+        assert_eq!(handlers.len(), 13);
+        let orders: Vec<i32> = handlers.iter().map(|handler| handler.order).collect();
+        assert_eq!(orders, vec![-9999, 10, 20, 30, 40, 50, 60, 65, 70, 80, 90, 100, 110]);
+
+        let task_post = handlers.iter().find(|handler| {
+            handler.class_name == "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskPostAssigneeHandler"
+        }).expect("TaskPost 元数据必须存在");
+        assert_eq!(task_post.display_name, "根据任务节点唯一编码关联岗位分配参与者");
+        assert_eq!(task_post.order, 65);
+        assert_eq!(task_post.handler_type, "AssignmentHandler");
+        assert_eq!(task_post.group, "built-in");
+        assert!(task_post.class_name.contains('$'));
+
+        let form_post = handlers.iter().find(|handler| {
+            handler.class_name == "com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler"
+        }).expect("FormPost 元数据必须存在");
+        assert_eq!(form_post.display_name, "表单指定岗位分配参与者");
+        assert_eq!(form_post.order, 110);
+        assert_eq!(form_post.handler_type, "AssignmentHandler");
+        assert_eq!(form_post.group, "built-in");
+        assert!(!form_post.class_name.contains('$'));
     }
 
     #[test]
@@ -364,6 +407,6 @@ mod tests {
             group: "custom".into(),
         });
         let handlers = reg.list_handlers("AssignmentHandler");
-        assert_eq!(handlers.len(), 12); // 11 built-in + 1 custom
+        assert_eq!(handlers.len(), 14); // 13 built-in + 1 custom
     }
 }

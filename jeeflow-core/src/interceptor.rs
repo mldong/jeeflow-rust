@@ -1,4 +1,4 @@
-//! Interceptors — 11 built-in AssignmentHandlers + field permission filtering.
+//! Interceptors — 13 built-in AssignmentHandlers + field permission filtering.
 //! Registration names = Java FQCN (cross-language flow JSON compatibility).
 
 use crate::context::ServiceContext;
@@ -6,12 +6,12 @@ use crate::engine::Execution;
 use crate::error::JeeflowResult;
 use crate::json::{FlowData, JsonValue};
 use crate::parser::{NodeType, ProcessModel};
-use crate::spi::{AssignmentHandler, OrgUserProvider, UserProvider};
+use crate::spi::{AssignmentHandler, OrgUserProvider, PostUserProvider, UserProvider};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════
-// 11 Built-in AssignmentHandlers
+// 13 Built-in AssignmentHandlers
 // ═══════════════════════════════════════════════════════
 
 /// 1. OperatorAssignmentHandler — returns the process initiator.
@@ -179,6 +179,31 @@ impl AssignmentHandler for TaskRoleAssigneeHandler {
     }
 }
 
+/// issues/259：任务节点唯一编码关联岗位（postCode = node id）。
+///
+/// 与 TaskRole 同形：保留 Provider 返回顺序；节点为空、SPI 未注册、岗位无成员或查询失败均返回空串。
+pub struct TaskPostAssigneeHandler {
+    post: Option<Arc<dyn PostUserProvider>>,
+}
+
+impl AssignmentHandler for TaskPostAssigneeHandler {
+    fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
+        let Some(node) = &exec.current_node else {
+            return Ok(String::new());
+        };
+        if node.id.is_empty() {
+            return Ok(String::new());
+        }
+        let Some(post) = &self.post else {
+            return Ok(String::new());
+        };
+        match post.find_by_post(&node.id) {
+            Ok(v) if !v.is_empty() => Ok(v.join(",")),
+            _ => Ok(String::new()),
+        }
+    }
+}
+
 /// 8. FormUserDeptLeaderAssignmentHandler — leader of the department of **the user named in the form**.
 ///
 /// 场景（参照 mldong-fastapi-wf 提交 fe9233d）：HR 代员工提交、代理申请——表单里给出被代理人的
@@ -223,6 +248,47 @@ pub struct FormDeptMainLeaderAssignmentHandler {
 impl AssignmentHandler for FormDeptMainLeaderAssignmentHandler {
     fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
         Ok(self.base.by_form_dept(exec, true))
+    }
+}
+
+/// issues/259：表单指定 1–N 个岗位，逐岗位取成员。
+///
+/// 字段查找沿用 issues/254/258 的四档并集；字符串拆英文逗号，数组逐元素且不二次拆。
+/// 岗位编码与最终 userId 均保序去重；单个岗位失败只跳过该岗位。
+pub struct FormPostAssignmentHandler {
+    post: Option<Arc<dyn PostUserProvider>>,
+}
+
+impl AssignmentHandler for FormPostAssignmentHandler {
+    fn assign(&self, exec: &Execution) -> JeeflowResult<String> {
+        let Some(node) = &exec.current_node else {
+            return Ok(String::new());
+        };
+        if node.id.is_empty() {
+            return Ok(String::new());
+        }
+        let post_codes = form_post_codes(find_form_user_field_value(&exec.args, &node.id));
+        if post_codes.is_empty() {
+            return Ok(String::new());
+        }
+        let Some(post) = &self.post else {
+            return Ok(String::new());
+        };
+
+        let mut result: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
+        for post_code in post_codes {
+            let Ok(user_ids) = post.find_by_post(&post_code) else {
+                continue;
+            };
+            for user_id in user_ids {
+                let id = user_id.trim();
+                if !id.is_empty() && seen.insert(id.to_string()) {
+                    result.push(id.to_string());
+                }
+            }
+        }
+        Ok(result.join(","))
     }
 }
 
@@ -393,6 +459,40 @@ fn form_dept_ids(value: Option<&JsonValue>) -> Vec<String> {
     result
 }
 
+/// issues/259 岗位编码标量转换。数字按字面读（`0` 合法），对象／嵌套集合没有编码形状。
+fn json_post_scalar_to_string(v: &JsonValue) -> String {
+    match v {
+        JsonValue::Str(s) => s.clone(),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Null | JsonValue::Array(_) | JsonValue::Object(_) => String::new(),
+    }
+}
+
+/// 字符串按英文逗号拆；数组逐元素读取且不二次拆逗号。trim、丢空、岗位编码去重均保序。
+fn form_post_codes(value: Option<&JsonValue>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let tokens: Vec<String> = match value.as_array() {
+        Some(items) => items.iter().map(json_post_scalar_to_string).collect(),
+        None => json_post_scalar_to_string(value)
+            .split(',')
+            .map(str::to_string)
+            .collect(),
+    };
+
+    let mut result: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    for token in tokens {
+        let code = token.trim();
+        if !code.is_empty() && seen.insert(code.to_string()) {
+            result.push(code.to_string());
+        }
+    }
+    result
+}
+
 // ═══════════════════════════════════════════════════════
 // Field permission filtering
 // ═══════════════════════════════════════════════════════/// Filter fields by permission settings (spec/09 §4.2).
@@ -467,6 +567,7 @@ pub fn register_builtin_assignment_handlers(ctx: &mut ServiceContext) {
     let dept_base = FormDeptAssignBase {
         org: ctx.org_user_provider.clone(),
     };
+    let post_provider = ctx.post_user_provider.clone();
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler",
         Arc::new(OperatorAssignmentHandler));
@@ -488,6 +589,10 @@ pub fn register_builtin_assignment_handlers(ctx: &mut ServiceContext) {
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler",
         Arc::new(TaskRoleAssigneeHandler { org: ctx.org_user_provider.clone() }));
+    // issues/259：节点编码即岗位编码；注册名保留 Java 嵌套类形状。
+    ctx.register_assignment_handler(
+        "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskPostAssigneeHandler",
+        Arc::new(TaskPostAssigneeHandler { post: post_provider.clone() }));
     // 两个「表单指定用户」类：注册名用顶级类 FQN，与其余七语言逐字一致
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler",
@@ -502,6 +607,10 @@ pub fn register_builtin_assignment_handlers(ctx: &mut ServiceContext) {
     ctx.register_assignment_handler(
         "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler",
         Arc::new(FormDeptMainLeaderAssignmentHandler { base: dept_base }));
+    // issues/259：表单指定岗位；注册名为 Java 顶级类 FQCN。
+    ctx.register_assignment_handler(
+        "com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler",
+        Arc::new(FormPostAssignmentHandler { post: post_provider }));
 }
 
 #[cfg(test)]
@@ -591,7 +700,7 @@ mod tests {
     fn test_register_builtins() {
         let mut ctx = ServiceContext::new();
         register_builtin_assignment_handlers(&mut ctx);
-        assert_eq!(ctx.assignment_handlers.len(), 11);
+        assert_eq!(ctx.assignment_handlers.len(), 13);
         assert!(ctx.find_assignment_handler(
             "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler"
         ).is_some());
@@ -890,14 +999,14 @@ mod form_user_tests {
     fn metadata_exposes_two_new_display_names() {
         let reg = crate::metadata::HandlerRegistry::new();
         let handlers = reg.list_handlers("AssignmentHandler");
-        assert_eq!(handlers.len(), 11);
-        // issues/258 两枚追加在 order 90/100，旧两枚仍固定占据 70/80。
-        assert_eq!(handlers[7].class_name, FQ_LEADER);
-        assert_eq!(handlers[7].display_name, "表单指定用户所属部门经理");
-        assert_eq!(handlers[7].order, 70);
-        assert_eq!(handlers[8].class_name, FQ_MAIN);
-        assert_eq!(handlers[8].display_name, "表单指定用户所属部门分管领导");
-        assert_eq!(handlers[8].order, 80);
+        assert_eq!(handlers.len(), 13);
+        // issues/259 TaskPost 插在 order 65；旧两枚仍固定占据 70/80。
+        assert_eq!(handlers[8].class_name, FQ_LEADER);
+        assert_eq!(handlers[8].display_name, "表单指定用户所属部门经理");
+        assert_eq!(handlers[8].order, 70);
+        assert_eq!(handlers[9].class_name, FQ_MAIN);
+        assert_eq!(handlers[9].display_name, "表单指定用户所属部门分管领导");
+        assert_eq!(handlers[9].order, 80);
     }
 }
 
@@ -1200,7 +1309,7 @@ mod form_dept_tests {
         // 故意不注册 UserProvider：两枚新 handler 只依赖 OrgUserProvider。
         ctx.org_user_provider = Some(Arc::new(FdOrg::default()));
         register_builtin_assignment_handlers(&mut ctx);
-        assert_eq!(ctx.assignment_handlers.len(), 11);
+        assert_eq!(ctx.assignment_handlers.len(), 13);
 
         for (name, expected) in [
             (FQ_LEADER, "leaderA,shared"),
@@ -1217,20 +1326,20 @@ mod form_dept_tests {
     fn t20_metadata_count_names_and_order() {
         let reg = crate::metadata::HandlerRegistry::new();
         let handlers = reg.list_handlers("AssignmentHandler");
-        assert_eq!(handlers.len(), 11);
+        assert_eq!(handlers.len(), 13);
         let orders: Vec<i32> = handlers.iter().map(|handler| handler.order).collect();
-        assert_eq!(orders, vec![-9999, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+        assert_eq!(orders, vec![-9999, 10, 20, 30, 40, 50, 60, 65, 70, 80, 90, 100, 110]);
 
-        let tail = &handlers[handlers.len() - 2..];
-        assert_eq!(tail[0].class_name, FQ_LEADER);
-        assert_eq!(tail[0].display_name, "表单指定部门负责人");
-        assert_eq!(tail[0].order, 90);
-        assert_eq!(tail[0].handler_type, "AssignmentHandler");
-        assert_eq!(tail[0].group, "built-in");
-        assert_eq!(tail[1].class_name, FQ_MAIN);
-        assert_eq!(tail[1].display_name, "表单指定部门分管领导");
-        assert_eq!(tail[1].order, 100);
-        assert_eq!(tail[1].handler_type, "AssignmentHandler");
-        assert_eq!(tail[1].group, "built-in");
+        // issues/259 两枚插入后，部门两枚仍固定占据 90/100；FormPost 收尾在 110。
+        assert_eq!(handlers[10].class_name, FQ_LEADER);
+        assert_eq!(handlers[10].display_name, "表单指定部门负责人");
+        assert_eq!(handlers[10].order, 90);
+        assert_eq!(handlers[10].handler_type, "AssignmentHandler");
+        assert_eq!(handlers[10].group, "built-in");
+        assert_eq!(handlers[11].class_name, FQ_MAIN);
+        assert_eq!(handlers[11].display_name, "表单指定部门分管领导");
+        assert_eq!(handlers[11].order, 100);
+        assert_eq!(handlers[11].handler_type, "AssignmentHandler");
+        assert_eq!(handlers[11].group, "built-in");
     }
 }
